@@ -3,6 +3,7 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import anime, { stopMotion, prefersReducedMotion, type MotionHandle } from '../motion'
 
 // Shared rich-text renderer for assistant/agent messages across all three tabs
 // (Chat, Hermes, Claude Code). Renders GFM markdown — headings, emphasis, lists,
@@ -17,28 +18,35 @@ function CodeBlock(props: { language: string; value: string }) {
   const btnRef = useRef<HTMLButtonElement>(null)
   const lang = props.language || 'text'
 
+  const codeAnimRef = useRef<MotionHandle>(null)
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el || prefersReducedMotion()) return
+    codeAnimRef.current = anime(el, { translateY: [8, 0], duration: 200, ease: 'outExpo' })
+    return () => stopMotion(codeAnimRef.current)
+  }, [])
+
   useEffect(() => {
     const wrap = wrapRef.current
     const btn = btnRef.current
     if (!wrap || !btn) return
 
-    function update() {
-      const rect = wrap!.getBoundingClientRect()
+    // Sticky copy button while the block's top edge sits above the 40px
+    // header line but the block is still on screen. A fine threshold array
+    // makes the observer fire continuously as the block scrolls past that
+    // line — no per-block scroll listeners on the chat scroller (those
+    // accumulate one handler per code block in long sessions).
+    const thresholds = Array.from({ length: 21 }, (_, i) => i / 20)
+    const observer = new IntersectionObserver((entries) => {
+      const rect = entries[entries.length - 1].boundingClientRect
       if (rect.top < 40 && rect.bottom > 40) {
-        btn!.classList.add('sticky-copy')
+        btn.classList.add('sticky-copy')
       } else {
-        btn!.classList.remove('sticky-copy')
+        btn.classList.remove('sticky-copy')
       }
-    }
-
-    const observer = new IntersectionObserver(update, { threshold: [0, 0.1, 1] })
+    }, { rootMargin: '-40px 0px 0px 0px', threshold: thresholds })
     observer.observe(wrap)
-    const scrollParent = wrap.closest('.chat-scroll') ?? document
-    scrollParent.addEventListener('scroll', update, { passive: true })
-    return () => {
-      observer.disconnect()
-      scrollParent.removeEventListener('scroll', update)
-    }
+    return () => observer.disconnect()
   }, [])
 
   async function copy() {

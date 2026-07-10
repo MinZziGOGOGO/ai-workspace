@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ActivityEntry } from '../types'
 import { StatusBadge, WorkspaceEmptyState } from './WorkspacePrimitives'
+import { animateScrollToBottom, stopMotion, type MotionHandle } from '../motion'
 
 const MAX_ENTRIES = 500
 
 export default function ActivityPanel() {
   const [entries, setEntries] = useState<ActivityEntry[]>([])
   const feedRef = useRef<HTMLDivElement>(null)
+  const scrollAnimRef = useRef<MotionHandle>(null)
 
   useEffect(() => {
     if (!window.api.activity) return
@@ -20,8 +22,12 @@ export default function ActivityPanel() {
 
   useEffect(() => {
     const el = feedRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (!el) return
+    stopMotion(scrollAnimRef.current)
+    scrollAnimRef.current = animateScrollToBottom(el)
   }, [entries])
+
+  useEffect(() => () => stopMotion(scrollAnimRef.current), [])
 
   function fmtTime(ts: number) {
     const d = new Date(ts)

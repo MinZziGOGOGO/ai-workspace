@@ -1,4 +1,7 @@
 import { spawn, ChildProcess } from 'child_process'
+import { randomUUID } from 'crypto'
+import { existsSync, readFileSync } from 'fs'
+import { resolve, relative, isAbsolute } from 'path'
 import { getDb } from './db'
 
 // Hermes ACP (Agent Client Protocol) integration — Milestone 6.
@@ -46,6 +49,11 @@ export interface HermesActivity {
   message: string
 }
 
+export interface HermesPlanEntry {
+  content: string
+  status: string // 'pending' | 'in_progress' | 'completed' (per ACP `plan` update)
+}
+
 export type HermesEvent =
   | { kind: 'text'; text: string }
   | { kind: 'thought'; text: string }
@@ -54,6 +62,175 @@ export type HermesEvent =
   | { kind: 'model'; name: string }
   | { kind: 'usage'; used: number; size: number }
   | { kind: 'commands'; commands: Array<{ name: string; description: string; hint?: string }> }
+  | { kind: 'plan'; entries: HermesPlanEntry[] }
+  | { kind: 'permissionRequest'; request: HermesPermissionRequest }
+
+// ---- Permission modes --------------------------------------------------------
+// Configurable autonomy levels, modeled after Claude Code's permission modes.
+// Mode 1 asks before everything; mode 5 asks only for genuinely dangerous ops.
+
+export type HermesPermissionMode = 1 | 2 | 3 | 4 | 5
+export type HermesActionKind = 'read' | 'create' | 'edit' | 'execute' | 'destructive' | 'catastrophic'
+
+export interface HermesPermissionRequest {
+  requestId: string
+  action: HermesActionKind
+  title: string
+}
+
+const DEFAULT_HERMES_PERMISSION_MODE: HermesPermissionMode = 3
+
+// Kinds listed for a mode are the ones that still require approval at that mode.
+// Anything not listed is auto-approved.
+const APPROVAL_MATRIX: Record<HermesPermissionMode, ReadonlySet<HermesActionKind>> = {
+  1: new Set(['read', 'create', 'edit', 'execute', 'destructive', 'catastrophic']),
+  2: new Set(['edit', 'execute', 'destructive', 'catastrophic']),
+  3: new Set(['execute', 'destructive', 'catastrophic']),
+  4: new Set(['destructive', 'catastrophic']),
+  5: new Set(['catastrophic']),
+}
+
+function hermesRequiresApproval(mode: HermesPermissionMode, kind: HermesActionKind): boolean {
+  return APPROVAL_MATRIX[mode].has(kind)
+}
+
+// Smallest mode that would auto-approve this kind of action (catastrophic never
+// auto-approves at any mode — the loop below falls through to 5, which still asks).
+function modeThatAutoApproves(kind: HermesActionKind): HermesPermissionMode {
+  for (const m of [1, 2, 3, 4, 5] as HermesPermissionMode[]) {
+    if (!hermesRequiresApproval(m, kind)) return m
+  }
+  return 5
+}
+
+export function getHermesPermissionMode(): HermesPermissionMode {
+  try {
+    const db = getDb()
+    const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('hermes_permission_mode') as
+      | { value: string }
+      | undefined
+    const n = Number(row?.value)
+    return (n >= 1 && n <= 5 ? n : DEFAULT_HERMES_PERMISSION_MODE) as HermesPermissionMode
+  } catch {
+    return DEFAULT_HERMES_PERMISSION_MODE
+  }
+}
+
+export function setHermesPermissionMode(mode: HermesPermissionMode): void {
+  getDb()
+    .prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)')
+    .run('hermes_permission_mode', String(mode))
+}
+
+// "Always allow this session" bumps the effective mode for the rest of the app
+// session (our own session id, stable across turns) without touching the saved
+// default. In-memory only — never persisted.
+const sessionModeOverrides = new Map<string, HermesPermissionMode>()
+
+function effectiveHermesMode(sessionId: string): HermesPermissionMode {
+  const override = sessionModeOverrides.get(sessionId)
+  const saved = getHermesPermissionMode()
+  return override != null && override > saved ? override : saved
+}
+
+export function bumpHermesSessionOverride(sessionId: string, kind: HermesActionKind): void {
+  const needed = modeThatAutoApproves(kind)
+  const current = effectiveHermesMode(sessionId)
+  if (needed > current) sessionModeOverrides.set(sessionId, needed)
+}
+
+// ---- Permission classification ------------------------------------------------
+// Best-effort: the request_permission params shape isn't formally pinned down for
+// this Hermes ACP build, so we read several plausible field names defensively.
+
+const CATASTROPHIC_PATTERNS: RegExp[] = [
+  /\bforce\b[\s\S]{0,20}\bpush\b/i,
+  /\bpush\b[\s\S]{0,12}--force/i,
+  /\bpush\b[\s\S]{0,6}(^|\s)-f(\s|$)/i,
+  /rm\s+-rf\s+(\/|~|\*|\$HOME)/i,
+  /del\s+\/s\s+\/q/i,
+  /format\s+[a-z]:/i,
+  /drop\s+(table|database)/i,
+  /truncate\s+table/i,
+  /git\s+reset\s+--hard/i,
+  /git\s+clean\s+-[a-z]*d[a-z]*f/i
+]
+
+const DESTRUCTIVE_PATTERNS: RegExp[] = [
+  /\brm\b/i, /\bdel\b/i, /\bremove-item\b/i, /\bunlink\b/i,
+  /\bdrop\b/i, /\bkill\b/i, /\bshutdown\b/i, /\breboot\b/i,
+  /\bchmod\b/i, /\bchown\b/i
+]
+
+function matchesAny(patterns: RegExp[], text: string): boolean {
+  return text.length > 0 && patterns.some((re) => re.test(text))
+}
+
+function extractActionText(params: any): string {
+  const toolCall = params?.toolCall ?? {}
+  const rawInput = toolCall.rawInput ?? params?.rawInput ?? {}
+  const parts = [
+    toolCall.title, toolCall.description, params?.title, params?.description,
+    rawInput.command, Array.isArray(rawInput.args) ? rawInput.args.join(' ') : rawInput.args
+  ]
+  return parts.filter((p) => typeof p === 'string' && p).join(' ')
+}
+
+function extractActionPath(params: any): string | undefined {
+  const toolCall = params?.toolCall ?? {}
+  const rawInput = toolCall.rawInput ?? params?.rawInput ?? {}
+  const loc = Array.isArray(toolCall.locations) ? toolCall.locations[0] : undefined
+  return loc?.path ?? rawInput.path ?? rawInput.file_path ?? params?.path
+}
+
+function classifyHermesAction(params: any): HermesActionKind {
+  const text = extractActionText(params)
+  if (matchesAny(CATASTROPHIC_PATTERNS, text)) return 'catastrophic'
+
+  const rawKind = String(params?.toolCall?.kind ?? params?.kind ?? '').toLowerCase()
+
+  if (rawKind === 'delete' || rawKind === 'move') return 'destructive'
+  if (matchesAny(DESTRUCTIVE_PATTERNS, text)) return 'destructive'
+
+  if (rawKind === 'read' || rawKind === 'search' || rawKind === 'think' || rawKind === 'fetch') return 'read'
+  if (rawKind === 'edit') {
+    const path = extractActionPath(params)
+    if (path) {
+      try { return existsSync(path) ? 'edit' : 'create' } catch { /* fall through to text heuristic */ }
+    }
+    return /\bcreate\b|\bnew file\b/i.test(text) ? 'create' : 'edit'
+  }
+  // 'execute', 'other', or unclassified — treat as a command run (conservative default).
+  return 'execute'
+}
+
+function describeHermesAction(params: any, kind: HermesActionKind): string {
+  const toolCall = params?.toolCall ?? {}
+  const rawInput = toolCall.rawInput ?? params?.rawInput ?? {}
+  const title: string | undefined = toolCall.title ?? params?.title
+  if (title) return title
+  const command: string | undefined = rawInput.command
+  if (command) return `Run command \`${command}\``
+  const path = extractActionPath(params)
+  if (path) {
+    const verb = kind === 'create' ? 'Create' : kind === 'edit' ? 'Edit' : kind === 'read' ? 'Read' : 'Delete'
+    return `${verb} \`${path}\``
+  }
+  return `Perform a ${kind} action`
+}
+
+// This Hermes ACP build responds to permission requests with a plain
+// `{ granted }` boolean. If a future build sends the richer ACP `options` array,
+// respond in that shape instead so we don't silently break either variant.
+function buildPermissionResult(params: any, approved: boolean): any {
+  const options: any[] = Array.isArray(params?.options) ? params.options : []
+  if (options.length > 0) {
+    const wanted = approved ? ['allow_once', 'allow_always'] : ['reject_once', 'reject_always']
+    const opt = options.find((o: any) => wanted.includes(o?.kind)) ?? options[0]
+    return { outcome: { outcome: 'selected', optionId: opt?.optionId } }
+  }
+  return { granted: approved }
+}
 
 export interface AcpRunResult {
   ok: boolean
@@ -243,6 +420,14 @@ class HermesAcpClient {
   private pending = new Map<number, PendingEntry>()
   // ACP session id → listener for session/update notifications
   private updateListeners = new Map<string, (update: any) => void>()
+  // ACP session id → raw event sink, used for out-of-band events (permission requests)
+  private eventListeners = new Map<string, (e: HermesEvent) => void>()
+  // ACP session id → our own (stable, cross-turn) session id, for permission-mode lookups
+  private ourSessionByAcp = new Map<string, string>()
+  // ACP session id → project root (Windows path) used for fs/* path confinement
+  private projectPathByAcp = new Map<string, string>()
+  // requestId (ours) → the ACP request awaiting a renderer decision
+  private pendingPermissions = new Map<string, { msgId: number; params: any }>()
   private buf = ''
   private _version?: string
   private _connected = false
@@ -327,6 +512,7 @@ class HermesAcpClient {
     const matched = models.find((m: any) => m.id === currentId)
     const raw = matched?.name ?? matched?.id ?? currentId
     const modelName: string | undefined = raw || undefined
+    this.projectPathByAcp.set(result.sessionId, cwd)
     return { sessionId: result.sessionId, modelName }
   }
 
@@ -334,9 +520,13 @@ class HermesAcpClient {
     acpSessionId: string,
     text: string,
     onEvent: (e: HermesEvent) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    ourSessionId?: string
   ): Promise<{ stopReason: string; text: string }> {
     let assembled = ''
+
+    this.eventListeners.set(acpSessionId, onEvent)
+    this.ourSessionByAcp.set(acpSessionId, ourSessionId ?? acpSessionId)
 
     this.updateListeners.set(acpSessionId, (update: any) => {
       const su: string = update?.sessionUpdate ?? ''
@@ -365,6 +555,12 @@ class HermesAcpClient {
         const active = entries.find((e: any) => e.status === 'in_progress') ?? entries[0]
         if (active?.content) {
           onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'plan', message: active.content } })
+        }
+        if (entries.length > 0) {
+          onEvent({
+            kind: 'plan',
+            entries: entries.map((e: any) => ({ content: String(e.content ?? ''), status: String(e.status ?? 'pending') }))
+          })
         }
       } else if (su === 'usage_update') {
         const size: number = update?.size ?? 0
@@ -397,7 +593,20 @@ class HermesAcpClient {
       return { stopReason: result?.stopReason ?? 'end_turn', text: assembled }
     } finally {
       this.updateListeners.delete(acpSessionId)
+      this.eventListeners.delete(acpSessionId)
+      this.ourSessionByAcp.delete(acpSessionId)
     }
+  }
+
+  // Called from the renderer (via IPC) once the user has decided on a pending
+  // permission request. Returns false if the request is unknown (e.g. already
+  // resolved, or the process restarted since it was raised).
+  respondPermission(requestId: string, approved: boolean): boolean {
+    const pending = this.pendingPermissions.get(requestId)
+    if (!pending) return false
+    this.pendingPermissions.delete(requestId)
+    this.sendLine({ jsonrpc: '2.0', id: pending.msgId, result: buildPermissionResult(pending.params, approved) })
+    return true
   }
 
   cancelSession(acpSessionId: string): void {
@@ -413,6 +622,9 @@ class HermesAcpClient {
     for (const [, h] of this.pending) h.reject(new Error('Hermes ACP process exited'))
     this.pending.clear()
     this.updateListeners.clear()
+    this.eventListeners.clear()
+    this.ourSessionByAcp.clear()
+    this.pendingPermissions.clear()
     this.buf = ''
   }
 
@@ -488,8 +700,7 @@ class HermesAcpClient {
   private handleAgentRequest(msg: any): void {
     const { id, method, params } = msg
     if (method === 'session/request_permission') {
-      // Auto-approve (--accept-hooks already silences shell hooks; this covers RPC-level gates)
-      this.sendLine({ jsonrpc: '2.0', id, result: { granted: true } })
+      this.handlePermissionRequest(id, params)
     } else if (method === 'fs/read_text_file') {
       // Serve file content for in-project paths; empty string for anything else
       const filePath: string = params?.path ?? params?.uri ?? ''
@@ -507,6 +718,26 @@ class HermesAcpClient {
     } else {
       this.sendLine({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } })
     }
+  }
+
+  // Gate on the current permission mode (global default, bumped by any
+  // "always allow this session" override). Read-only/create actions stay
+  // auto-approved in the default mode so the common path never blocks on UI.
+  private handlePermissionRequest(id: number, params: any): void {
+    const acpSessionId: string = params?.sessionId ?? ''
+    const ourSessionId = this.ourSessionByAcp.get(acpSessionId) ?? acpSessionId
+    const kind = classifyHermesAction(params)
+    const mode = effectiveHermesMode(ourSessionId)
+
+    if (!hermesRequiresApproval(mode, kind)) {
+      this.sendLine({ jsonrpc: '2.0', id, result: buildPermissionResult(params, true) })
+      return
+    }
+
+    const requestId = randomUUID()
+    this.pendingPermissions.set(requestId, { msgId: id, params })
+    const title = describeHermesAction(params, kind)
+    this.eventListeners.get(acpSessionId)?.({ kind: 'permissionRequest', request: { requestId, action: kind, title } })
   }
 }
 
@@ -546,6 +777,7 @@ export function hermesVersion(): string | undefined {
 // Connect if needed, open an ACP session, send the prompt, stream events back.
 
 export async function runHermesPrompt(opts: {
+  sessionId: string
   projectPath: string
   prompt: string
   mcpServers?: object[]
@@ -575,7 +807,8 @@ export async function runHermesPrompt(opts: {
       acpSessionId,
       opts.prompt,
       opts.onEvent,
-      opts.signal
+      opts.signal,
+      opts.sessionId
     )
     return { ok: true, text, stopReason }
   } catch (e: any) {
@@ -583,6 +816,13 @@ export async function runHermesPrompt(opts: {
     opts.onEvent({ kind: 'error', message: msg })
     return { ok: false, text: '', error: msg }
   }
+}
+
+// Resolve a pending permission request raised by the current Hermes run (if
+// any). Returns false if the request is unknown — e.g. the client reconnected
+// since the request was raised, or the renderer double-fired the response.
+export function respondHermesPermission(requestId: string, approved: boolean): boolean {
+  return _client?.respondPermission(requestId, approved) ?? false
 }
 
 // ---- summarize for durable memory ------------------------------------------

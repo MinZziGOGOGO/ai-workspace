@@ -1,9 +1,12 @@
+import { Fragment } from 'react'
+
 type AiContextBarProps = {
   testId: string
   usedTokens?: number
   maxTokens?: number
   tokensApproximate?: boolean
   model?: string
+  modelBadge?: import('react').ReactNode
   mode?: string
   status?: string
   disabledReason?: string
@@ -26,12 +29,13 @@ export default function AiContextBar(props: AiContextBarProps) {
   const percent = hasMax && hasUsed
     ? Math.min(100, Math.max(0, Math.round((props.usedTokens! / props.maxTokens!) * 100)))
     : undefined
-  const fillWidth = percent === undefined ? '100%' : `${percent}%`
+  const fillScale = percent === undefined ? 1 : percent / 100
 
+  const modelText = props.model?.trim() || 'model unknown'
   const details = [
     percent === undefined ? 'context unknown' : `${percent}% context`,
     hasUsed ? formatTokens(props.usedTokens!, props.tokensApproximate) : undefined,
-    props.model?.trim() || 'model unknown',
+    modelText,
     props.mode?.trim(),
     props.status?.trim(),
     props.disabledReason?.trim()
@@ -41,16 +45,19 @@ export default function AiContextBar(props: AiContextBarProps) {
   return (
     <div className="context-bar" data-testid={props.testId} aria-label={`AI context status: ${label}`} title={label}>
       <div className={`context-meter ${percent === undefined ? 'unknown' : ''}`} aria-hidden>
-        <div
-          className={`context-meter-fill ${percent === undefined ? 'unknown' : ''}`}
-          style={{ width: fillWidth }}
-        />
+        <AnimatedScaleBar className="context-meter-fill" value={fillScale} unknown={percent === undefined} />
       </div>
       <div className="context-items">
-        {details.map((item) => (
-          <span key={item} className="context-item">{item}</span>
+        {details.map((item, i) => (
+          <Fragment key={i}>
+            <span className="context-item">{item}</span>
+            {item === modelText && props.modelBadge && (
+              <span className="context-item context-item-badge">{props.modelBadge}</span>
+            )}
+          </Fragment>
         ))}
       </div>
     </div>
   )
 }
+import { AnimatedScaleBar } from '../motion'

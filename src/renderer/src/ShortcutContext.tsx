@@ -57,6 +57,7 @@ function dispatchWorkspaceAction(action: string) {
     new_session: 'workspace:newSession',
     close_panel: 'workspace:closePanel',
     focus_composer: 'workspace:focusComposer',
+    command_palette: 'workspace:toggleCommandPalette',
   }
   const eventName = events[action]
   if (eventName) window.dispatchEvent(new CustomEvent(eventName))
@@ -80,7 +81,8 @@ export function ShortcutProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!loaded) return
-    void window.api.settings.set(SHORTCUTS_STORAGE_KEY, JSON.stringify(persistable(shortcuts)))
+    window.api.settings.set(SHORTCUTS_STORAGE_KEY, JSON.stringify(persistable(shortcuts)))
+      .catch((err) => console.error('[shortcuts] persist failed:', err))
   }, [loaded, shortcuts])
 
   useEffect(() => {

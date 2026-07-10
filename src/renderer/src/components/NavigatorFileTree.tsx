@@ -42,6 +42,7 @@ export default function NavigatorFileTree({
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
   const [dirContents, setDirContents] = useState<Map<string, FsEntry[]>>(new Map())
   const [searchQuery, setSearchQuery] = useState('')
+  const [gitFiles, setGitFiles] = useState<Record<string, string> | null>(null)
 
   useEffect(() => {
     setRootEntries(null)
@@ -52,6 +53,36 @@ export default function NavigatorFileTree({
       setRootEntries(entries)
     })
   }, [projectPath])
+
+  // Git status indicators: load on mount and refresh every 10 seconds.
+  // A non-repo project simply shows no indicators (gitFiles stays null).
+  useEffect(() => {
+    let cancelled = false
+    setGitFiles(null)
+    const load = () => {
+      window.api.git.status(projectPath).then(result => {
+        if (!cancelled) setGitFiles(result.isGitRepo ? result.files : null)
+      }).catch(() => {})
+    }
+    load()
+    const timer = setInterval(load, 10000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [projectPath])
+
+  // Map an absolute entry path to its git status dot class, if any.
+  function gitDotFor(absPath: string): string | null {
+    if (!gitFiles) return null
+    const normalizedRoot = projectPath.replace(/\\/g, '/').replace(/\/+$/, '')
+    const normalized = absPath.replace(/\\/g, '/')
+    if (!normalized.toLowerCase().startsWith(normalizedRoot.toLowerCase() + '/')) return null
+    const rel = normalized.slice(normalizedRoot.length + 1)
+    const status = gitFiles[rel]
+    if (!status) return null
+    if (status === '??') return 'untracked'
+    if (status.includes('D')) return 'deleted'
+    if (status.includes('A')) return 'added'
+    return 'modified' // M, R, C, U and mixed states
+  }
 
   async function toggleDir(path: string, depth: number) {
     if (depth >= MAX_DEPTH) return
@@ -111,6 +142,7 @@ export default function NavigatorFileTree({
           </div>
         )
       } else {
+        const gitDot = gitDotFor(entry.path)
         return (
           <button
             key={entry.path}
@@ -121,6 +153,7 @@ export default function NavigatorFileTree({
           >
             <span className="file-tree-icon"><FileIcon /></span>
             <span className="file-tree-name">{entry.name}</span>
+            {gitDot && <span className={`git-status-dot ${gitDot}`} title={`Git: ${gitDot}`} />}
           </button>
         )
       }
@@ -151,6 +184,7 @@ export default function NavigatorFileTree({
           ) : (
             matchedFiles!.map(({ entry, relativePath }) => {
               const dir = relativePath.includes('/') ? relativePath.slice(0, relativePath.lastIndexOf('/')) : ''
+              const gitDot = gitDotFor(entry.path)
               return (
                 <button
                   key={entry.path}
@@ -162,6 +196,7 @@ export default function NavigatorFileTree({
                   <span className="file-tree-icon"><FileIcon /></span>
                   <span className="flat-file-name">{entry.name}</span>
                   {dir && <span className="flat-file-path">{dir}</span>}
+                  {gitDot && <span className={`git-status-dot ${gitDot}`} title={`Git: ${gitDot}`} />}
                 </button>
               )
             })

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process'
-import { existsSync, readdirSync } from 'fs'
+import { existsSync, readdirSync, readFileSync } from 'fs'
 import { join } from 'path'
 
 // Milestone 5 — Claude Code launcher.
@@ -27,10 +27,17 @@ const IS_WIN = process.platform === 'win32'
 const CLAUDE_EXE = IS_WIN ? 'claude.exe' : 'claude'
 
 // ---- normalized events -----------------------------------------------------
+export interface FileDiff {
+  path: string
+  before: string | null // null for newly created files
+  after: string
+}
+
 export interface ActivityEntry {
   name: string // tool name (Write, Edit, Bash, Read, …)
   summary: string // short, human-readable arg (file path, command, …)
   ok?: boolean // set when the matching tool_result arrives
+  diff?: FileDiff // set for file write/edit tools once the tool completes successfully
 }
 
 export type CCEvent =
@@ -38,6 +45,7 @@ export type CCEvent =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; id: string; name: string; summary: string }
   | { kind: 'tool-result'; id: string; ok: boolean; summary: string }
+  | { kind: 'file_diff'; toolCallId: string; path: string; before: string | null; after: string }
   | { kind: 'error'; message: string }
 
 export interface CCCheck {
@@ -90,6 +98,10 @@ export function resolveClaudeBin(): string {
   for (const c of candidates) if (existsSync(c)) return c
   return 'claude' // last resort: PATH lookup via shell
 }
+
+// Tools whose `file_path` input is written wholesale/patched in place, so a
+// before/after diff can be captured around them.
+const FILE_WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit'])
 
 /** Whether a resolved bin can be spawned directly (no shell, prompt safe as argv). */
 function isDirectExe(bin: string): boolean {
@@ -181,6 +193,11 @@ export function runClaudeCode(opts: {
     const args = direct ? ['-p', opts.prompt, ...baseArgs] : ['-p', ...baseArgs]
 
     const activity: ActivityEntry[] = []
+    // Tool calls that write a file: keyed by tool_use id so the matching
+    // tool_result can pair the pre-execution snapshot with the post-execution
+    // content and produce a diff. `entry` is the same object pushed into
+    // `activity`, so attaching `diff` there also persists it in the log.
+    const pendingDiffs = new Map<string, { path: string; before: string | null; entry: ActivityEntry }>()
     let streamedText = ''
     let resultText = ''
     let cost: number | undefined
@@ -246,8 +263,20 @@ export function runClaudeCode(opts: {
               opts.onEvent({ kind: 'text', text: b.text })
             } else if (b.type === 'tool_use') {
               const summary = summarizeToolInput(b.name, b.input)
-              activity.push({ name: b.name, summary })
+              const entry: ActivityEntry = { name: b.name, summary }
+              activity.push(entry)
               opts.onEvent({ kind: 'tool', id: b.id ?? '', name: b.name, summary })
+
+              if (FILE_WRITE_TOOLS.has(b.name) && typeof b.input?.file_path === 'string' && b.id) {
+                const filePath = b.input.file_path
+                let before: string | null = null
+                try {
+                  if (existsSync(filePath)) before = readFileSync(filePath, 'utf8')
+                } catch {
+                  /* unreadable before content — fall back to treating it as unavailable */
+                }
+                pendingDiffs.set(b.id, { path: filePath, before, entry })
+              }
             }
           }
           break
@@ -263,6 +292,26 @@ export function runClaudeCode(opts: {
                 ok: resultOk,
                 summary: resultSummary(b.content)
               })
+
+              const pending = pendingDiffs.get(b.tool_use_id ?? '')
+              if (pending) {
+                pendingDiffs.delete(b.tool_use_id ?? '')
+                if (resultOk) {
+                  try {
+                    const after = readFileSync(pending.path, 'utf8')
+                    pending.entry.diff = { path: pending.path, before: pending.before, after }
+                    opts.onEvent({
+                      kind: 'file_diff',
+                      toolCallId: b.tool_use_id ?? '',
+                      path: pending.path,
+                      before: pending.before,
+                      after
+                    })
+                  } catch {
+                    /* file gone or unreadable after the tool ran — skip the diff */
+                  }
+                }
+              }
             }
           }
           break
@@ -387,6 +436,67 @@ function resultSummary(content: any): string {
 
 function clip(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s
+}
+
+// ---- checkpoints (git-based rollback) --------------------------------------
+// Before a headless task runs, the caller (ipc.ts) records the project's
+// current HEAD so the user can undo everything the task did. We only ever
+// do this against a clean working tree — never on top of the user's own
+// uncommitted changes — and rollback is a plain `git reset --hard`, so both
+// sides of this are intentionally simple, inspectable git operations.
+function runGit(args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let out = ''
+    let err = ''
+    let child
+    try {
+      child = spawn('git', args, { cwd, windowsHide: true })
+    } catch (e: any) {
+      resolve({ code: 1, stdout: '', stderr: String(e?.message ?? e) })
+      return
+    }
+    child.stdout?.on('data', (d) => (out += d.toString()))
+    child.stderr?.on('data', (d) => (err += d.toString()))
+    child.on('error', (e: any) => resolve({ code: 1, stdout: out, stderr: String(e?.message ?? e) }))
+    child.on('close', (code) => resolve({ code: code ?? 1, stdout: out, stderr: err }))
+  })
+}
+
+export async function isGitRepo(projectPath: string): Promise<boolean> {
+  const r = await runGit(['rev-parse', '--git-dir'], projectPath)
+  return r.code === 0
+}
+
+export async function isGitClean(projectPath: string): Promise<boolean> {
+  const r = await runGit(['status', '--porcelain'], projectPath)
+  return r.code === 0 && r.stdout.trim() === ''
+}
+
+export async function getHeadCommit(projectPath: string): Promise<string | null> {
+  const r = await runGit(['rev-parse', 'HEAD'], projectPath)
+  return r.code === 0 ? r.stdout.trim() : null
+}
+
+export async function gitResetHard(projectPath: string, commitHash: string): Promise<{ success: boolean; error?: string }> {
+  const r = await runGit(['reset', '--hard', commitHash], projectPath)
+  return r.code === 0 ? { success: true } : { success: false, error: r.stderr.trim() || `git reset exited with code ${r.code}` }
+}
+
+export type CheckpointAttempt =
+  | { ok: true; commitHash: string }
+  | { ok: false; reason: 'not-git' | 'dirty' | 'error'; error?: string }
+
+/** Best-effort checkpoint attempt: never throws, never touches a dirty tree. */
+export async function tryCreateCheckpoint(projectPath: string): Promise<CheckpointAttempt> {
+  try {
+    if (!(await isGitRepo(projectPath))) return { ok: false, reason: 'not-git' }
+    if (!(await isGitClean(projectPath))) return { ok: false, reason: 'dirty' }
+    const commitHash = await getHeadCommit(projectPath)
+    if (!commitHash) return { ok: false, reason: 'error', error: 'Could not resolve HEAD commit' }
+    return { ok: true, commitHash }
+  } catch (e: any) {
+    return { ok: false, reason: 'error', error: String(e?.message ?? e) }
+  }
 }
 
 function compareVersionsDesc(a: string, b: string): number {

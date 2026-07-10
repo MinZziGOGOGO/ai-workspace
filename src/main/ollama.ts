@@ -53,8 +53,12 @@ export async function* streamChat(
     buf = lines.pop() ?? ''
     for (const line of lines) {
       if (!line.trim()) continue
-      const chunk = JSON.parse(line)
-      if (chunk.message?.content) yield chunk.message.content as string
+      try {
+        const chunk = JSON.parse(line)
+        if (chunk.message?.content) yield chunk.message.content as string
+      } catch {
+        continue // skip malformed NDJSON lines instead of killing the stream
+      }
     }
   }
 }
@@ -148,6 +152,28 @@ export async function* streamCloudChat(
         } catch { /* bad JSON */ }
       }
     }
+  }
+}
+
+export async function cloudChat(
+  model: string,
+  messages: ChatMessage[],
+  apiKey: string,
+  timeoutMs?: number
+): Promise<string | null> {
+  try {
+    const signal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined
+    const res = await fetch(`${OLLAMA_CLOUD}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, stream: false }),
+      signal
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
+    return data.choices?.[0]?.message?.content ?? null
+  } catch {
+    return null
   }
 }
 

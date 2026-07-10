@@ -20,9 +20,12 @@ export default function TerminalPanel({ project }: { project: Project }) {
   const isGlobal = isGlobalProjectId(project.id)
   const containerRef = useRef<HTMLDivElement>(null)
   const [exitState, setExitState] = useState(false)
+  // Bumping this key disposes the current xterm/PTY and creates a fresh one.
+  const [restartKey, setRestartKey] = useState(0)
 
   useEffect(() => {
     if (isGlobal || !containerRef.current) return
+    setExitState(false)
 
     const term = new Terminal({
       theme: {
@@ -111,7 +114,7 @@ export default function TerminalPanel({ project }: { project: Project }) {
         terminalId = null
       }
     }
-  }, [project.path, isGlobal])
+  }, [project.path, isGlobal, restartKey])
 
   if (isGlobal) {
     return (
@@ -129,7 +132,10 @@ export default function TerminalPanel({ project }: { project: Project }) {
     <div className="terminal-panel" data-testid="terminal-panel-content">
       {exitState && (
         <div className="terminal-exited-bar">
-          Process exited — close the panel to dismiss.
+          <span>Process exited.</span>
+          <button className="ghost tiny" onClick={() => setRestartKey((k) => k + 1)}>
+            Restart shell
+          </button>
         </div>
       )}
       <div ref={containerRef} className="terminal-xterm" />

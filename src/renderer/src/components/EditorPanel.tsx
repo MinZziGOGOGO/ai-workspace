@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { StatusBadge, WorkspaceEmptyState, WorkspaceNotice } from './WorkspacePrimitives'
+import Markdown from './Markdown'
 
 function basename(filePath: string): string {
   return filePath.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? filePath
@@ -28,12 +29,28 @@ export default function EditorPanel({
   const [saveError, setSaveError] = useState<string | null>(null)
   const [showSaved, setShowSaved] = useState(false)
   const [openedFile, setOpenedFile] = useState<string | null>(null)
+  const [previewMode, setPreviewMode] = useState(false)
+  // Stored editor preferences (Settings → Editor & Terminal). Values live in
+  // app_meta as strings, so parse defensively and fall back to the defaults.
+  const [fontSize, setFontSize] = useState(13)
+  const [tabSize, setTabSize] = useState(2)
+  const [wordWrap, setWordWrap] = useState(true)
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
+  const isMarkdown = !!openedFile && /\.(md|markdown)$/i.test(openedFile)
   const isDirty = !loadError && content !== savedContent
+  // Render-time ref so the file-switch effect can check dirtiness of the
+  // file that is *currently* open, before state is reset for the new one.
+  const dirtyGuardRef = useRef({ isDirty: false, openedFile: null as string | null })
+  dirtyGuardRef.current = { isDirty, openedFile }
 
   useEffect(() => {
+    const guard = dirtyGuardRef.current
+    if (guard.openedFile && guard.openedFile !== selectedFile && guard.isDirty) {
+      const confirmed = window.confirm('You have unsaved changes. Discard them?')
+      if (!confirmed) return // keep the current file open, don't switch
+    }
     if (!selectedFile) {
       setOpenedFile(null)
       setContent('')
@@ -41,6 +58,7 @@ export default function EditorPanel({
       setLoadError(null)
       setSaveError(null)
       setShowSaved(false)
+      setPreviewMode(false)
       return
     }
 
@@ -50,6 +68,7 @@ export default function EditorPanel({
     setLoadError(null)
     setSaveError(null)
     setShowSaved(false)
+    setPreviewMode(false)
 
     window.api.fs.readFile(selectedFile).then(result => {
       if ('error' in result) {
@@ -68,6 +87,37 @@ export default function EditorPanel({
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     }
   }, [])
+
+  // Re-read stored editor preferences whenever a file is opened, so changes
+  // made in Settings take effect the next time the Editor is used.
+  useEffect(() => {
+    let cancelled = false
+    window.api.settings
+      .getMany(['editor_font_size', 'editor_tab_size', 'editor_word_wrap'])
+      .then(values => {
+        if (cancelled) return
+        const size = parseInt(values.editor_font_size ?? '', 10)
+        setFontSize(Number.isFinite(size) && size >= 8 && size <= 32 ? size : 13)
+        const tab = parseInt(values.editor_tab_size ?? '', 10)
+        setTabSize(Number.isFinite(tab) && tab >= 1 && tab <= 8 ? tab : 2)
+        setWordWrap((values.editor_word_wrap ?? 'true') !== 'false')
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [selectedFile])
+
+  // Ctrl+Shift+P toggles markdown preview while a markdown file is open.
+  useEffect(() => {
+    if (!isMarkdown) return
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
+        e.preventDefault()
+        setPreviewMode(v => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [isMarkdown])
 
   async function save() {
     if (!openedFile || loadError || saving) return
@@ -92,12 +142,13 @@ export default function EditorPanel({
       const el = e.currentTarget
       const start = el.selectionStart
       const end = el.selectionEnd
-      const newVal = content.slice(0, start) + '  ' + content.slice(end)
+      const indent = ' '.repeat(tabSize)
+      const newVal = content.slice(0, start) + indent + content.slice(end)
       setContent(newVal)
       requestAnimationFrame(() => {
         if (textareaRef.current) {
-          textareaRef.current.selectionStart = start + 2
-          textareaRef.current.selectionEnd = start + 2
+          textareaRef.current.selectionStart = start + indent.length
+          textareaRef.current.selectionEnd = start + indent.length
         }
       })
     } else if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
@@ -136,6 +187,24 @@ export default function EditorPanel({
           <span className="editor-filepath" title={openedFile}>{openedFile}</span>
         </div>
         <div className="editor-header-actions">
+          {isMarkdown && !loadError && (
+            <div className="instructions-mode-toggle" role="group" aria-label="Editor mode">
+              <button
+                className={`instructions-mode-btn${!previewMode ? ' active' : ''}`}
+                onClick={() => setPreviewMode(false)}
+                title="Edit (Ctrl+Shift+P)"
+              >
+                Edit
+              </button>
+              <button
+                className={`instructions-mode-btn${previewMode ? ' active' : ''}`}
+                onClick={() => setPreviewMode(true)}
+                title="Preview (Ctrl+Shift+P)"
+              >
+                Preview
+              </button>
+            </div>
+          )}
           <StatusBadge tone={isDirty ? 'warning' : 'success'}>{isDirty ? 'Unsaved' : 'Saved'}</StatusBadge>
           {!loadError && (
             <button
@@ -165,6 +234,10 @@ export default function EditorPanel({
               It may be binary, too large, or outside the readable workspace.
             </WorkspaceNotice>
           </div>
+        ) : isMarkdown && previewMode ? (
+          <div className="editor-md-preview" style={{ fontSize: `${fontSize + 1}px` }}>
+            <Markdown>{content}</Markdown>
+          </div>
         ) : (
           <textarea
             ref={textareaRef}
@@ -176,7 +249,8 @@ export default function EditorPanel({
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
-            wrap="off"
+            wrap={wordWrap ? 'soft' : 'off'}
+            style={{ fontSize: `${fontSize}px`, tabSize }}
           />
         )}
         {showSaved && <div className="editor-saved-toast">Saved</div>}

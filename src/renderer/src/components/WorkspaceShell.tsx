@@ -10,20 +10,35 @@ import CodexTab from './CodexTab'
 import KnowledgePanel from './KnowledgePanel'
 import SettingsPanel from './SettingsPanel'
 import ProjectPicker from './ProjectPicker'
+import ProjectHomePanel from './ProjectHomePanel'
 import EditorPanel from './EditorPanel'
 import TerminalPanel from './TerminalPanel'
 import ResearchPanel from './ResearchPanel'
 import ActivityPanel from './ActivityPanel'
 import ExtensionsPanel from './ExtensionsPanel'
+import CommandPalette from './CommandPalette'
 import { ToastProvider, useToast } from './ToastContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge } from './WorkspacePrimitives'
 import { useShortcuts } from '../ShortcutContext'
+import { useAgentActivity, type AgentId } from '../AgentActivityContext'
 import { formatShortcutKey, type Shortcut } from '../shortcuts'
+import {
+  BreathingDot,
+  cleanupMotion,
+  concealPanel,
+  pulseElement,
+  revealPanel,
+  runWorkspaceStartup,
+  stopMotion,
+  useEntranceMotion,
+  type MotionHandle,
+} from '../motion'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 type DockPanel =
+  | 'home'
   | 'navigator' | 'chat' | 'knowledge'
   | 'hermes' | 'claudecode' | 'codex' | 'editor' | 'terminal' | 'research' | 'activity' | 'extensions'
 
@@ -92,10 +107,11 @@ const ZONES: ZoneEntry[] = [
 ]
 
 const PANELS: DockPanel[] = [
-  'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'editor', 'terminal', 'research', 'activity', 'extensions'
+  'home', 'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'editor', 'terminal', 'research', 'activity', 'extensions'
 ]
 
 const PANEL_TITLES: Record<DockPanel, string> = {
+  home: 'Project Home',
   navigator: 'Navigator',
   chat: 'Chat',
   knowledge: 'Knowledge',
@@ -115,6 +131,12 @@ const PANEL_META: Record<DockPanel, {
   status: string
   tone?: 'neutral' | 'info' | 'success' | 'warning' | 'error'
 }> = {
+  home: {
+    kind: 'Home',
+    hint: 'Project summary, actions, readiness, files, and memory',
+    status: 'Start',
+    tone: 'info',
+  },
   navigator: {
     kind: 'Files',
     hint: 'Projects, file tree, and workspace switching',
@@ -202,6 +224,7 @@ const extensionsIcon = (
 )
 
 const TOPBAR_GROUPS: { label: string; panels: TopbarPanel[] }[] = [
+  { label: 'Home',      panels: [topbarPanel('home')] },
   { label: 'AI',        panels: ['chat', 'hermes', 'claudecode', 'codex'].map((id) => topbarPanel(id as DockPanel)) },
   { label: 'Tools',     panels: [
     topbarPanel('navigator'),
@@ -215,23 +238,39 @@ const TOPBAR_GROUPS: { label: string; panels: TopbarPanel[] }[] = [
 
 // ── Layout helpers ─────────────────────────────────────────────────────────────
 
+function AnimatedDropdown(props: {
+  className: string
+  style: React.CSSProperties
+  children: ReactNode
+  onMouseDown?: (event: React.MouseEvent<HTMLDivElement>) => void
+  onPointerEnter?: (event: React.PointerEvent<HTMLDivElement>) => void
+  onPointerLeave?: (event: React.PointerEvent<HTMLDivElement>) => void
+}) {
+  const ref = useEntranceMotion<HTMLDivElement>('dropdown', [])
+  return (
+    <div
+      ref={ref}
+      className={props.className}
+      style={{ ...props.style, transformOrigin: 'top center' }}
+      onMouseDown={props.onMouseDown}
+      onPointerEnter={props.onPointerEnter}
+      onPointerLeave={props.onPointerLeave}
+    >
+      {props.children}
+    </div>
+  )
+}
+
 function defaultLayout(isGlobal: boolean): WorkspaceLayout {
   if (isGlobal) {
     return {
-      root: { type: 'pane', id: 'chat' },
-      openIds: ['chat'],
+      root: { type: 'pane', id: 'home' },
+      openIds: ['home'],
     }
   }
   return {
-    root: {
-      type: 'split',
-      direction: 'horizontal',
-      children: [
-        { type: 'pane', id: 'chat' },
-        { type: 'pane', id: 'claudecode' },
-      ],
-    },
-    openIds: ['chat', 'claudecode'],
+    root: { type: 'pane', id: 'home' },
+    openIds: ['home'],
   }
 }
 
@@ -301,42 +340,6 @@ function removeFromTree(node: LayoutNode, id: DockPanel): LayoutNode | null {
   if (newChildren.length === 0) return null
   if (newChildren.length === 1) return newChildren[0]
   return { type: 'split', direction: node.direction, children: newChildren }
-}
-
-/** Find a shallow leaf so repeated tool opens spread across the workspace. */
-function findBestSplitLeaf(node: LayoutNode): DockPanel {
-  const queue: LayoutNode[] = [node]
-  while (queue.length > 0) {
-    const current = queue.shift()
-    if (!current) break
-    if (current.type === 'pane') return current.id
-    queue.push(...current.children)
-  }
-  return 'chat'
-}
-
-/** Replace a leaf pane with a split containing it and a new pane */
-function splitLeaf(
-  node: LayoutNode,
-  targetId: DockPanel,
-  newId: DockPanel,
-  direction: SplitDirection,
-): LayoutNode {
-  if (node.type === 'pane') {
-    if (node.id === targetId) {
-      return {
-        type: 'split',
-        direction,
-        children: [{ type: 'pane', id: targetId }, { type: 'pane', id: newId }],
-      }
-    }
-    return node
-  }
-  return {
-    type: 'split',
-    direction: node.direction,
-    children: node.children.map(c => splitLeaf(c, targetId, newId, direction)),
-  }
 }
 
 /** Add a panel to root split in a given edge direction */
@@ -512,16 +515,25 @@ function WorkspaceShellInner(props: {
   onRefresh: () => void
   onOpenGlobal: () => void
   onOpenProject: (p: Project) => void
+  onOpenSetupWizard: () => void
 }) {
   const isGlobal = isGlobalProjectId(props.project.id)
 
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [showShortcutsOverlay, setShowShortcutsOverlay] = useState(false)
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [groupDropdown, setGroupDropdown] = useState<{ label: string; rect: DOMRect } | null>(null)
   const { addToast } = useToast()
   const { shortcuts } = useShortcuts()
+  const { active: agentActive } = useAgentActivity()
   const focusedPanelRef = useRef<DockPanel | null>(null)
+  const knowledgeButtonRef = useRef<HTMLButtonElement | null>(null)
+  const knowledgePulseRef = useRef<MotionHandle>(null)
+  const shellRef = useRef<HTMLDivElement>(null)
+  const startupMotionRef = useRef<MotionHandle>(null)
+  const panelRevealRef = useRef<MotionHandle[]>([])
+  const previousOpenIdsRef = useRef<DockPanel[]>([])
 
   // Fullscreen: temporarily show only one panel; store previous layout to restore
   const [fullscreenId, setFullscreenId] = useState<DockPanel | null>(null)
@@ -531,6 +543,18 @@ function WorkspaceShellInner(props: {
   const [presets, setPresets] = useState<LayoutPreset[]>([])
   const [savingPreset, setSavingPreset] = useState(false)
   const [presetName, setPresetName] = useState('')
+
+  useEffect(() => {
+    function handleKnowledgePulse() {
+      stopMotion(knowledgePulseRef.current)
+      knowledgePulseRef.current = pulseElement(knowledgeButtonRef.current)
+    }
+    window.addEventListener('knowledge:pulse', handleKnowledgePulse)
+    return () => {
+      window.removeEventListener('knowledge:pulse', handleKnowledgePulse)
+      stopMotion(knowledgePulseRef.current)
+    }
+  }, [])
 
   const [layout, setLayout] = useState<WorkspaceLayout>(() =>
     loadLayout(props.project.id, isGlobal)
@@ -614,12 +638,14 @@ function WorkspaceShellInner(props: {
   const workspaceRef = useRef<HTMLDivElement>(null)
   const topbarRef = useRef<HTMLElement>(null)
 
-  const handlersRef = useRef({ openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone } as {
+  const handlersRef = useRef({ openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, activePanelFromFocus, resetLayout } as {
     openPanel: (p: DockPanel) => void
     closePanel: (p: DockPanel) => void
     dropPanel: (p: DockPanel, edge: DropEdge) => void
     dropPanelOnTarget: (p: DockPanel, target: DockPanel, side: LocalDropSide) => void
     placePanelInZone: (p: DockPanel, zone: LayoutZone) => void
+    activePanelFromFocus: () => DockPanel | null
+    resetLayout: () => void
   })
 
   const dragActive = drag !== null
@@ -758,14 +784,15 @@ function WorkspaceShellInner(props: {
           openIds: newOpenIds,
         })
       }
-      // 2+ open: split the rightmost leaf
-      const leafId = findBestSplitLeaf(cur.root)
-      const newRoot = splitLeaf(cur.root, leafId, panel, 'horizontal')
+      // 2+ open: append at the root so newly opened panels do not split an
+      // already-small pane into unusable slivers. Precise placement still uses
+      // drag/drop or the layout picker.
+      const newRoot = addToRoot(cur.root, panel, 'right')
       return normalizeLayout({ root: newRoot, openIds: newOpenIds })
     })
   }
 
-  function closePanel(panel: DockPanel) {
+  function removePanel(panel: DockPanel) {
     setLayout(cur => {
       if (!cur.openIds.includes(panel)) return cur
       const newOpenIds = cur.openIds.filter(id => id !== panel)
@@ -777,6 +804,16 @@ function WorkspaceShellInner(props: {
       setFullscreenId(null)
       prevLayoutForFullscreen.current = null
     }
+  }
+
+  function closePanel(panel: DockPanel) {
+    const panelEl = shellRef.current?.querySelector<HTMLElement>(`[data-dock-panel-id="${panel}"]`) ?? null
+    const closeAfterMotion = concealPanel(panelEl)
+    if (closeAfterMotion) {
+      void closeAfterMotion.then(() => removePanel(panel))
+      return
+    }
+    removePanel(panel)
   }
 
   function dropPanel(panel: DockPanel, edge: DropEdge) {
@@ -836,7 +873,6 @@ function WorkspaceShellInner(props: {
   async function savePreset() {
     const name = presetName.trim()
     if (!name) return
-    console.log('[presets] saving:', name, layout.openIds)
     const saved = await window.api.presets.save(name, layout.root, layout.openIds, props.project.id)
     const updated = await window.api.presets.list()
     setPresets(updated)
@@ -847,7 +883,6 @@ function WorkspaceShellInner(props: {
 
   async function loadPreset(id: string) {
     const preset = await window.api.presets.load(id)
-    console.log('[presets] loading:', preset)
     if (!preset) return
     const presetIsGlobal = isGlobalProjectId(preset.workspaceId)
     if (presetIsGlobal !== isGlobal) {
@@ -884,10 +919,24 @@ function WorkspaceShellInner(props: {
     if (!layout.openIds.includes('editor')) openPanel('editor')
   }
 
+  function focusPanel(panel: DockPanel) {
+    if (!layout.openIds.includes(panel)) return
+    if (fullscreenId && fullscreenId !== panel) setFullscreenId(panel)
+    rememberFocusedPanel(panel)
+    window.requestAnimationFrame(() => {
+      shellRef.current
+        ?.querySelector<HTMLElement>(`[data-dock-panel-id="${panel}"]`)
+        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    })
+  }
+
   // ── Rack click: auto-layout ─────────────────────────────────────────────────
 
   function handleRackClick(panel: DockPanel) {
-    if (layout.openIds.includes(panel)) return // already open, just visual
+    if (layout.openIds.includes(panel)) {
+      focusPanel(panel)
+      return
+    }
     openPanel(panel)
   }
 
@@ -924,10 +973,37 @@ function WorkspaceShellInner(props: {
 
   const openIds = activeLayout.openIds
   const isDragging = drag?.live ?? false
+  const activeAgentIds = (Object.keys(agentActive) as AgentId[]).filter((id) => agentActive[id])
 
   function rememberFocusedPanel(panel: DockPanel) {
     focusedPanelRef.current = panel
   }
+
+  useEffect(() => {
+    previousOpenIdsRef.current = openIds
+    stopMotion(startupMotionRef.current)
+    startupMotionRef.current = runWorkspaceStartup(shellRef.current)
+    return () => {
+      cleanupMotion(startupMotionRef.current)
+      panelRevealRef.current.forEach(cleanupMotion)
+      panelRevealRef.current = []
+    }
+  }, [props.project.id])
+
+  useEffect(() => {
+    const previous = previousOpenIdsRef.current
+    const added = openIds.filter((id) => !previous.includes(id))
+    previousOpenIdsRef.current = openIds
+    if (added.length === 0) return
+
+    window.requestAnimationFrame(() => {
+      panelRevealRef.current.forEach(cleanupMotion)
+      panelRevealRef.current = added
+        .map((panel) => shellRef.current?.querySelector<HTMLElement>(`[data-dock-panel-id="${panel}"]`) ?? null)
+        .map(revealPanel)
+        .filter((handle): handle is NonNullable<MotionHandle> => Boolean(handle))
+    })
+  }, [openIds.join('|')])
 
   function activePanelFromFocus(): DockPanel | null {
     const activeElement = document.activeElement as HTMLElement | null
@@ -937,10 +1013,13 @@ function WorkspaceShellInner(props: {
     return fullscreenId ?? openIds[0] ?? null
   }
 
+  // Registered once. Handlers dispatch through handlersRef (updated every
+  // render) so they always see the current layout state without tearing down
+  // and re-adding six window listeners on every render.
   useEffect(() => {
     function onOpenPanel(event: Event) {
       const panel = (event as CustomEvent<{ panel?: string }>).detail?.panel
-      if (panel && PANELS.includes(panel as DockPanel)) openPanel(panel as DockPanel)
+      if (panel && PANELS.includes(panel as DockPanel)) handlersRef.current.openPanel(panel as DockPanel)
     }
 
     function onOpenSettings() {
@@ -951,37 +1030,49 @@ function WorkspaceShellInner(props: {
       setShowShortcutsOverlay((visible) => !visible)
     }
 
+    function onToggleCommandPalette() {
+      setCommandPaletteOpen((open) => !open)
+    }
+
     function onNewSession() {
-      const panel = activePanelFromFocus()
+      const panel = handlersRef.current.activePanelFromFocus()
       if (panel) window.dispatchEvent(new CustomEvent('panel:newSession', { detail: { panel } }))
     }
 
     function onClosePanel() {
-      const panel = activePanelFromFocus()
-      if (panel) closePanel(panel)
+      const panel = handlersRef.current.activePanelFromFocus()
+      if (panel) handlersRef.current.closePanel(panel)
     }
 
     function onFocusComposer() {
-      const panel = activePanelFromFocus()
+      const panel = handlersRef.current.activePanelFromFocus()
       if (!panel) return
       window.dispatchEvent(new CustomEvent('panel:focusComposer', { detail: { panel } }))
+    }
+
+    function onResetLayout() {
+      handlersRef.current.resetLayout()
     }
 
     window.addEventListener('workspace:openPanel', onOpenPanel)
     window.addEventListener('workspace:openSettings', onOpenSettings)
     window.addEventListener('workspace:showShortcuts', onShowShortcuts)
+    window.addEventListener('workspace:toggleCommandPalette', onToggleCommandPalette)
     window.addEventListener('workspace:newSession', onNewSession)
     window.addEventListener('workspace:closePanel', onClosePanel)
     window.addEventListener('workspace:focusComposer', onFocusComposer)
+    window.addEventListener('workspace:resetLayout', onResetLayout)
     return () => {
       window.removeEventListener('workspace:openPanel', onOpenPanel)
       window.removeEventListener('workspace:openSettings', onOpenSettings)
       window.removeEventListener('workspace:showShortcuts', onShowShortcuts)
+      window.removeEventListener('workspace:toggleCommandPalette', onToggleCommandPalette)
       window.removeEventListener('workspace:newSession', onNewSession)
       window.removeEventListener('workspace:closePanel', onClosePanel)
       window.removeEventListener('workspace:focusComposer', onFocusComposer)
+      window.removeEventListener('workspace:resetLayout', onResetLayout)
     }
-  })
+  }, [])
 
   useEffect(() => {
     if (!showShortcutsOverlay) return
@@ -1006,6 +1097,17 @@ function WorkspaceShellInner(props: {
 
   function renderContent(panel: DockPanel): ReactNode {
     switch (panel) {
+      case 'home':
+        return (
+          <ProjectHomePanel
+            project={props.project}
+            projects={props.projects}
+            onOpenPanel={openPanel}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSetupWizard={props.onOpenSetupWizard}
+            onRefreshProjects={props.onRefresh}
+          />
+        )
       case 'navigator':
         return (
           <ProjectPicker
@@ -1020,9 +1122,9 @@ function WorkspaceShellInner(props: {
           />
         )
       case 'chat':
-        return <ChatTab project={props.project} />
+        return <ChatTab project={props.project} active={openIds.includes('chat')} />
       case 'knowledge':
-        return <KnowledgePanel project={props.project} />
+        return <KnowledgePanel project={props.project} onOpenProject={props.onOpenProject} />
       case 'hermes':
         return <HermesTab project={props.project} active={openIds.includes('hermes')} />
       case 'claudecode':
@@ -1077,13 +1179,13 @@ function WorkspaceShellInner(props: {
       >
         <div
           className="shortcuts-overlay-card"
+          onMouseDown={(e) => e.stopPropagation()}
           role="dialog"
           aria-label="Keyboard Shortcuts"
-          onMouseDown={(e) => e.stopPropagation()}
         >
           <header className="shortcuts-overlay-header">
             <span>Keyboard Shortcuts</span>
-            <button className="ghost tiny" onClick={() => setShowShortcutsOverlay(false)} aria-label="Close keyboard shortcuts">x</button>
+            <button className="ghost tiny" onClick={() => setShowShortcutsOverlay(false)} aria-label="Close keyboard shortcuts">×</button>
           </header>
           {sections.map((section) => (
             <section key={section.title}>
@@ -1112,6 +1214,8 @@ function WorkspaceShellInner(props: {
     if (node.type === 'pane') {
       const panel = node.id
       const meta = PANEL_META[panel]
+      const title = PANEL_TITLES[panel]
+      const showKind = meta.kind.trim().toLowerCase() !== title.trim().toLowerCase()
       // Hide panel being dragged (topbar drag only)
       const hidden = isDragging && drag?.panel === panel
       return (
@@ -1132,8 +1236,8 @@ function WorkspaceShellInner(props: {
             >
               <span className="panel-accent" aria-hidden />
               <div className="workspace-panel-meta" title={meta.hint}>
-                <span className="workspace-panel-title">{PANEL_TITLES[panel]}</span>
-                <span className="workspace-panel-kind">{meta.kind}</span>
+                <span className="workspace-panel-title">{title}</span>
+                {showKind && <span className="workspace-panel-kind">{meta.kind}</span>}
                 <span className="workspace-panel-hint">{meta.hint}</span>
               </div>
               <StatusBadge tone={meta.tone}>{meta.status}</StatusBadge>
@@ -1197,6 +1301,8 @@ function WorkspaceShellInner(props: {
     if (node.type === 'pane') {
       const panel = node.id
       const meta = PANEL_META[panel]
+      const title = PANEL_TITLES[panel]
+      const showKind = meta.kind.trim().toLowerCase() !== title.trim().toLowerCase()
       const hidden = isDragging && drag?.panel === panel
       if (hidden) return null
       return (
@@ -1216,8 +1322,8 @@ function WorkspaceShellInner(props: {
           >
             <span className="panel-accent" aria-hidden />
             <div className="workspace-panel-meta" title={meta.hint}>
-              <span className="workspace-panel-title">{PANEL_TITLES[panel]}</span>
-              <span className="workspace-panel-kind">{meta.kind}</span>
+              <span className="workspace-panel-title">{title}</span>
+              {showKind && <span className="workspace-panel-kind">{meta.kind}</span>}
               <span className="workspace-panel-hint">{meta.hint}</span>
             </div>
             <StatusBadge tone={meta.tone}>{meta.status}</StatusBadge>
@@ -1275,10 +1381,10 @@ function WorkspaceShellInner(props: {
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
-  handlersRef.current = { openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone }
+  handlersRef.current = { openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, activePanelFromFocus, resetLayout }
 
   return (
-    <div className={`shell mode-${shellAccent}`} data-testid="workspace-shell">
+    <div ref={shellRef} className={`shell mode-${shellAccent}`} data-testid="workspace-shell">
       <header className="topbar" ref={topbarRef}>
         <span className="project-badge">{props.project.name}</span>
         <div className="topbar-sep" aria-hidden />
@@ -1290,6 +1396,7 @@ function WorkspaceShellInner(props: {
             return (
               <div key={group.label} className="topbar-group">
                 <button
+                  ref={group.label === 'Knowledge' ? knowledgeButtonRef : undefined}
                   className={`topbar-group-btn${hasOpen ? ' has-open' : ''}`}
                   onClick={(e) => {
                     e.stopPropagation()
@@ -1302,6 +1409,16 @@ function WorkspaceShellInner(props: {
                   <span className="topbar-group-chevron" aria-hidden>▾</span>
                   {hasOpen && <span className="topbar-group-dot" aria-hidden />}
                 </button>
+                {group.label === 'AI' && activeAgentIds.length > 0 && (
+                  <span
+                    className="topbar-activity-badge"
+                    data-testid="topbar-activity-badge"
+                    title={`Active: ${activeAgentIds.map((id) => PANEL_TITLES[id]).join(', ')}`}
+                  >
+                    <BreathingDot />
+                    {activeAgentIds.length} active
+                  </span>
+                )}
                 {group.panels.map(item => {
                   const panel = item.id
                   const isOpen = openIds.includes(panel)
@@ -1390,7 +1507,7 @@ function WorkspaceShellInner(props: {
             <div
               className={`workspace-area${isDragging ? ' workspace-dragging' : ''}`}
               ref={workspaceRef}
-              style={{ width: '100%', height: '100%', flex: 1, minWidth: 0, minHeight: 0, position: 'relative', overflow: 'hidden' }}
+              style={{ width: '100%', height: '100%', flex: 1, minWidth: 0, minHeight: 0, position: 'relative', overflow: 'auto' }}
             >
               {activeLayout.root && renderRoot(activeLayout.root)}
 
@@ -1398,7 +1515,8 @@ function WorkspaceShellInner(props: {
               {PANELS.filter(p => !openIds.includes(p)).map(p => (
                 <div
                   key={p}
-                  data-testid={`workspace-panel-${p}`}
+                  data-testid={`workspace-panel-hidden-${p}`}
+                  aria-hidden="true"
                   style={{ display: 'none' }}
                 >
                   {renderContent(p)}
@@ -1461,6 +1579,15 @@ function WorkspaceShellInner(props: {
 
       {renderShortcutOverlay()}
 
+      {commandPaletteOpen && (
+        <CommandPalette
+          project={props.project}
+          projects={props.projects}
+          onOpenProject={props.onOpenProject}
+          onClose={() => setCommandPaletteOpen(false)}
+        />
+      )}
+
       {/* Ghost tab portal */}
       {isDragging && drag && createPortal(
         <div
@@ -1481,7 +1608,7 @@ function WorkspaceShellInner(props: {
 
       {/* Group dropdown portal */}
       {groupDropdown && createPortal(
-        <div
+        <AnimatedDropdown
           className="topbar-dropdown"
           style={{
             position: 'fixed',
@@ -1499,7 +1626,7 @@ function WorkspaceShellInner(props: {
                 key={panel}
                 className={`topbar-dropdown-item${isOpen ? ' is-open' : ''}`}
                 onClick={() => {
-                  isOpen ? closePanel(panel) : openPanel(panel)
+                  handleRackClick(panel)
                   setGroupDropdown(null)
                 }}
               >
@@ -1509,13 +1636,13 @@ function WorkspaceShellInner(props: {
               </button>
             )
           })}
-        </div>,
+        </AnimatedDropdown>,
         document.body
       )}
 
       {/* Presets dropdown portal */}
       {presetsDropdown && createPortal(
-        <div
+        <AnimatedDropdown
           className="topbar-dropdown"
           style={{
             position: 'fixed',
@@ -1567,7 +1694,7 @@ function WorkspaceShellInner(props: {
               <button className="ghost tiny" onClick={() => void deletePreset(preset.id)} title="Delete preset">×</button>
             </div>
           ))}
-        </div>,
+        </AnimatedDropdown>,
         document.body
       )}
 
@@ -1610,6 +1737,7 @@ export default function WorkspaceShell(props: {
   onRefresh: () => void
   onOpenGlobal: () => void
   onOpenProject: (p: Project) => void
+  onOpenSetupWizard: () => void
 }) {
   return (
     <ToastProvider>

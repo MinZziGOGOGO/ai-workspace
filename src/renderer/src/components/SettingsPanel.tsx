@@ -5,13 +5,16 @@ import type {
   RemoteHermesConfig,
   SettingsDiagnostics,
   SettingsSummary,
+  UsageSummaryRow,
   WebCompanionStatus,
 } from '../types'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceNotice } from './WorkspacePrimitives'
 import { useShortcuts } from '../ShortcutContext'
 import { formatShortcutKey, isModifierOnlyKey, parseKey, type Shortcut } from '../shortcuts'
-import { applyMotionPreference } from '../motion'
+import { applyMotionPreference, type MotionMode } from '../motion'
+import { applyTheme } from '../theme'
+import { SETTING_CHANGED_EVENT } from '../notify'
 
 type OllamaStatus = { connected: boolean; defaultModel: string | null }
 type ClaudeStatus = { installed: boolean; version?: string; bin?: string; error?: string }
@@ -19,7 +22,7 @@ type CodexStatus = { installed: boolean; version?: string; bin?: string; error?:
 
 type SectionId =
   | 'overview' | 'appearance' | 'workspace' | 'agents' | 'models' | 'knowledge'
-  | 'research' | 'editor' | 'web' | 'privacy' | 'shortcuts' | 'diagnostics' | 'advanced'
+  | 'usage' | 'research' | 'editor' | 'web' | 'privacy' | 'shortcuts' | 'diagnostics' | 'advanced'
 
 interface SettingMeta {
   key: string
@@ -32,8 +35,8 @@ interface SettingMeta {
 }
 
 const SETTINGS: SettingMeta[] = [
-  { key: 'ui_theme', label: 'Theme', description: 'Applies a system, dark, or light palette preference.', section: 'appearance', type: 'select', wired: 'partial', options: [
-    { value: 'system', label: 'System' }, { value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light (preview)' },
+  { key: 'ui_theme', label: 'Theme', description: 'Applies a system, dark, or light palette preference.', section: 'appearance', type: 'select', wired: 'wired', options: [
+    { value: 'system', label: 'System' }, { value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' },
   ] },
   { key: 'ui_density', label: 'Density', description: 'Controls workspace spacing and compactness.', section: 'appearance', type: 'select', wired: 'wired', options: [
     { value: 'comfortable', label: 'Comfortable' }, { value: 'compact', label: 'Compact' },
@@ -41,7 +44,10 @@ const SETTINGS: SettingMeta[] = [
   { key: 'ui_font_scale', label: 'UI text size', description: 'Scales interface text across the renderer.', section: 'appearance', type: 'select', wired: 'wired', options: [
     { value: '95', label: 'Small (95%)' }, { value: '100', label: 'Default (100%)' }, { value: '110', label: 'Large (110%)' }, { value: '120', label: 'Extra large (120%)' },
   ] },
-  { key: 'ui_reduced_motion', label: 'Reduced motion', description: 'Disables nonessential animation and transitions.', section: 'appearance', type: 'toggle', wired: 'wired' },
+  { key: 'ui_motion_mode', label: 'Motion', description: 'Controls workspace animation. Reduced also follows the OS reduced-motion setting.', section: 'appearance', type: 'select', wired: 'wired', options: [
+    { value: 'full', label: 'Full' }, { value: 'reduced', label: 'Reduced' }, { value: 'off', label: 'Off' },
+  ] },
+  { key: 'notify_sound_enabled', label: 'Play sound when a response completes', description: "Plays a short tone when a response finishes in the background — while this window isn't focused, or that panel isn't the one you're looking at.", section: 'appearance', type: 'toggle', wired: 'wired' },
   { key: 'workspace_startup', label: 'Startup workspace', description: 'Preferred workspace landing behavior on next launch.', section: 'workspace', type: 'select', wired: 'planned', options: [
     { value: 'last', label: 'Last opened' }, { value: 'global', label: 'Global Workspace' },
   ] },
@@ -57,9 +63,9 @@ const SETTINGS: SettingMeta[] = [
     { value: 'web', label: 'Web only' }, { value: 'local', label: 'Local knowledge' }, { value: 'both', label: 'Web + local knowledge' },
   ] },
   { key: 'research_result_limit', label: 'Research result target', description: 'Stored preference for result-volume tuning in future research builds.', section: 'research', type: 'number', wired: 'planned' },
-  { key: 'editor_font_size', label: 'Editor font size (pt)', description: 'Default font size for Editor panel sessions.', section: 'editor', type: 'number', wired: 'planned' },
-  { key: 'editor_tab_size', label: 'Editor tab size', description: 'Default tab/indent size for code editing.', section: 'editor', type: 'number', wired: 'planned' },
-  { key: 'editor_word_wrap', label: 'Editor word wrap', description: 'Default word wrap preference for editor sessions.', section: 'editor', type: 'toggle', wired: 'planned' },
+  { key: 'editor_font_size', label: 'Editor font size (pt)', description: 'Default font size for Editor panel sessions.', section: 'editor', type: 'number', wired: 'wired' },
+  { key: 'editor_tab_size', label: 'Editor tab size', description: 'Default tab/indent size for code editing.', section: 'editor', type: 'number', wired: 'wired' },
+  { key: 'editor_word_wrap', label: 'Editor word wrap', description: 'Default word wrap preference for editor sessions.', section: 'editor', type: 'toggle', wired: 'wired' },
   { key: 'terminal_start_dir', label: 'Terminal startup folder', description: 'Terminal opens in the project folder when available, otherwise falls back.', section: 'editor', type: 'select', wired: 'partial', options: [
     { value: 'project', label: 'Project folder' }, { value: 'app', label: 'App folder fallback' },
   ] },
@@ -72,6 +78,7 @@ const SECTION_ICONS: Record<SectionId, string> = {
   agents:      '⚡',
   models:      '◈',
   knowledge:   '◇',
+  usage:       '▤',
   research:    '◎',
   editor:      '▣',
   web:         '◈',
@@ -88,6 +95,7 @@ const SECTIONS: { id: SectionId; label: string; description: string }[] = [
   { id: 'agents',      label: 'Agents',            description: 'Codex, Claude Code, and Hermes status and preferences.' },
   { id: 'models',      label: 'Models',            description: 'Ollama host, default models, and cloud key status.' },
   { id: 'knowledge',   label: 'Knowledge',         description: 'Shared memory controls, visibility, and explanations.' },
+  { id: 'usage',       label: 'Usage',             description: 'Today\'s message and task counts per agent.' },
   { id: 'research',    label: 'Research',          description: 'SearXNG endpoint and research defaults.' },
   { id: 'editor',      label: 'Editor & Terminal', description: 'Local editing and shell preferences.' },
   { id: 'web',         label: 'Web Companion',     description: 'Optional private-network mobile Chat access.' },
@@ -101,7 +109,9 @@ const DEFAULT_VALUES: Record<string, string> = {
   ui_theme: 'system',
   ui_density: 'comfortable',
   ui_font_scale: '100',
+  ui_motion_mode: 'full',
   ui_reduced_motion: 'false',
+  notify_sound_enabled: 'false',
   workspace_startup: 'last',
   workspace_confirm_destructive: 'true',
   workspace_panel_hints: 'true',
@@ -119,10 +129,20 @@ const DEFAULT_VALUES: Record<string, string> = {
 
 function applyUiPrefs(values: Record<string, string | null>) {
   const root = document.documentElement
-  root.dataset.theme = values.ui_theme ?? DEFAULT_VALUES.ui_theme
+  applyTheme(values.ui_theme ?? DEFAULT_VALUES.ui_theme)
   root.dataset.density = values.ui_density ?? DEFAULT_VALUES.ui_density
   root.dataset.fontScale = values.ui_font_scale ?? DEFAULT_VALUES.ui_font_scale
-  applyMotionPreference(values.ui_reduced_motion === 'true')
+  const rawMotion = values.ui_motion_mode ?? (values.ui_reduced_motion === 'true' ? 'reduced' : DEFAULT_VALUES.ui_motion_mode)
+  const motionMode: MotionMode = rawMotion === 'reduced' || rawMotion === 'off' ? rawMotion : 'full'
+  applyMotionPreference(motionMode)
+}
+
+const USAGE_AGENTS = ['chat', 'claudecode', 'hermes', 'codex'] as const
+const USAGE_LABELS: Record<(typeof USAGE_AGENTS)[number], string> = {
+  chat: 'Chat',
+  claudecode: 'Claude Code',
+  hermes: 'Hermes',
+  codex: 'Codex',
 }
 
 function tone(ok: boolean | undefined): 'success' | 'error' {
@@ -186,7 +206,7 @@ function SettingsRow(props: {
   )
 }
 
-function SettingsToggle(props: { checked: boolean; onChange: (next: boolean) => void; label: string }) {
+function SettingsToggle(props: { checked: boolean; onChange: (next: boolean) => void; label: string; testId?: string }) {
   return (
     <button
       type="button"
@@ -195,6 +215,7 @@ function SettingsToggle(props: { checked: boolean; onChange: (next: boolean) => 
       aria-checked={props.checked}
       aria-label={props.label}
       onClick={() => props.onChange(!props.checked)}
+      data-testid={props.testId}
     >
       <span />
     </button>
@@ -345,13 +366,17 @@ export default function SettingsPanel(props: {
   const [webCompanion, setWebCompanion] = useState<WebCompanionStatus | null>(null)
   const [newWebToken, setNewWebToken] = useState('')
   const [diagnostics, setDiagnostics] = useState<SettingsDiagnostics | null>(null)
+  const [usage, setUsage] = useState<UsageSummaryRow[] | null>(null)
   const [cloudKeyInput, setCloudKeyInput] = useState('')
   const [confirmClear, setConfirmClear] = useState(false)
+  // Setup wizard flag: checked = wizard will run again on next launch.
+  const [showWizardNextLaunch, setShowWizardNextLaunch] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [validation, setValidation] = useState<Record<string, string>>({})
   const msgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshSeq = useRef(0)
 
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
 
@@ -384,35 +409,60 @@ export default function SettingsPanel(props: {
   }, [props.project.id])
 
   async function refresh() {
+    const seq = ++refreshSeq.current
     try {
       setError('')
-      const [settingsSummary, nextOllama, nextCodex, nextClaude, nextHermes, cfg, nextWeb] = await Promise.all([
+      const [settingsSummary, nextWeb] = await Promise.all([
         window.api.settings.summary(),
+        window.api.webCompanion.status(),
+      ])
+      if (seq !== refreshSeq.current) return
+      setSummary(settingsSummary)
+      const merged = { ...DEFAULT_VALUES, ...settingsSummary.values }
+      setValues(merged)
+      applyUiPrefs(merged)
+      setWebCompanion(nextWeb)
+      void window.api.setup.isComplete()
+        .then((complete) => { if (seq === refreshSeq.current) setShowWizardNextLaunch(!complete) })
+        .catch(() => {})
+      void refreshMemoryCount(seq)
+      window.setTimeout(() => void refreshProviderStatus(seq), 50)
+      void window.api.usage.today()
+        .then((rows) => { if (seq === refreshSeq.current) setUsage(rows) })
+        .catch(() => {})
+    } catch (e: any) {
+      setError(String(e?.message ?? e))
+    }
+  }
+
+  async function refreshMemoryCount(seq = refreshSeq.current) {
+    try {
+      const nextCount = isGlobalWorkspace
+        ? (await window.api.memory.list(props.project.id)).length
+        : await window.api.memory.count(props.project.id)
+      if (seq === refreshSeq.current) setCount(nextCount)
+    } catch (e: any) {
+      if (seq === refreshSeq.current) setError(String(e?.message ?? e))
+    }
+  }
+
+  async function refreshProviderStatus(seq = refreshSeq.current) {
+    try {
+      const [nextOllama, nextCodex, nextClaude, nextHermes, cfg] = await Promise.all([
         window.api.ollama.status(),
         window.api.codex.check(),
         window.api.claudeCode.check(),
         window.api.hermes.check(),
         window.api.hermes.getConfig(),
-        window.api.webCompanion.status(),
       ])
-      setSummary(settingsSummary)
-      const merged = { ...DEFAULT_VALUES, ...settingsSummary.values }
-      setValues(merged)
-      applyUiPrefs(merged)
+      if (seq !== refreshSeq.current) return
       setOllama(nextOllama)
       setCodex(nextCodex)
       setClaude(nextClaude)
       setHermes(nextHermes)
       setHermesConfig(cfg)
-      setWebCompanion(nextWeb)
-      if (isGlobalWorkspace) {
-        const items = await window.api.memory.list(props.project.id)
-        setCount(items.length)
-      } else {
-        setCount(await window.api.memory.count(props.project.id))
-      }
     } catch (e: any) {
-      setError(String(e?.message ?? e))
+      if (seq === refreshSeq.current) setError(String(e?.message ?? e))
     }
   }
 
@@ -444,6 +494,7 @@ export default function SettingsPanel(props: {
     try {
       await window.api.settings.set(meta.key, next)
       if (meta.section === 'appearance') applyUiPrefs({ ...values, [meta.key]: next })
+      window.dispatchEvent(new CustomEvent(SETTING_CHANGED_EVENT, { detail: { key: meta.key, value: next } }))
       showMessage('Saved')
     } catch (e: any) {
       setError(String(e?.message ?? e))
@@ -573,6 +624,38 @@ export default function SettingsPanel(props: {
     return JSON.stringify({ exportedAt: new Date().toISOString(), settings: summary }, null, 2)
   }
 
+  async function importSettings() {
+    const filePath = await window.api.files.pick()
+    if (!filePath) return
+    if (!filePath.toLowerCase().endsWith('.json')) {
+      setError('Choose a .json settings file.')
+      return
+    }
+    const confirmed = window.confirm(
+      'This will overwrite your current settings with values from the file. Continue?'
+    )
+    if (!confirmed) return
+    setSavingKey('settings-import')
+    try {
+      const file = await window.api.files.read(filePath)
+      if (file.type !== 'text' || typeof file.content !== 'string') {
+        setError('Could not read the file as text.')
+        return
+      }
+      const result = await window.api.settings.import(file.content)
+      if (result.success) {
+        showMessage(`Imported ${result.imported ?? 0} ${result.imported === 1 ? 'setting' : 'settings'}`)
+        await refresh()
+      } else {
+        setError(result.error ?? 'Import failed')
+      }
+    } catch (e: any) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
   function sectionSettings(section: SectionId) {
     return SETTINGS.filter((s) => s.section === section && (!query || `${s.label} ${s.description} ${s.key}`.toLowerCase().includes(query.toLowerCase())))
   }
@@ -608,6 +691,15 @@ export default function SettingsPanel(props: {
   const activeSection = visibleSections.some((s) => s.id === active) ? active : visibleSections[0]?.id ?? 'overview'
 
   const agentCount = (codex?.installed ? 1 : 0) + (claude?.installed ? 1 : 0) + (hermes?.installed ? 1 : 0)
+
+  const usageByAgent = useMemo(() => {
+    const map: Partial<Record<(typeof USAGE_AGENTS)[number], UsageSummaryRow>> = {}
+    for (const row of usage ?? []) {
+      if ((USAGE_AGENTS as readonly string[]).includes(row.agent)) map[row.agent as (typeof USAGE_AGENTS)[number]] = row
+    }
+    return map
+  }, [usage])
+  const maxUsageCount = Math.max(1, ...USAGE_AGENTS.map((id) => usageByAgent[id]?.message_count ?? 0))
 
   return (
     <div className="settings-overlay" onClick={props.onClose} data-testid="settings-overlay">
@@ -892,6 +984,37 @@ export default function SettingsPanel(props: {
               </SettingsSection>
             )}
 
+            {/* ── Usage ────────────────────────────────────────────────── */}
+            {activeSection === 'usage' && (
+              <SettingsSection id="settings-usage" title="Usage" description="Today's message and task counts, per agent. This device only.">
+                <WorkspaceNotice title="Counts only, no cost estimates" tone="info">
+                  Token counts below are rough estimates (~4 characters per token), not billed usage. Every agent here runs through a subscription CLI login, not metered API billing, so there is nothing to price.
+                </WorkspaceNotice>
+                <div className="usage-today-list" data-testid="settings-usage-list">
+                  {USAGE_AGENTS.map((id) => {
+                    const row = usageByAgent[id]
+                    const count = row?.message_count ?? 0
+                    const tokens = row?.estimated_tokens ?? 0
+                    const pct = Math.round((count / maxUsageCount) * 100)
+                    const unit = id === 'chat' ? (count === 1 ? 'message' : 'messages') : (count === 1 ? 'task' : 'tasks')
+                    return (
+                      <div className="usage-row" key={id} data-testid={`settings-usage-row-${id}`}>
+                        <div className="usage-row-head">
+                          <span className="usage-row-label">{USAGE_LABELS[id]}</span>
+                          <span className="usage-row-count">
+                            {count} {unit}
+                            {id === 'chat' && count > 0 ? ` · ~${tokens.toLocaleString()} tokens` : ''}
+                          </span>
+                        </div>
+                        <div className="usage-row-bar"><div className="usage-row-bar-fill" style={{ width: `${pct}%` }} /></div>
+                      </div>
+                    )
+                  })}
+                  {usage === null && <p className="muted small">Loading today's usage…</p>}
+                </div>
+              </SettingsSection>
+            )}
+
             {/* ── Research ─────────────────────────────────────────────── */}
             {activeSection === 'research' && (
               <SettingsSection id="settings-research" title="Research" description="Deep research defaults and search backend configuration.">
@@ -1119,10 +1242,39 @@ export default function SettingsPanel(props: {
                 </SettingsRow>
                 <SettingsRow
                   label="Import settings"
-                  description="Not implemented in this pass. Importing settings needs schema validation and version checks to be safe."
+                  description="Loads setting values from an exported JSON file. Only known settings are applied; keys and other secrets are never imported."
                 >
-                  <span className="settings-mini-badge">Coming soon</span>
+                  <button
+                    className="ghost"
+                    onClick={importSettings}
+                    disabled={savingKey === 'settings-import'}
+                    data-testid="settings-import"
+                  >
+                    {savingKey === 'settings-import' ? 'Importing…' : 'Import settings…'}
+                  </button>
                 </SettingsRow>
+                <div className="settings-subpanel">
+                  <h3>Setup</h3>
+                  <SettingsRow
+                    label="Show setup wizard on next launch"
+                    description="Re-runs the first-launch tool detection wizard the next time the app starts."
+                  >
+                    <SettingsToggle
+                      label="Show setup wizard on next launch"
+                      testId="settings-show-setup-wizard"
+                      checked={showWizardNextLaunch}
+                      onChange={async (next) => {
+                        try {
+                          await window.api.setup.markComplete(!next)
+                          setShowWizardNextLaunch(next)
+                          showMessage(next ? 'Setup wizard will run on next launch' : 'Setup wizard stays hidden')
+                        } catch (e: any) {
+                          setError(String(e?.message ?? e))
+                        }
+                      }}
+                    />
+                  </SettingsRow>
+                </div>
                 <WorkspaceNotice title="Dangerous operations" tone="warning">
                   Layout resets close all open panels. Credential clears remove stored keys. These actions cannot be undone from within Settings.
                 </WorkspaceNotice>

@@ -9,7 +9,12 @@ contextBridge.exposeInMainWorld('api', {
     import: () => ipcRenderer.invoke('projects:import'),
     open: (id: string) => ipcRenderer.invoke('projects:open', id),
     archive: (id: string, archived: boolean) => ipcRenderer.invoke('projects:archive', id, archived),
-    pickFolder: () => ipcRenderer.invoke('projects:pickFolder')
+    pickFolder: () => ipcRenderer.invoke('projects:pickFolder'),
+    getLinks: (projectId: string) => ipcRenderer.invoke('projects:getLinks', projectId),
+    addLink: (srcId: string, dstId: string) => ipcRenderer.invoke('projects:addLink', srcId, dstId),
+    removeLink: (srcId: string, dstId: string) => ipcRenderer.invoke('projects:removeLink', srcId, dstId),
+    getAvailableLinkTargets: (projectId: string) =>
+      ipcRenderer.invoke('projects:getAvailableLinkTargets', projectId)
   },
   models: {
     list: () => ipcRenderer.invoke('models:list'),
@@ -30,16 +35,30 @@ contextBridge.exposeInMainWorld('api', {
   },
   sessions: {
     list: (projectId: string, mode: string) => ipcRenderer.invoke('sessions:list', projectId, mode),
+    listArchived: (projectId: string, mode: string) =>
+      ipcRenderer.invoke('sessions:listArchived', projectId, mode),
     create: (projectId: string, mode: string, title: string) =>
       ipcRenderer.invoke('sessions:create', projectId, mode, title),
     rename: (id: string, title: string) => ipcRenderer.invoke('sessions:rename', id, title),
-    delete: (id: string) => ipcRenderer.invoke('sessions:delete', id)
+    archive: (id: string, archived: boolean) => ipcRenderer.invoke('sessions:archive', id, archived),
+    delete: (id: string) => ipcRenderer.invoke('sessions:delete', id),
+    generateSummary: (sessionId: string, model: string) =>
+      ipcRenderer.invoke('sessions:generateSummary', sessionId, model)
+  },
+  messages: {
+    update: (id: string, content: string) => ipcRenderer.invoke('messages:update', id, content),
+    deleteAfter: (sessionId: string, messageId: string) => ipcRenderer.invoke('messages:deleteAfter', sessionId, messageId),
+    setReaction: (id: string, reaction: 'up' | 'down' | null) => ipcRenderer.invoke('messages:setReaction', id, reaction)
   },
   chat: {
     messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
-    send: (args: { sessionId: string; projectId: string; model: string; content: string; images?: string[] }) =>
+    send: (args: { sessionId: string; projectId: string; model: string; content: string; images?: string[]; systemPrefix?: string; regenerateMessageId?: string }) =>
       ipcRenderer.invoke('chat:send', args),
     abort: (sessionId: string) => ipcRenderer.invoke('chat:abort', sessionId),
+    classifyHandoff: (opts: { model: string; conversationContext: string; userMessage: string }) =>
+      ipcRenderer.invoke('chat:classifyHandoff', opts),
+    generateHandoffPrompt: (opts: { model: string; agent: 'claudecode' | 'hermes' | 'codex'; conversationHistory: string }) =>
+      ipcRenderer.invoke('chat:generateHandoffPrompt', opts),
     onToken: (cb: (d: { sessionId: string; token: string }) => void) => {
       const fn = (_: unknown, d: any) => cb(d)
       ipcRenderer.on('chat:token', fn)
@@ -55,7 +74,7 @@ contextBridge.exposeInMainWorld('api', {
       ipcRenderer.on('chat:error', fn)
       return () => ipcRenderer.removeListener('chat:error', fn)
     },
-    onUsage: (cb: (d: { used: number; max: number | null }) => void) => {
+    onUsage: (cb: (d: { sessionId: string; used: number; max: number | null }) => void) => {
       const fn = (_: unknown, d: any) => cb(d)
       ipcRenderer.on('chat:usage', fn)
       return () => ipcRenderer.removeListener('chat:usage', fn)
@@ -99,6 +118,7 @@ contextBridge.exposeInMainWorld('api', {
       skipGitRepoCheck?: boolean
       model?: string
       imagePaths?: string[]
+      regenerateMessageId?: string
     }) => ipcRenderer.invoke('codex:send', args),
     onEvent: (cb: (d: any) => void) => {
       const fn = (_: unknown, d: any) => cb(d)
@@ -122,6 +142,7 @@ contextBridge.exposeInMainWorld('api', {
       model?: string
       effort?: 'normal' | 'high' | 'max'
       thinking?: boolean
+      regenerateMessageId?: string
     }) => ipcRenderer.invoke('claudecode:send', args),
     abort: (sessionId: string) => ipcRenderer.invoke('claudecode:abort', sessionId),
     onEvent: (cb: (d: { sessionId: string; event: any }) => void) => {
@@ -139,7 +160,26 @@ contextBridge.exposeInMainWorld('api', {
       const fn = (_: unknown, d: any) => cb(d)
       ipcRenderer.on('claudecode:done', fn)
       return () => ipcRenderer.removeListener('claudecode:done', fn)
+    },
+    onCheckpoint: (cb: (d: {
+      sessionId: string
+      messageId: string
+      success: boolean
+      checkpointId?: string
+      commitHash?: string
+      reason?: 'not-git' | 'dirty' | 'error'
+      error?: string
+    }) => void) => {
+      const fn = (_: unknown, d: any) => cb(d)
+      ipcRenderer.on('claudecode:checkpoint', fn)
+      return () => ipcRenderer.removeListener('claudecode:checkpoint', fn)
     }
+  },
+  checkpoints: {
+    create: (sessionId: string, projectPath: string, description: string) =>
+      ipcRenderer.invoke('checkpoints:create', sessionId, projectPath, description),
+    list: (sessionId: string) => ipcRenderer.invoke('checkpoints:list', sessionId),
+    rollback: (checkpointId: string) => ipcRenderer.invoke('checkpoints:rollback', checkpointId)
   },
   // Phase F: Terminal — real PTY via node-pty, rendered via xterm.js.
   terminal: {
@@ -158,6 +198,10 @@ contextBridge.exposeInMainWorld('api', {
       return () => ipcRenderer.removeListener('terminal:exit', fn)
     }
   },
+  // Git status for the Navigator file tree indicators.
+  git: {
+    status: (projectPath: string) => ipcRenderer.invoke('git:status', projectPath)
+  },
   // Phase D/E: filesystem access for Navigator file tree and Editor panel.
   fs: {
     readDir: (path: string) => ipcRenderer.invoke('fs:readDir', path),
@@ -171,11 +215,20 @@ contextBridge.exposeInMainWorld('api', {
     connect: (distro?: string) => ipcRenderer.invoke('hermes:connect', distro),
     messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
     abort: (sessionId: string) => ipcRenderer.invoke('hermes:abort', sessionId),
-    send: (args: { sessionId: string; projectId: string; prompt: string; injectMemory?: boolean }) =>
+    send: (args: { sessionId: string; projectId: string; prompt: string; injectMemory?: boolean; regenerateMessageId?: string }) =>
       ipcRenderer.invoke('hermes:send', args),
     getConfig: () => ipcRenderer.invoke('hermes:getConfig'),
     setConfig: (config: unknown) => ipcRenderer.invoke('hermes:setConfig', config),
     testConnection: (config?: unknown) => ipcRenderer.invoke('hermes:testConnection', config),
+    getPermissionMode: () => ipcRenderer.invoke('hermes:getPermissionMode'),
+    setPermissionMode: (mode: number) => ipcRenderer.invoke('hermes:setPermissionMode', mode),
+    respondPermission: (args: {
+      sessionId: string
+      requestId: string
+      approved: boolean
+      actionKind?: string
+      alwaysAllowSession?: boolean
+    }) => ipcRenderer.invoke('hermes:respondPermission', args),
     onEvent: (cb: (d: { sessionId: string; event: any }) => void) => {
       const fn = (_: unknown, d: any) => cb(d)
       ipcRenderer.on('hermes:event', fn)
@@ -197,6 +250,13 @@ contextBridge.exposeInMainWorld('api', {
       return () => ipcRenderer.removeListener('hermes:usage', fn)
     }
   },
+  // Hermes dashboard skills API (Extensions panel Skills tab).
+  hermesSkills: {
+    list: () => ipcRenderer.invoke('hermesSkills:list'),
+    toggle: (name: string, enabled: boolean) => ipcRenderer.invoke('hermesSkills:toggle', name, enabled),
+    search: (query: string) => ipcRenderer.invoke('hermesSkills:search', query),
+    install: (identifier: string) => ipcRenderer.invoke('hermesSkills:install', identifier)
+  },
   mcp: {
     list: () => ipcRenderer.invoke('mcp:list'),
     add: (name: string, config: unknown) => ipcRenderer.invoke('mcp:add', name, config),
@@ -204,7 +264,14 @@ contextBridge.exposeInMainWorld('api', {
     setEnabled: (name: string, enabled: boolean) => ipcRenderer.invoke('mcp:setEnabled', name, enabled),
     check: (name: string) => ipcRenderer.invoke('mcp:check', name),
     checkAll: () => ipcRenderer.invoke('mcp:checkAll'),
-    getConfigPath: () => ipcRenderer.invoke('mcp:getConfigPath')
+    getConfigPath: () => ipcRenderer.invoke('mcp:getConfigPath'),
+    getKnowledgeServerPath: () => ipcRenderer.invoke('mcp:getKnowledgeServerPath')
+  },
+  // First-run setup wizard: tool detection + completion flag.
+  setup: {
+    detectTools: () => ipcRenderer.invoke('setup:detectTools'),
+    isComplete: () => ipcRenderer.invoke('setup:isComplete'),
+    markComplete: (complete?: boolean) => ipcRenderer.invoke('setup:markComplete', complete)
   },
   // Settings: thin key/value wrapper over app_meta for UI-configurable values.
   settings: {
@@ -214,7 +281,8 @@ contextBridge.exposeInMainWorld('api', {
     setMany: (values: Record<string, string>) => ipcRenderer.invoke('settings:setMany', values),
     delete: (key: string) => ipcRenderer.invoke('settings:delete', key),
     summary: () => ipcRenderer.invoke('settings:summary'),
-    diagnostics: () => ipcRenderer.invoke('settings:diagnostics')
+    diagnostics: () => ipcRenderer.invoke('settings:diagnostics'),
+    import: (jsonString: string) => ipcRenderer.invoke('settings:import', jsonString)
   },
   webCompanion: {
     status: () => ipcRenderer.invoke('webCompanion:status'),
@@ -236,6 +304,7 @@ contextBridge.exposeInMainWorld('api', {
       scope: 'web' | 'local' | 'both'
       projectId: string | null
       saveToProject: boolean
+      quick?: boolean
     }) => ipcRenderer.invoke('research:start', args),
     cancel: () => ipcRenderer.invoke('research:cancel'),
     onProgress: (cb: (d: any) => void) => {
@@ -261,5 +330,23 @@ contextBridge.exposeInMainWorld('api', {
     read: (filePath: string) => ipcRenderer.invoke('instructions:read', filePath),
     write: (filePath: string, content: string) => ipcRenderer.invoke('instructions:write', filePath, content),
     getPath: (agentId: string, projectPath: string) => ipcRenderer.invoke('instructions:getPath', agentId, projectPath)
+  },
+  // Lightweight daily usage counters (message/task counts, no cost estimates).
+  usage: {
+    today: () => ipcRenderer.invoke('usage:today')
+  },
+  // Background-completion notification: pings the main process for a taskbar
+  // cue (flashFrame on Windows, badge count elsewhere) when unfocused.
+  window: {
+    notifyActivity: () => ipcRenderer.invoke('window:notifyActivity')
+  },
+  // Contextual tips: simple usage stats + a shown/dismissed ledger so a tip
+  // never displays more than once (see src/renderer/src/tips.ts).
+  tips: {
+    stats: () => ipcRenderer.invoke('tips:stats'),
+    shownIds: () => ipcRenderer.invoke('tips:shownIds'),
+    markShown: (tipId: string) => ipcRenderer.invoke('tips:markShown', tipId),
+    dismiss: (tipId: string) => ipcRenderer.invoke('tips:dismiss', tipId),
+    markHandoffUsed: () => ipcRenderer.invoke('tips:markHandoffUsed')
   }
 })

@@ -1,16 +1,36 @@
-import { createPortal } from 'react-dom'
-import { useEffect, useRef, useState } from 'react'
-import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, RemoteHermesConfig, ComposerAttachment } from '../types'
-import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, HermesPlanEntry, HermesPermissionMode, HermesPermissionRequestInfo, RemoteHermesConfig, ComposerAttachment } from '../types'
+import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import { useToast } from './ToastContext'
+import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
-import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, OutputActions } from './AgentPanelPrimitives'
+import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
+import { WorkspaceNotice } from './WorkspacePrimitives'
 import InstructionsEditor from './InstructionsEditor'
+import anime, { animateScrollToBottom, prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
+import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
+import { isLastAssistantMessage, useMessageActions } from '../messageActions'
+import { useCompletionNotifier } from '../notify'
 
 const HERMES_MODEL = 'gemma4-workspace:12b'
+
+const HERMES_EMPTY_HEADINGS = [
+  'What should Hermes work on?',
+  'Ready for an autonomous task.',
+  'Hand it to Hermes.',
+]
+
+const PERMISSION_MODES: Array<{ mode: HermesPermissionMode; label: string; description: string }> = [
+  { mode: 1, label: 'Ask before everything', description: 'Every tool call requires your approval.' },
+  { mode: 2, label: 'Read & create files', description: 'Reads and creates files freely — asks before modifying/deleting existing files or running commands.' },
+  { mode: 3, label: 'Can edit files', description: 'Reads, writes, and edits files freely — asks before running terminal commands.' },
+  { mode: 4, label: 'Can run commands', description: 'Full file access plus terminal commands — asks before destructive actions (delete, force push).' },
+  { mode: 5, label: 'High autonomy', description: 'Minimal interruption — only asks for genuinely dangerous operations.' },
+]
+const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.hermes.pinned'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
@@ -33,22 +53,57 @@ function ThinkingBlock(props: { text: string; tokenCount: number; done: boolean 
   )
 }
 
+const KANBAN_COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
+  { key: 'todo', label: 'To Do', statuses: ['pending'] },
+  { key: 'in_progress', label: 'In Progress', statuses: ['in_progress'] },
+  { key: 'done', label: 'Done', statuses: ['completed'] },
+]
+
+function columnForStatus(status: string): string {
+  const match = KANBAN_COLUMNS.find((c) => c.statuses.includes(status))
+  return match?.key ?? 'todo'
+}
+
+function KanbanBoard(props: { entries: HermesPlanEntry[] }) {
+  if (props.entries.length === 0) {
+    return (
+      <div className="empty center kanban-empty">
+        <p className="muted">No active task list. Hermes will show a board here when it&apos;s tracking multi-step work.</p>
+      </div>
+    )
+  }
+  return (
+    <div className="kanban-board">
+      {KANBAN_COLUMNS.map((col) => {
+        const cards = props.entries.filter((e) => columnForStatus(e.status) === col.key)
+        return (
+          <div key={col.key} className="kanban-column">
+            <div className="kanban-column-header">{col.label} · {cards.length}</div>
+            <div className="kanban-column-body">
+              {cards.map((c, i) => (
+                <div key={i} className="kanban-card">{c.content}</div>
+              ))}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function ActivityLog(props: { entries: HermesActivity[]; live?: boolean }) {
   if (props.entries.length === 0) return null
   return (
-    <div className="activity-log">
-      <div className="activity-head">Activity</div>
-      <ul>
-        {props.entries.map((e, i) => (
-          <li key={i} className={`activity-item ${e.kind === 'error' ? 'err' : ''}`}>
-            <span className={`activity-status ${props.live && i === props.entries.length - 1 ? 'pending' : ''}`}>
-              {e.kind === 'error' ? '✕' : e.kind === 'tool' ? '▸' : e.kind === 'plan' ? '☐' : '•'}
-            </span>
-            <span className="activity-tool">{e.kind}</span>
-            <span className="activity-summary">{e.message}</span>
-          </li>
-        ))}
-      </ul>
+    <div className="tool-activity">
+      {props.entries.map((e, i) => (
+        <div key={i} className="activity-line-item">
+          <div className="activity-line">
+            <span className={`activity-line-name${e.kind === 'error' ? ' err' : ''}`}>{e.kind}</span>
+            <span className="activity-line-detail">{e.message}</span>
+            {props.live && i === props.entries.length - 1 && <span className="activity-line-spinner" aria-hidden>◌</span>}
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
@@ -170,9 +225,11 @@ interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function HermesTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
+  const { setActive: setAgentActive } = useAgentActivity()
   const [check, setCheck] = useState<HermesCheck | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
+  const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
@@ -182,6 +239,8 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [streamText, setStreamText] = useState('')
   const [thoughtText, setThoughtText] = useState('')
   const [activity, setActivity] = useState<HermesActivity[]>([])
+  const [planEntries, setPlanEntries] = useState<HermesPlanEntry[]>([])
+  const [view, setView] = useState<'chat' | 'board'>('chat')
   const [error, setError] = useState('')
   const [config, setConfig] = useState<RemoteHermesConfig | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -193,15 +252,28 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [contextMenu, setContextMenu] = useState<CtxMenu | null>(null)
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
+  const confirmDestructive = useConfirmDestructive()
+  const [renderOffset, setRenderOffset] = useState(0)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
+  const [isDragOver, setIsDragOver] = useState(false)
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [instructionsOpen, setInstructionsOpen] = useState<{ agentId: string; agentLabel: string } | null>(null)
   const [agentMdExists, setAgentMdExists] = useState(false)
   const [sharedMdExists, setSharedMdExists] = useState(false)
+  const [permissionMode, setPermissionMode] = useState<HermesPermissionMode>(3)
+  const [pendingPermission, setPendingPermission] = useState<HermesPermissionRequestInfo | null>(null)
+  const [respondingPermission, setRespondingPermission] = useState(false)
+  const [emptyHeading] = useState(() => HERMES_EMPTY_HEADINGS[Math.floor(Math.random() * HERMES_EMPTY_HEADINGS.length)])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
+  const scrollAnimRef = useRef<MotionHandle>(null)
+  const sessionSwitchAnimRef = useRef<MotionHandle>(null)
+  const sessionRef = useRef<Session | null>(null)
+  const newSessionRef = useRef<() => void>(() => {})
+  const handoffRef = useRef<(detail: HandoffSendDetail) => void>(() => {})
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const checkRef = useRef<HermesCheck | null>(null)
   checkRef.current = check
 
@@ -211,6 +283,53 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const contextText = [...messages.map((m) => m.content), streamText, thoughtText, input].filter(Boolean).join('\n')
   const estimatedTokens = estimateTokensFromText(contextText)
   const contextStatus = running ? 'Running' : connected ? 'Ready' : 'Disconnected'
+  const notifyCompletion = useCompletionNotifier(active)
+  const lastActivity = activity[activity.length - 1]
+  const activeToolName = running && lastActivity?.kind === 'tool' && !lastActivity.message.startsWith('✓') ? lastActivity.message : null
+  const hermesHasStarted = streamText.length > 0 || thoughtText.length > 0 || activity.length > 0
+  const statusPhrase = useStatusPhrase({
+    active: running,
+    hasStarted: hermesHasStarted,
+    toolName: activeToolName,
+    progressKey: `${streamText.length}:${thoughtText.length}:${activity.length}:${lastActivity?.message.length ?? 0}`
+  })
+  sessionRef.current = session
+
+  useEffect(() => () => {
+    stopMotion(scrollAnimRef.current)
+    stopMotion(sessionSwitchAnimRef.current)
+  }, [])
+
+  function selectSession(next: Session | null) {
+    if (next?.id === sessionRef.current?.id) return
+    const el = scrollRef.current
+    stopMotion(sessionSwitchAnimRef.current)
+    if (!el || prefersReducedMotion()) {
+      setSession(next)
+      return
+    }
+    const out = anime(el, { opacity: [1, 0], translateY: [0, -4], duration: 100, ease: 'outQuad' })
+    sessionSwitchAnimRef.current = out
+    if (!out) {
+      setSession(next)
+      return
+    }
+    void out.then(() => {
+      setSession(next)
+      window.requestAnimationFrame(() => {
+        const nextEl = scrollRef.current
+        if (!nextEl) return
+        sessionSwitchAnimRef.current = anime(nextEl, { opacity: [0, 1], translateY: [6, 0], duration: 150, ease: 'outExpo' })
+      })
+    })
+  }
+
+  // Publish start/stop only (not per event) so the topbar activity badge
+  // doesn't re-render on every streamed chunk.
+  useEffect(() => {
+    setAgentActive('hermes', running)
+    return () => setAgentActive('hermes', false)
+  }, [running, setAgentActive])
 
   const recheck = () => window.api.hermes.check().then(setCheck)
 
@@ -255,6 +374,25 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   }
 
   useEffect(() => { window.api.models.list().then(setOllamaModels) }, [])
+
+  useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
+    setSession((prev) => (prev && prev.id === sessionId ? { ...prev, summary } : prev))
+  })
+
+  useEffect(() => {
+    function handleTestCheck(event: Event) {
+      const detail = (event as CustomEvent<{ check?: HermesCheck }>).detail
+      const next = detail?.check ?? { wsl2: true, installed: true, connected: true, version: 'e2e' }
+      setCheck(next)
+      checkRef.current = next
+      setConnecting(false)
+      setError('')
+    }
+    window.addEventListener('aiworkspace:test:set-hermes-check', handleTestCheck)
+    return () => window.removeEventListener('aiworkspace:test:set-hermes-check', handleTestCheck)
+  }, [])
+
   useEffect(() => {
     function onFocusComposer(event: Event) {
       const panel = (event as CustomEvent<{ panel?: string }>).detail?.panel
@@ -262,13 +400,31 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     }
     function onNewSession(event: Event) {
       const panel = (event as CustomEvent<{ panel?: string }>).detail?.panel
-      if (panel === 'hermes' && !isGlobalWorkspace && connected) void newSession()
+      // Call through the ref so the guard sees the current connection state
+      // instead of the values captured at listener registration.
+      if (panel === 'hermes') newSessionRef.current()
+    }
+    function onPrefillPrompt(event: Event) {
+      const detail = (event as CustomEvent<{ panel?: string; prompt?: string }>).detail
+      if (detail?.panel === 'hermes' && typeof detail.prompt === 'string') {
+        setInput(detail.prompt)
+        textareaRef.current?.focus()
+        setSlashIdx(-1)
+      }
+    }
+    function onSelectSession(event: Event) {
+      const detail = (event as CustomEvent<{ panel?: string; session?: Session }>).detail
+      if (detail?.panel === 'hermes' && detail.session) selectSession(detail.session)
     }
     window.addEventListener('panel:focusComposer', onFocusComposer)
     window.addEventListener('panel:newSession', onNewSession)
+    window.addEventListener('panel:prefillPrompt', onPrefillPrompt)
+    window.addEventListener('panel:selectSession', onSelectSession)
     return () => {
       window.removeEventListener('panel:focusComposer', onFocusComposer)
       window.removeEventListener('panel:newSession', onNewSession)
+      window.removeEventListener('panel:prefillPrompt', onPrefillPrompt)
+      window.removeEventListener('panel:selectSession', onSelectSession)
     }
   }, [])
 
@@ -284,10 +440,34 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   }, [props.project.path, isGlobalWorkspace, instructionsOpen])
   useEffect(() => { if (!isGlobalWorkspace && active) recheck() }, [isGlobalWorkspace, active])
   useEffect(() => {
-    if (isGlobalWorkspace || !active) { setSessions([]); return }
+    if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
     window.api.sessions.list(props.project.id, 'hermes').then(setSessions)
+    window.api.sessions.listArchived(props.project.id, 'hermes').then(setArchivedSessions)
   }, [props.project.id, isGlobalWorkspace, active])
   useEffect(() => { if (!isGlobalWorkspace && active) window.api.hermes.getConfig().then(setConfig) }, [isGlobalWorkspace, active])
+  useEffect(() => { if (!isGlobalWorkspace && active) window.api.hermes.getPermissionMode().then(setPermissionMode) }, [isGlobalWorkspace, active])
+
+  async function changePermissionMode(mode: HermesPermissionMode) {
+    setPermissionMode(mode)
+    await window.api.hermes.setPermissionMode(mode)
+  }
+
+  async function respondPermission(approved: boolean, alwaysAllowSession = false) {
+    if (!pendingPermission || !session || respondingPermission) return
+    setRespondingPermission(true)
+    try {
+      await window.api.hermes.respondPermission({
+        sessionId: session.id,
+        requestId: pendingPermission.requestId,
+        approved,
+        actionKind: pendingPermission.action,
+        alwaysAllowSession
+      })
+      setPendingPermission(null)
+    } finally {
+      setRespondingPermission(false)
+    }
+  }
 
   useEffect(() => {
     if (isGlobalWorkspace || !active) return
@@ -304,8 +484,29 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => {
     if (session) window.api.hermes.messages(session.id).then(setMessages)
     else setMessages([])
-    setStreamText(''); setThoughtText(''); setActivity([]); setError('')
+    setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setError('')
+    setPendingPermission(null)
+    setRenderOffset(0)
   }, [session])
+
+  // Publish live state to the Chat→agent handoff bus.
+  useEffect(() => { setAgentPanelOpen('hermes', active) }, [active])
+  useEffect(() => { setAgentAvailable('hermes', !isGlobalWorkspace && connected) }, [connected, isGlobalWorkspace])
+  useEffect(() => {
+    if (session) setAgentSession('hermes', session.id, session.title)
+    else clearAgentCurrent('hermes')
+  }, [session])
+
+  // Receive a handoff sent programmatically from the Chat tab.
+  useEffect(() => {
+    function onHandoff(event: Event) {
+      const detail = (event as CustomEvent<HandoffSendDetail>).detail
+      if (detail?.panel !== 'hermes') return
+      void handoffRef.current(detail)
+    }
+    window.addEventListener('panel:handoffSend', onHandoff)
+    return () => window.removeEventListener('panel:handoffSend', onHandoff)
+  }, [])
 
   useEffect(() => {
     const offEvent = window.api.hermes.onEvent((d) => {
@@ -317,11 +518,14 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       else if (e.kind === 'error') setError(e.message)
       else if (e.kind === 'model') setHermesModel(e.name)
       else if (e.kind === 'commands') setCommands(e.commands)
+      else if (e.kind === 'plan') setPlanEntries(e.entries)
+      else if (e.kind === 'permissionRequest') setPendingPermission(e.request)
     })
     const offDone = window.api.hermes.onDone(async (d) => {
       if (d.sessionId !== session?.id) return
       setRunning(false); setStreamText(''); setThoughtText('')
       setMessages(await window.api.hermes.messages(d.sessionId)); setActivity([])
+      notifyCompletion()
     })
     return () => { offEvent(); offDone() }
   }, [session])
@@ -331,7 +535,10 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => {
     clearTimeout(scrollTimeoutRef.current)
     scrollTimeoutRef.current = setTimeout(() => {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: running ? 'auto' : 'smooth' })
+      const el = scrollRef.current
+      if (!el) return
+      stopMotion(scrollAnimRef.current)
+      scrollAnimRef.current = animateScrollToBottom(el, running)
     }, running ? 100 : 0)
   }, [messages, activity, streamText, thoughtText, running])
 
@@ -347,6 +554,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     const s = await window.api.sessions.create(props.project.id, 'hermes', 'New task')
     setSessions((prev) => [s, ...prev]); setSession(s)
   }
+  newSessionRef.current = () => { if (!isGlobalWorkspace && connected) void newSession() }
 
   async function deleteSession(target: Session) {
     await window.api.sessions.delete(target.id)
@@ -375,6 +583,21 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     setPinnedIds(prev => { const next = new Set(prev); if (next.has(sessionId)) next.delete(sessionId); else next.add(sessionId); savePinned(next); return next })
   }
 
+  async function toggleArchive(target: Session) {
+    setContextMenu(null)
+    const archive = !target.archived
+    await window.api.sessions.archive(target.id, archive)
+    if (archive) {
+      setSessions(prev => prev.filter(x => x.id !== target.id))
+      setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
+      if (session?.id === target.id) { setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('') }
+    } else {
+      setArchivedSessions(prev => prev.filter(x => x.id !== target.id))
+      setSessions(prev => [{ ...target, archived: 0 }, ...prev])
+    }
+    addToast(archive ? 'Session archived' : 'Session unarchived')
+  }
+
   const titleFrom = (text: string) => text.trim().replace(/\s+/g, ' ').slice(0, 50) || 'New task'
 
   async function sendTask(prompt: string) {
@@ -391,13 +614,36 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       setPendingContextBlock(null)
     }
 
-    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setInput(''); setHermesUsage(null)
+    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setInput(''); setHermesUsage(null)
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: prompt, model: null, created_at: Date.now() }])
     window.api.hermes.send({ sessionId: s.id, projectId: props.project.id, prompt: finalPrompt, injectMemory })
     setInjectMemory(false)
   }
 
-  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+  async function handoffSend(detail: HandoffSendDetail) {
+    if (isGlobalWorkspace || !connected) return
+    let s: Session | null = null
+    if (!detail.newSession && detail.sessionId) s = sessions.find((x) => x.id === detail.sessionId) ?? null
+    if (!s) {
+      s = await window.api.sessions.create(props.project.id, 'hermes', titleFrom(detail.prompt))
+      setSessions((prev) => [s!, ...prev])
+    }
+    setSession(s)
+    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setHermesUsage(null)
+    setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: detail.prompt, model: null, created_at: Date.now() }])
+    window.api.hermes.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, injectMemory: false })
+  }
+  handoffRef.current = (detail) => { void handoffSend(detail) }
+
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    for (const item of Array.from(e.clipboardData.items)) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault()
+        const att = await attachmentFromImageClipboardItem(item)
+        if (att) setAttachments(prev => [...prev, att])
+        return
+      }
+    }
     const text = e.clipboardData.getData('text/plain')
     if (text.length > 1500) {
       e.preventDefault()
@@ -419,6 +665,32 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     } catch (err) {
       addToast(err instanceof Error ? err.message : 'Failed to read file')
     }
+  }
+
+  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault()
+    setIsDragOver(false)
+    for (const file of Array.from(e.dataTransfer.files)) {
+      const path = electronFilePath(file)
+      if (!path) continue
+      try {
+        const fileAttachment = await window.api.files.read(path)
+        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
+      } catch (err) {
+        addToast(err instanceof Error ? err.message : 'Failed to read file')
+      }
+    }
+  }
+
+  async function deleteManySessions(ids: string[]) {
+    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
+    const idSet = new Set(ids)
+    setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    if (session && idSet.has(session.id)) {
+      setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('')
+    }
+    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
   }
 
   async function run() {
@@ -492,7 +764,27 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       source: 'hermes',
     })
     addToast('Saved to Knowledge')
+    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
   }
+
+  // Regenerate / edit-resend / reactions — shared logic lives in the hook,
+  // this tab only supplies how to fetch messages and how to kick a fresh task.
+  const hermesResend = useCallback((content: string, regenerateMessageId: string) => {
+    if (!session || running) return
+    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setHermesUsage(null)
+    window.api.hermes.send({ sessionId: session.id, projectId: props.project.id, prompt: content, injectMemory: false, regenerateMessageId })
+  }, [session, running, props.project.id])
+
+  const fetchHermesMessages = useCallback((sid: string) => window.api.hermes.messages(sid), [])
+
+  const { regenerate, editAndResend, setReaction } = useMessageActions({
+    sessionId: session?.id,
+    messages,
+    setMessages,
+    busy: running,
+    fetchMessages: fetchHermesMessages,
+    resend: hermesResend
+  })
 
   const renderMessage = (m: Message) => {
     if (m.role === 'tool') {
@@ -501,46 +793,111 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       return <ActivityLog key={m.id} entries={entries} />
     }
     if (m.role === 'user') return (
-      <div key={m.id} className="msg user">
-        <div className="msg-body">{m.content}</div>
-        <div className="msg-meta"><span className="msg-time"><RelativeTime ts={m.created_at} /></span></div>
-      </div>
+      <EditableUserMessage
+        key={m.id}
+        content={m.content}
+        timestamp={m.created_at}
+        disabled={running}
+        onSaveResend={(newContent) => void editAndResend(m.id, newContent)}
+        onCopy={() => void copyOutput(m.content)}
+      />
     )
     return (
       <div key={m.id} className="msg assistant">
         <div className="msg-body md-body"><Markdown>{m.content}</Markdown></div>
         <div className="msg-meta">
-          <span className="msg-time"><RelativeTime ts={m.created_at} /></span>
+          <span className="msg-timestamp"><RelativeTime ts={m.created_at} /></span>
           <OutputActions
             onCopy={() => void copyOutput(m.content)}
             onSave={() => void saveOutputToKnowledge(m)}
+            isLast={!running && isLastAssistantMessage(messages, m.id)}
+            onRegenerate={() => void regenerate()}
+            reaction={m.reaction ?? null}
+            onReaction={(r) => void setReaction(m.id, r)}
           />
         </div>
       </div>
     )
   }
 
-  const ctxSession = contextMenu ? sessions.find(s => s.id === contextMenu.sessionId) : null
+  const ctxSession = contextMenu ? [...sessions, ...archivedSessions].find(s => s.id === contextMenu.sessionId) : null
   const isRemote = config?.mode === 'remote'
-  const pinnedSessions = sessions.filter(s => pinnedIds.has(s.id))
-  const unpinnedSessions = sessions.filter(s => !pinnedIds.has(s.id))
+  const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
 
-  function renderSessionRow(s: Session) {
-    const isActive = session?.id === s.id
-    const isRenaming = renaming?.id === s.id
-    return (
-      <li key={s.id} className="session-row">
-        <button className={`session-item${isActive ? ' active' : ''}`} onClick={() => { if (!isRenaming) setSession(s) }}>
-          {isRenaming ? (
-            <input className="session-rename-input" value={renaming.value} onChange={e => setRenaming({ id: s.id, value: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void commitRename(s) } if (e.key === 'Escape') setRenaming(null) }} onBlur={() => void commitRename(s)} autoFocus onClick={e => e.stopPropagation()} />
-          ) : (
-            <span className="session-item-title">{s.title || 'New task'}</span>
-          )}
-        </button>
-        <button className="session-dot-menu" title="Session options" aria-label={`Options for ${s.title}`} onClick={e => openContextMenu(e, s)}>⋯</button>
-      </li>
-    )
-  }
+  // Context line + unified composer shell, shared between the empty state and
+  // an active session — the empty state IS the composer, ready to type into.
+  const composerBlock = (
+    <>
+      <AiContextBar
+        testId="context-bar-hermes"
+        usedTokens={session ? (hermesUsage?.used ?? estimatedTokens) : undefined}
+        maxTokens={session ? hermesUsage?.max : undefined}
+        tokensApproximate={session ? (hermesUsage === null && estimatedTokens !== undefined) : undefined}
+        model={hermesModel ?? HERMES_MODEL}
+        mode="Hermes"
+        status={contextStatus}
+      />
+      <div
+        className={`composer composer-shell${isDragOver ? ' composer-dropzone-active' : ''}`}
+        onDragOver={e => { e.preventDefault(); setIsDragOver(true) }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={e => void handleDrop(e)}
+      >
+        {isDragOver && <div className="composer-drop-overlay">Drop files to attach</div>}
+        <AttachmentChips
+          attachments={attachments}
+          models={ollamaModels}
+          onRemove={id => setAttachments(prev => prev.filter(a => a.id !== id))}
+          onVisionModelChange={(id, vm) => setAttachments(prev => prev.map(a => a.id === id ? { ...a, visionModel: vm } : a))}
+        />
+        {(() => {
+          const showSlash = input.startsWith('/') && !input.includes(' ') && commands.length > 0
+          const slashFilter = showSlash ? input.slice(1).toLowerCase() : ''
+          const filteredCmds = showSlash ? commands.filter((c) => c.name.toLowerCase().startsWith(slashFilter)) : []
+          return filteredCmds.length > 0 ? (
+            <div className="slash-palette">
+              {filteredCmds.map((cmd, i) => (
+                <button key={cmd.name} className={`slash-item ${i === slashIdx ? 'active' : ''}`} onMouseEnter={() => setSlashIdx(i)} onClick={() => { setInput(`/${cmd.name}`); setSlashIdx(-1) }}>
+                  <span className="slash-name">/{cmd.name}</span>
+                  <span className="slash-desc">{cmd.description}</span>
+                </button>
+              ))}
+            </div>
+          ) : null
+        })()}
+        <textarea
+          ref={textareaRef}
+          data-composer="true"
+          data-testid="hermes-composer"
+          placeholder="Describe a task for Hermes…  (Enter to send · Shift+Enter for newline)"
+          value={input}
+          onChange={(e) => { setInput(e.target.value); setSlashIdx(-1) }}
+          onPaste={handlePaste}
+          onKeyDown={handleKeyDown}
+        />
+        <div className="composer-bar">
+          <div className="composer-bar-left">
+            <button className="composer-icon-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>＋</button>
+            <div className="model-select model-picker-plain" data-testid="hermes-mode-control" title={PERMISSION_MODES.find((m) => m.mode === permissionMode)?.description}>
+              <select
+                data-testid="hermes-permission-mode"
+                value={permissionMode}
+                onChange={(e) => void changePermissionMode(Number(e.target.value) as HermesPermissionMode)}
+              >
+                {PERMISSION_MODES.map((m) => <option key={m.mode} value={m.mode}>{m.label}</option>)}
+              </select>
+              <span className="model-select-chevron">⌄</span>
+            </div>
+          </div>
+          <div className="composer-bar-right">
+            {running
+              ? <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn stop" onClick={cancelRun} title="Stop Hermes">Stop</button>
+              : <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn" data-testid="hermes-send" disabled={!connected} onClick={() => void run()}>Send</button>}
+          </div>
+        </div>
+      </div>
+    </>
+  )
 
   if (isGlobalWorkspace) return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
@@ -649,6 +1006,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     <div className="chat-layout">
       <AgentSessionRail
         sessions={sessions}
+        archivedSessions={archivedSessions}
         activeSessionId={session?.id}
         pinnedIds={pinnedIds}
         renaming={renaming}
@@ -657,34 +1015,37 @@ export default function HermesTab(props: { project: Project; active?: boolean })
         emptyLabel="No Hermes tasks yet"
         headerSlot={hermesHeaderSlot}
         onNew={newSession}
-        onSelect={setSession}
+        onSelect={selectSession}
         onOptions={openContextMenu}
         onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
         onRenameCommit={(s) => void commitRename(s)}
         onRenameCancel={() => setRenaming(null)}
+        onDeleteMany={deleteManySessions}
       />
 
       <section className="chat-main">
         {!session ? (
-          <>
-            <div className="empty center">
-              <div className="empty-icon" aria-hidden>
-                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+          <div className="empty-hero">
+            <h2 className="empty-state-heading">
+              <span className="empty-state-icon" style={{ color: 'var(--accent-hermes)' }} aria-hidden>
+                <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="5" r="2.4" /><circle cx="5" cy="18" r="2.4" /><circle cx="19" cy="18" r="2.4" />
                   <path d="M12 7.4v4.2M12 11.6 6.6 16.2M12 11.6l5.4 4.6" />
                 </svg>
-              </div>
-              <h2>Hand off to Hermes.</h2>
-              <p className="muted">{isRemote ? 'Hermes runs autonomously on a remote host via SSH + ACP. Give it a task and it works through it, streaming its activity here.' : "Hermes runs autonomously in WSL2 via ACP. Give it a task and it works through it, streaming its activity here. It shares this workspace's memory through the knowledge MCP server."}</p>
-              <button className="primary" onClick={newSession}>Start a task</button>
-            </div>
-            <AiContextBar testId="context-bar-hermes" model={HERMES_MODEL} mode="Hermes" status={contextStatus} />
-          </>
+              </span>
+              {emptyHeading}
+            </h2>
+            {composerBlock}
+          </div>
         ) : (
           <>
             <header className="chat-header">
               <span className="chat-header-title">{session.title}</span>
               <div className="hermes-header-right">
+                <div className="hermes-view-toggle" role="group" aria-label="View">
+                  <button className={`hermes-view-btn ${view === 'chat' ? 'on' : ''}`} onClick={() => setView('chat')}>Chat</button>
+                  <button className={`hermes-view-btn ${view === 'board' ? 'on' : ''}`} onClick={() => setView('board')}>Board</button>
+                </div>
                 <span className={`hermes-conn ${connected ? 'ok' : 'bad'}`} title={connected ? 'Hermes ACP connected' : 'Hermes disconnected'}>
                   <span className="status-dot" />
                   {connected ? (isRemote ? `Connected · remote${check?.version ? ` · ${check.version}` : ''}` : `Connected${check?.version ? ` · ${check.version}` : ''}`) : 'Disconnected'}
@@ -701,79 +1062,71 @@ export default function HermesTab(props: { project: Project; active?: boolean })
             </header>
             <AgentStatusStrip
               agent="Hermes"
-              status={running ? 'Running' : connected ? 'Ready' : 'Disconnected'}
+              status={running ? (statusPhrase ?? 'Running') : connected ? 'Ready' : 'Disconnected'}
               tone={running ? 'info' : connected ? 'success' : 'warning'}
+              running={running}
               detail={isRemote ? 'Remote SSH' : 'WSL2 ACP'}
             />
 
-            <div className="chat-scroll" ref={scrollRef}>
-              {messages.map(renderMessage)}
-              {running && (
-                <div className="cc-live">
-                  {thoughtText && <ThinkingBlock text={thoughtText} tokenCount={thoughtText.split(/\s+/).filter(Boolean).length} done={streamText.length > 0} />}
-                  {streamText && <div className="msg assistant"><div className="msg-body md-body"><Markdown>{streamText}</Markdown><span className="cursor">&#x2587;</span></div></div>}
-                  <ActivityLog entries={activity} live />
-                  {!streamText && !thoughtText && activity.length === 0 && <div className="cc-note muted small">Connecting to Hermes…<span className="cursor">&#x2587;</span></div>}
-                </div>
-              )}
-            </div>
+            {view === 'board' ? (
+              <div className="chat-scroll kanban-scroll">
+                <KanbanBoard entries={planEntries} />
+              </div>
+            ) : (
+              <div className="chat-scroll" ref={scrollRef}>
+                {messages.length > RENDER_LIMIT + renderOffset && (
+                  <button className="ghost load-older-btn" onClick={() => setRenderOffset((o) => o + RENDER_LIMIT)}>
+                    Load older messages
+                  </button>
+                )}
+                {visibleMessages.map(renderMessage)}
+                {running && (
+                  <div className="cc-live">
+                    {thoughtText && <ThinkingBlock text={thoughtText} tokenCount={thoughtText.split(/\s+/).filter(Boolean).length} done={streamText.length > 0} />}
+                    {streamText && <div className="msg assistant"><div className="msg-body md-body"><Markdown>{streamText}</Markdown><span className="cursor">&#x2587;</span></div></div>}
+                    <ActivityLog entries={activity} live />
+                    {!streamText && !thoughtText && activity.length === 0 && <div className="cc-note muted small">{statusPhrase ?? 'Connecting to Hermes…'}<span className="cursor">&#x2587;</span></div>}
+                  </div>
+                )}
+              </div>
+            )}
 
             {error && <AgentErrorNotice title="Hermes could not run">{error}</AgentErrorNotice>}
 
-            <AiContextBar testId="context-bar-hermes" usedTokens={hermesUsage?.used ?? estimatedTokens} maxTokens={hermesUsage?.max} tokensApproximate={hermesUsage === null && estimatedTokens !== undefined} model={hermesModel ?? HERMES_MODEL} mode="Hermes" status={contextStatus} />
-
-            <div className="composer">
-              <AttachmentChips
-                attachments={attachments}
-                models={ollamaModels}
-                onRemove={id => setAttachments(prev => prev.filter(a => a.id !== id))}
-                onVisionModelChange={(id, vm) => setAttachments(prev => prev.map(a => a.id === id ? { ...a, visionModel: vm } : a))}
-              />
-              {(() => {
-                const showSlash = input.startsWith('/') && !input.includes(' ') && commands.length > 0
-                const slashFilter = showSlash ? input.slice(1).toLowerCase() : ''
-                const filteredCmds = showSlash ? commands.filter((c) => c.name.toLowerCase().startsWith(slashFilter)) : []
-                return filteredCmds.length > 0 ? (
-                  <div className="slash-palette">
-                    {filteredCmds.map((cmd, i) => (
-                      <button key={cmd.name} className={`slash-item ${i === slashIdx ? 'active' : ''}`} onMouseEnter={() => setSlashIdx(i)} onClick={() => { setInput(`/${cmd.name}`); setSlashIdx(-1) }}>
-                        <span className="slash-name">/{cmd.name}</span>
-                        <span className="slash-desc">{cmd.description}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : null
-              })()}
-              <textarea
-                ref={textareaRef}
-                data-composer="true"
-                placeholder="Describe a task for Hermes…  (Enter to send · Shift+Enter for newline)"
-                value={input}
-                onChange={(e) => { setInput(e.target.value); setSlashIdx(-1) }}
-                onPaste={handlePaste}
-                onKeyDown={handleKeyDown}
-              />
-              <div className="composer-bar">
-                <span className="cc-hint muted small">{connected ? (isRemote ? 'Hermes · remote SSH · subscription-free local agent' : 'Hermes · WSL2 ACP · subscription-free local agent') : 'Hermes disconnected'}</span>
-                <div className="composer-actions">
-                  <button className="composer-attach-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>📎</button>
-                  {running ? <button className="danger send-btn stop-btn" onClick={cancelRun} title="Stop Hermes">■ Stop</button> : <button className="send-btn" disabled={!connected} onClick={() => void run()}>Send</button>}
-                </div>
+            {pendingPermission && (
+              <div className="agent-error-wrap hermes-permission-wrap" data-testid="hermes-permission-card">
+                <WorkspaceNotice
+                  title={`⚠ Hermes wants to: ${pendingPermission.title}`}
+                  tone="warning"
+                  action={
+                    <div className="hermes-permission-actions">
+                      <button className="ghost" disabled={respondingPermission} onClick={() => void respondPermission(false)}>Deny</button>
+                      <button className="primary" disabled={respondingPermission} onClick={() => void respondPermission(true)}>Approve</button>
+                      <button className="ghost" disabled={respondingPermission} onClick={() => void respondPermission(true, true)}>Always allow this session</button>
+                    </div>
+                  }
+                />
               </div>
-            </div>
+            )}
+
+            {composerBlock}
           </>
         )}
       </section>
 
       {/* ── Context menu portal ── */}
-      {contextMenu && ctxSession && createPortal(
-        <div className="session-context-menu" style={{ top: contextMenu.y, left: contextMenu.x }} onPointerDown={e => e.stopPropagation()}>
-          <button className="session-context-item" onClick={() => togglePin(contextMenu.sessionId)}>{pinnedIds.has(contextMenu.sessionId) ? 'Unpin' : 'Pin'}</button>
-          <button className="session-context-item" onClick={() => startRename(ctxSession)}>Rename</button>
-          <div className="session-context-divider" />
-          <button className="session-context-item danger" onClick={() => { setContextMenu(null); void deleteSession(ctxSession) }}>Delete</button>
-        </div>,
-        document.body
+      {contextMenu && ctxSession && (
+        <SessionContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          pinned={pinnedIds.has(contextMenu.sessionId)}
+          archived={!!ctxSession.archived}
+          confirmDestructive={confirmDestructive}
+          onTogglePin={() => togglePin(contextMenu.sessionId)}
+          onRename={() => startRename(ctxSession)}
+          onToggleArchive={() => void toggleArchive(ctxSession)}
+          onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+        />
       )}
     </div>
       {instructionsOpen && (

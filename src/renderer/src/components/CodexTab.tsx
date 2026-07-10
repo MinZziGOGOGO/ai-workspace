@@ -1,22 +1,57 @@
-import { createPortal } from 'react-dom'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexSandboxMode, ComposerAttachment } from '../types'
-import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
+import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import { useToast } from './ToastContext'
+import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { fallbackTitleFromText, isGenericSessionTitle } from '../../../shared/sessionTitles'
-import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, OutputActions } from './AgentPanelPrimitives'
+import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import InstructionsEditor from './InstructionsEditor'
+import anime, { animateScrollToBottom, prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
+import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
+import { isLastAssistantMessage, useMessageActions } from '../messageActions'
+import { useCompletionNotifier } from '../notify'
 
 const CODEX_MODEL = 'Codex CLI'
+
+const CODEX_EMPTY_HEADINGS = [
+  'What are we building?',
+  'Ready when you are.',
+  'Describe a task for Codex.',
+]
+const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.codex.pinned'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
 }
 function savePinned(s: Set<string>) { localStorage.setItem(PINNED_KEY, JSON.stringify([...s])) }
+
+const KNOWN_MODELS = ['gpt-5.5', 'o3', 'o4-mini', 'o3-mini']
+const CUSTOM_MODELS_KEY = 'aiworkspace.codex.customModels'
+const CUSTOM_MODEL_SENTINEL = '__custom__'
+function loadCustomModels(): string[] {
+  try {
+    const arr = JSON.parse(localStorage.getItem(CUSTOM_MODELS_KEY) ?? '[]')
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : []
+  } catch { return [] }
+}
+function saveCustomModels(list: string[]) {
+  localStorage.setItem(CUSTOM_MODELS_KEY, JSON.stringify(list.slice(0, 5)))
+}
+function rememberCustomModel(value: string, prev: string[]): string[] {
+  const next = [value, ...prev.filter((m) => m !== value)].slice(0, 5)
+  saveCustomModels(next)
+  return next
+}
+
+const SANDBOX_META: Record<CodexSandboxMode, { label: string; icon: string; tone: 'neutral' | 'warning' | 'error' }> = {
+  'read-only': { label: 'Read-only', icon: '◎', tone: 'neutral' },
+  'workspace-write': { label: 'Workspace write', icon: '✎', tone: 'warning' },
+  'danger-full-access': { label: 'Full access', icon: '⚠', tone: 'error' },
+}
 
 function ToolCard(props: { entry: CodexActivityEntry; live?: boolean }) {
   const { entry, live } = props
@@ -24,16 +59,15 @@ function ToolCard(props: { entry: CodexActivityEntry; live?: boolean }) {
   const lines = entry.summary.split('\n'); const detail = lines[0]; const body = lines.slice(1).join('\n')
   const hasBody = body.trim().length > 0
   const [open, setOpen] = useState(false)
-  const icon = status === 'error' ? '✕' : status === 'done' ? '✓' : status === 'running' ? '◌' : '•'
   return (
-    <div className={`tool-card status-${status}`}>
-      <button className="tool-card-head" onClick={() => hasBody && setOpen((o) => !o)} disabled={!hasBody} aria-expanded={hasBody ? open : undefined} title={hasBody ? (open ? 'Collapse' : 'Expand') : detail}>
-        <span className={`tool-card-status ${status === 'running' ? 'pending' : ''}`}>{icon}</span>
-        <span className="tool-card-name">{entry.name}</span>
-        <span className="tool-card-detail">{detail}</span>
-        {hasBody && <span className="tool-card-chevron">{open ? '▾' : '▸'}</span>}
+    <div className={`activity-line-item status-${status}`}>
+      <button className="activity-line" onClick={() => hasBody && setOpen((o) => !o)} disabled={!hasBody} aria-expanded={hasBody ? open : undefined} title={hasBody ? (open ? 'Collapse' : 'Expand') : detail}>
+        <span className={`activity-line-name${status === 'error' ? ' err' : ''}`}>{entry.name}</span>
+        <span className="activity-line-detail">{detail}</span>
+        {status === 'running' && <span className="activity-line-spinner" aria-hidden>◌</span>}
+        {hasBody && <span className="chevron">{open ? '⌄' : '›'}</span>}
       </button>
-      {hasBody && open && <div className="tool-card-body"><pre className="tool-output">{body}</pre></div>}
+      {hasBody && open && <div className="activity-detail"><pre className="tool-output">{body}</pre></div>}
     </div>
   )
 }
@@ -41,11 +75,8 @@ function ToolCard(props: { entry: CodexActivityEntry; live?: boolean }) {
 function ActivityLog(props: { entries: CodexActivityEntry[]; live?: boolean }) {
   if (props.entries.length === 0) return null
   return (
-    <div className="tool-activity">
-      <div className="activity-head">Activity</div>
-      <div className="tool-card-list motion-list motion-list-tight">
-        {props.entries.map((e, i) => <ToolCard key={i} entry={e} live={props.live && e.ok === undefined} />)}
-      </div>
+    <div className="tool-activity motion-list motion-list-tight">
+      {props.entries.map((e, i) => <ToolCard key={i} entry={e} live={props.live && e.ok === undefined} />)}
     </div>
   )
 }
@@ -91,8 +122,10 @@ interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function CodexTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
+  const { setActive: setAgentActive } = useAgentActivity()
   const [check, setCheck] = useState<CodexCheck | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
+  const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
@@ -106,26 +139,90 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const [model, setModel] = useState<string>(() => {
     try { return localStorage.getItem('codex-preferred-model') ?? 'gpt-5.5' } catch { return 'gpt-5.5' }
   })
+  const [customModels, setCustomModels] = useState<string[]>(() => loadCustomModels())
+  const [customEditing, setCustomEditing] = useState(false)
+  const [customDraft, setCustomDraft] = useState('')
+  const [dangerConfirmOpen, setDangerConfirmOpen] = useState(false)
   const [usageTokens, setUsageTokens] = useState<number | undefined>(undefined)
   const [contextMenu, setContextMenu] = useState<CtxMenu | null>(null)
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
+  const confirmDestructive = useConfirmDestructive()
+  const [renderOffset, setRenderOffset] = useState(0)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
+  const [isDragOver, setIsDragOver] = useState(false)
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [instructionsOpen, setInstructionsOpen] = useState<{ agentId: string; agentLabel: string } | null>(null)
   const [agentMdExists, setAgentMdExists] = useState(false)
   const [sharedMdExists, setSharedMdExists] = useState(false)
+  const [emptyHeading] = useState(() => CODEX_EMPTY_HEADINGS[Math.floor(Math.random() * CODEX_EMPTY_HEADINGS.length)])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
+  const scrollAnimRef = useRef<MotionHandle>(null)
+  const sessionSwitchAnimRef = useRef<MotionHandle>(null)
+  const sessionRef = useRef<Session | null>(null)
+  const newSessionRef = useRef<() => void>(() => {})
+  const handoffRef = useRef<(detail: HandoffSendDetail) => void>(() => {})
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const lastPromptRef = useRef('')
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
   const contextText = [...messages.map((m) => m.content), output, input].filter(Boolean).join('\n')
   const estimatedTokens = estimateTokensFromText(contextText)
+  const notifyCompletion = useCompletionNotifier(active)
+  const lastCodexActivity = activity[activity.length - 1]
+  const codexStatusPhrase = useStatusPhrase({
+    active: running,
+    hasStarted: output.length > 0 || activity.length > 0,
+    toolName: !output && lastCodexActivity ? lastCodexActivity.name : null,
+    progressKey: `${output.length}:${activity.length}`
+  })
+  sessionRef.current = session
+
+  useEffect(() => () => {
+    stopMotion(scrollAnimRef.current)
+    stopMotion(sessionSwitchAnimRef.current)
+  }, [])
+
+  function selectSession(next: Session | null) {
+    if (next?.id === sessionRef.current?.id) return
+    const el = scrollRef.current
+    stopMotion(sessionSwitchAnimRef.current)
+    if (!el || prefersReducedMotion()) {
+      setSession(next)
+      return
+    }
+    const out = anime(el, { opacity: [1, 0], translateY: [0, -4], duration: 100, ease: 'outQuad' })
+    sessionSwitchAnimRef.current = out
+    if (!out) {
+      setSession(next)
+      return
+    }
+    void out.then(() => {
+      setSession(next)
+      window.requestAnimationFrame(() => {
+        const nextEl = scrollRef.current
+        if (!nextEl) return
+        sessionSwitchAnimRef.current = anime(nextEl, { opacity: [0, 1], translateY: [6, 0], duration: 150, ease: 'outExpo' })
+      })
+    })
+  }
+
+  // Publish start/stop only (not per event) so the topbar activity badge
+  // doesn't re-render on every streamed chunk.
+  useEffect(() => {
+    setAgentActive('codex', running)
+    return () => setAgentActive('codex', false)
+  }, [running, setAgentActive])
 
   useEffect(() => { window.api.models.list().then(setOllamaModels) }, [])
+
+  useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
+    setSession((prev) => (prev && prev.id === sessionId ? { ...prev, summary } : prev))
+  })
 
   useEffect(() => {
     function onFocusComposer(event: Event) {
@@ -134,13 +231,30 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     }
     function onNewSession(event: Event) {
       const panel = (event as CustomEvent<{ panel?: string }>).detail?.panel
-      if (panel === 'codex' && !isGlobalWorkspace && check?.installed) void newSession()
+      // Call through the ref so the guard sees the current check/workspace
+      // state instead of the values captured at listener registration.
+      if (panel === 'codex') newSessionRef.current()
+    }
+    function onPrefillPrompt(event: Event) {
+      const detail = (event as CustomEvent<{ panel?: string; prompt?: string }>).detail
+      if (detail?.panel === 'codex' && typeof detail.prompt === 'string') {
+        setInput(detail.prompt)
+        textareaRef.current?.focus()
+      }
+    }
+    function onSelectSession(event: Event) {
+      const detail = (event as CustomEvent<{ panel?: string; session?: Session }>).detail
+      if (detail?.panel === 'codex' && detail.session) selectSession(detail.session)
     }
     window.addEventListener('panel:focusComposer', onFocusComposer)
     window.addEventListener('panel:newSession', onNewSession)
+    window.addEventListener('panel:prefillPrompt', onPrefillPrompt)
+    window.addEventListener('panel:selectSession', onSelectSession)
     return () => {
       window.removeEventListener('panel:focusComposer', onFocusComposer)
       window.removeEventListener('panel:newSession', onNewSession)
+      window.removeEventListener('panel:prefillPrompt', onPrefillPrompt)
+      window.removeEventListener('panel:selectSession', onSelectSession)
     }
   }, [])
   useEffect(() => {
@@ -158,15 +272,36 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
 
   useEffect(() => { if (!isGlobalWorkspace && active) recheck() }, [isGlobalWorkspace, active])
   useEffect(() => {
-    if (isGlobalWorkspace || !active) { setSessions([]); return }
+    if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
     window.api.sessions.list(props.project.id, 'codex').then(setSessions)
+    window.api.sessions.listArchived(props.project.id, 'codex').then(setArchivedSessions)
   }, [props.project.id, isGlobalWorkspace, active])
 
   useEffect(() => {
     if (session) window.api.codex.messages(session.id).then(setMessages)
     else setMessages([])
     setOutput(''); setActivity([]); setNote(''); setError(''); setUsageTokens(undefined)
+    setRenderOffset(0)
   }, [session])
+
+  // Publish live state to the Chat→agent handoff bus.
+  useEffect(() => { setAgentPanelOpen('codex', active) }, [active])
+  useEffect(() => { setAgentAvailable('codex', !isGlobalWorkspace && !!check?.installed) }, [check, isGlobalWorkspace])
+  useEffect(() => {
+    if (session) setAgentSession('codex', session.id, session.title)
+    else clearAgentCurrent('codex')
+  }, [session])
+
+  // Receive a handoff sent programmatically from the Chat tab.
+  useEffect(() => {
+    function onHandoff(event: Event) {
+      const detail = (event as CustomEvent<HandoffSendDetail>).detail
+      if (detail?.panel !== 'codex') return
+      void handoffRef.current(detail)
+    }
+    window.addEventListener('panel:handoffSend', onHandoff)
+    return () => window.removeEventListener('panel:handoffSend', onHandoff)
+  }, [])
 
   useEffect(() => {
     const offEvent = window.api.codex.onEvent((d) => {
@@ -189,6 +324,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
       }
       setMessages(await window.api.codex.messages(d.sessionId))
       setOutput(''); setActivity([]); setNote('')
+      notifyCompletion()
     })
     return () => { offEvent(); offDone() }
   }, [session])
@@ -196,7 +332,10 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   useEffect(() => {
     clearTimeout(scrollTimeoutRef.current)
     scrollTimeoutRef.current = setTimeout(() => {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: running ? 'auto' : 'smooth' })
+      const el = scrollRef.current
+      if (!el) return
+      stopMotion(scrollAnimRef.current)
+      scrollAnimRef.current = animateScrollToBottom(el, running)
     }, running ? 100 : 0)
   }, [messages, output, activity, running])
 
@@ -212,6 +351,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     const s = await window.api.sessions.create(props.project.id, 'codex', 'New task')
     setSessions((prev) => [s, ...prev]); setSession(s)
   }
+  newSessionRef.current = () => { if (!isGlobalWorkspace && check?.installed) void newSession() }
 
   async function deleteSession(target: Session) {
     await window.api.sessions.delete(target.id)
@@ -240,6 +380,21 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     setPinnedIds(prev => { const next = new Set(prev); if (next.has(sessionId)) next.delete(sessionId); else next.add(sessionId); savePinned(next); return next })
   }
 
+  async function toggleArchive(target: Session) {
+    setContextMenu(null)
+    const archive = !target.archived
+    await window.api.sessions.archive(target.id, archive)
+    if (archive) {
+      setSessions(prev => prev.filter(x => x.id !== target.id))
+      setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
+      if (session?.id === target.id) { setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError('') }
+    } else {
+      setArchivedSessions(prev => prev.filter(x => x.id !== target.id))
+      setSessions(prev => [{ ...target, archived: 0 }, ...prev])
+    }
+    addToast(archive ? 'Session archived' : 'Session unarchived')
+  }
+
   const titleFrom = (text: string) => fallbackTitleFromText(text) ?? 'New task'
 
   async function sendPrompt(prompt: string, imagePaths?: string[]) {
@@ -255,7 +410,31 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt, sandbox, skipGitRepoCheck, model, imagePaths: imagePaths?.length ? imagePaths : undefined })
   }
 
-  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+  async function handoffSend(detail: HandoffSendDetail) {
+    if (isGlobalWorkspace || !check?.installed) return
+    let s: Session | null = null
+    if (!detail.newSession && detail.sessionId) s = sessions.find((x) => x.id === detail.sessionId) ?? null
+    if (!s) {
+      s = await window.api.sessions.create(props.project.id, 'codex', titleFrom(detail.prompt))
+      setSessions((prev) => [s!, ...prev])
+    }
+    setSession(s)
+    lastPromptRef.current = detail.prompt
+    setError(''); setRunning(true); setOutput(''); setActivity([]); setNote('')
+    setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: detail.prompt, model: null, created_at: Date.now() }])
+    window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, sandbox, skipGitRepoCheck, model })
+  }
+  handoffRef.current = (detail) => { void handoffSend(detail) }
+
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    for (const item of Array.from(e.clipboardData.items)) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault()
+        const att = await attachmentFromImageClipboardItem(item)
+        if (att) setAttachments(prev => [...prev, att])
+        return
+      }
+    }
     const text = e.clipboardData.getData('text/plain')
     if (text.length > 1500) {
       e.preventDefault()
@@ -279,6 +458,32 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     }
   }
 
+  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault()
+    setIsDragOver(false)
+    for (const file of Array.from(e.dataTransfer.files)) {
+      const path = electronFilePath(file)
+      if (!path) continue
+      try {
+        const fileAttachment = await window.api.files.read(path)
+        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
+      } catch (err) {
+        addToast(err instanceof Error ? err.message : 'Failed to read file')
+      }
+    }
+  }
+
+  async function deleteManySessions(ids: string[]) {
+    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
+    const idSet = new Set(ids)
+    setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    if (session && idSet.has(session.id)) {
+      setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError('')
+    }
+    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
+  }
+
   async function run() {
     if (running || !check?.installed) return
     if (!input.trim()) return
@@ -294,12 +499,13 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
           setError(`Image "${attachment.file.name}" does not have a readable file path.`)
           return
         }
-        try {
-          imagePaths.push(await window.api.files.copyToProject(sourcePath, props.project.path))
-        } catch (err) {
-          setError(err instanceof Error ? err.message : `Failed to copy image "${attachment.file.name}" into the project.`)
+        const copied = await window.api.files.copyToProject(sourcePath, props.project.path)
+        if (!copied.success) {
+          setError(`Failed to copy image "${attachment.file.name}" into the project: ${copied.error}`)
+          addToast(`Failed to copy "${attachment.file.name}"`)
           return
         }
+        imagePaths.push(copied.path)
       }
       setAttachments([])
       void sendPrompt(resolved.content + input, imagePaths)
@@ -309,6 +515,33 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   }
 
   function stopRun() { if (session && running) window.api.codex.abort(session.id) }
+
+  function selectModel(value: string) {
+    if (value === CUSTOM_MODEL_SENTINEL) {
+      setCustomDraft('')
+      setCustomEditing(true)
+      return
+    }
+    setModel(value)
+    try { localStorage.setItem('codex-preferred-model', value) } catch { /* ignore */ }
+  }
+
+  function commitCustomModel() {
+    const value = customDraft.trim()
+    setCustomEditing(false)
+    if (!value) return
+    setModel(value)
+    try { localStorage.setItem('codex-preferred-model', value) } catch { /* ignore */ }
+    setCustomModels((prev) => rememberCustomModel(value, prev))
+  }
+
+  function selectSandbox(value: CodexSandboxMode) {
+    if (value === 'danger-full-access' && sandbox !== 'danger-full-access') {
+      setDangerConfirmOpen(true)
+      return
+    }
+    setSandbox(value)
+  }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) {
@@ -352,7 +585,28 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
       source: 'codex',
     })
     addToast('Saved to Knowledge')
+    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
   }
+
+  // Regenerate / edit-resend / reactions — shared logic lives in the hook,
+  // this tab only supplies how to fetch messages and how to kick a fresh run.
+  const codexResend = useCallback((content: string, regenerateMessageId: string) => {
+    if (!session || running || !check?.installed) return
+    lastPromptRef.current = content
+    setError(''); setRunning(true); setOutput(''); setActivity([]); setNote('')
+    window.api.codex.send({ sessionId: session.id, projectId: props.project.id, prompt: content, sandbox, skipGitRepoCheck, model, regenerateMessageId })
+  }, [session, running, check, sandbox, skipGitRepoCheck, model, props.project.id])
+
+  const fetchCodexMessages = useCallback((sid: string) => window.api.codex.messages(sid), [])
+
+  const { regenerate, editAndResend, setReaction } = useMessageActions({
+    sessionId: session?.id,
+    messages,
+    setMessages,
+    busy: running,
+    fetchMessages: fetchCodexMessages,
+    resend: codexResend
+  })
 
   const renderMessage = (m: Message) => {
     if (m.role === 'tool') {
@@ -361,70 +615,134 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
       return <ActivityLog key={m.id} entries={entries} />
     }
     if (m.role === 'user') return (
-      <div key={m.id} className="msg user">
-        <div className="msg-body">{m.content}</div>
-        <div className="msg-meta"><span className="msg-time"><RelativeTime ts={m.created_at} /></span></div>
-      </div>
+      <EditableUserMessage
+        key={m.id}
+        content={m.content}
+        timestamp={m.created_at}
+        disabled={running}
+        onSaveResend={(newContent) => void editAndResend(m.id, newContent)}
+        onCopy={() => void copyOutput(m.content)}
+      />
     )
     return (
       <div key={m.id} className="msg assistant">
         <div className="msg-body md-body"><Markdown>{m.content}</Markdown></div>
         <div className="msg-meta">
-          <span className="msg-time"><RelativeTime ts={m.created_at} /></span>
+          <span className="msg-timestamp"><RelativeTime ts={m.created_at} /></span>
           <OutputActions
             onCopy={() => void copyOutput(m.content)}
             onSave={() => void saveOutputToKnowledge(m)}
+            isLast={!running && isLastAssistantMessage(messages, m.id)}
+            onRegenerate={() => void regenerate()}
+            reaction={m.reaction ?? null}
+            onReaction={(r) => void setReaction(m.id, r)}
           />
         </div>
       </div>
     )
   }
 
-  const ctxSession = contextMenu ? sessions.find(s => s.id === contextMenu.sessionId) : null
-  const pinnedSessions = sessions.filter(s => pinnedIds.has(s.id))
-  const unpinnedSessions = sessions.filter(s => !pinnedIds.has(s.id))
+  const ctxSession = contextMenu ? [...sessions, ...archivedSessions].find(s => s.id === contextMenu.sessionId) : null
+  const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
   const contextStatus = running ? 'Running' : check?.installed ? 'Ready' : 'Checking'
 
-  function renderSessionRow(s: Session) {
-    const isActive = session?.id === s.id
-    const isRenaming = renaming?.id === s.id
-    return (
-      <li key={s.id} className="session-row">
-        <button className={`session-item${isActive ? ' active' : ''}`} onClick={() => { if (!isRenaming) setSession(s) }}>
-          {isRenaming ? (
-            <input className="session-rename-input" value={renaming.value} onChange={e => setRenaming({ id: s.id, value: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void commitRename(s) } if (e.key === 'Escape') setRenaming(null) }} onBlur={() => void commitRename(s)} autoFocus onClick={e => e.stopPropagation()} />
-          ) : (
-            <span className="session-item-title">{s.title || 'New task'}</span>
-          )}
-        </button>
-        <button className="session-dot-menu" title="Session options" aria-label={`Options for ${s.title}`} onClick={e => openContextMenu(e, s)}>⋯</button>
-      </li>
-    )
-  }
+  const modelOptions = [...KNOWN_MODELS, ...customModels.filter((m) => !KNOWN_MODELS.includes(m))]
+  const modelSelectValue = modelOptions.includes(model) ? model : CUSTOM_MODEL_SENTINEL
 
-  const SafetyControls = (
-    <div className="codex-toolbar" role="group" aria-label="Codex safety controls">
-      <div className="model-select" title="Codex model (-m)">
-        <select data-testid="codex-model" value={model} disabled={running} onChange={(e) => { setModel(e.target.value); localStorage.setItem('codex-preferred-model', e.target.value) }}>
-          <option value="gpt-5.5">gpt-5.5</option>
-          <option value="o3">o3</option>
-          <option value="o4-mini">o4-mini</option>
-          <option value="o3-mini">o3-mini</option>
-        </select>
-        <span className="model-select-chevron">▾</span>
+  // Context line + unified composer shell, shared between the empty state and
+  // an active session — the empty state IS the composer, ready to type into.
+  const composerBlock = (
+    <>
+      <AiContextBar
+        testId="context-bar-codex"
+        usedTokens={session ? (usageTokens ?? estimatedTokens) : undefined}
+        tokensApproximate={session ? usageTokens == null : undefined}
+        model={model}
+        mode={`Codex · ${SANDBOX_META[sandbox].label}`}
+        status="subscription login"
+      />
+      <div
+        className={`composer composer-shell${isDragOver ? ' composer-dropzone-active' : ''}`}
+        onDragOver={e => { e.preventDefault(); setIsDragOver(true) }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={e => void handleDrop(e)}
+      >
+        {isDragOver && <div className="composer-drop-overlay">Drop files to attach</div>}
+        <AttachmentChips
+          attachments={attachments}
+          models={ollamaModels}
+          activeModel={model}
+          onRemove={id => setAttachments(prev => prev.filter(a => a.id !== id))}
+          onVisionModelChange={(id, vm) => setAttachments(prev => prev.map(a => a.id === id ? { ...a, visionModel: vm } : a))}
+        />
+        <textarea
+          ref={textareaRef}
+          data-composer="true"
+          data-testid="codex-composer"
+          placeholder="Describe a coding task…  (Enter to run · Shift+Enter for newline)"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onPaste={handlePaste}
+          onKeyDown={handleKeyDown}
+        />
+        <div className="composer-bar">
+          <div className="composer-bar-left">
+            <button className="composer-icon-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>＋</button>
+            <div className="mode-pill-toggle" role="group" aria-label="Codex sandbox mode" data-testid="codex-sandbox" title="Codex sandbox (-s)">
+              {(Object.keys(SANDBOX_META) as CodexSandboxMode[]).map((m) => (
+                <button
+                  key={m}
+                  className={sandbox === m ? 'active' : ''}
+                  data-testid={`codex-sandbox-${m}`}
+                  disabled={running}
+                  onClick={() => selectSandbox(m)}
+                  title={`Codex sandbox: ${SANDBOX_META[m].label}`}
+                >{SANDBOX_META[m].label}</button>
+              ))}
+            </div>
+            <label className={`codex-trust-chip ${skipGitRepoCheck ? 'on' : ''}`} title="Only enable for folders you trust — Codex may read and modify files in this project.">
+              <input data-testid="codex-allow-untrusted" type="checkbox" checked={skipGitRepoCheck} disabled={running} onChange={(e) => setSkipGitRepoCheck(e.target.checked)} />
+              <span>Allow untrusted</span>
+            </label>
+          </div>
+          <div className="composer-bar-right">
+            {customEditing ? (
+              <div className="model-select codex-custom-model" title="Custom Codex model (-m)">
+                <input
+                  data-testid="codex-model-custom-input"
+                  autoFocus
+                  placeholder="Custom model string…"
+                  value={customDraft}
+                  disabled={running}
+                  onChange={(e) => setCustomDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); commitCustomModel() }
+                    if (e.key === 'Escape') { e.preventDefault(); setCustomEditing(false) }
+                  }}
+                  onBlur={commitCustomModel}
+                />
+              </div>
+            ) : (
+              <div className="model-select model-picker-plain" title="Codex model (-m)">
+                <select data-testid="codex-model" value={modelSelectValue} disabled={running} onChange={(e) => selectModel(e.target.value)}>
+                  {KNOWN_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
+                  {customModels.filter((m) => !KNOWN_MODELS.includes(m)).length > 0 && (
+                    <optgroup label="Recently used">
+                      {customModels.filter((m) => !KNOWN_MODELS.includes(m)).map((m) => <option key={m} value={m}>{m}</option>)}
+                    </optgroup>
+                  )}
+                  <option value={CUSTOM_MODEL_SENTINEL}>Custom…</option>
+                </select>
+                <span className="model-select-chevron">⌄</span>
+              </div>
+            )}
+            {running
+              ? <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn stop" onClick={stopRun} title="Stop Codex">Stop</button>
+              : <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn" data-testid="codex-send" disabled={!input.trim()} onClick={() => void run()}>Run</button>}
+          </div>
+        </div>
       </div>
-      <div className="model-select" title="Codex sandbox (-s)">
-        <select data-testid="codex-sandbox" value={sandbox} disabled={running} onChange={(e) => setSandbox(e.target.value as CodexSandboxMode)}>
-          <option value="read-only">Read-only</option>
-          <option value="workspace-write">Workspace write</option>
-        </select>
-        <span className="model-select-chevron">▾</span>
-      </div>
-      <label className={`codex-trust-chip ${skipGitRepoCheck ? 'on' : ''}`} title="Only enable for folders you trust — Codex may read and modify files in this project.">
-        <input data-testid="codex-allow-untrusted" type="checkbox" checked={skipGitRepoCheck} disabled={running} onChange={(e) => setSkipGitRepoCheck(e.target.checked)} />
-        <span>Allow in untrusted folder</span>
-      </label>
-    </div>
+    </>
   )
 
   if (isGlobalWorkspace) return (
@@ -526,6 +844,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     <div className="chat-layout">
       <AgentSessionRail
         sessions={sessions}
+        archivedSessions={archivedSessions}
         activeSessionId={session?.id}
         pinnedIds={pinnedIds}
         renaming={renaming}
@@ -534,28 +853,27 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
         emptyLabel="No Codex tasks yet"
         headerSlot={codexHeaderSlot}
         onNew={newSession}
-        onSelect={setSession}
+        onSelect={selectSession}
         onOptions={openContextMenu}
         onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
         onRenameCommit={(s) => void commitRename(s)}
         onRenameCancel={() => setRenaming(null)}
+        onDeleteMany={deleteManySessions}
       />
 
       <section className="chat-main">
         {!session ? (
-          <>
-            <div className="empty center">
-              <div className="empty-icon" aria-hidden>
-                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+          <div className="empty-hero">
+            <h2 className="empty-state-heading">
+              <span className="empty-state-icon" style={{ color: 'var(--accent-codex)' }} aria-hidden>
+                <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M8 9l-4 3 4 3" /><path d="M16 9l4 3-4 3" /><path d="M13 7l-2 10" />
                 </svg>
-              </div>
-              <h2>Hand off to Codex.</h2>
-              <p className="muted">Describe a coding task and Codex runs it using your ChatGPT Plus subscription, streaming its output and tool calls here.</p>
-              <button className="primary" data-testid="codex-start-task" onClick={newSession}>Start a task</button>
-            </div>
-            <AiContextBar testId="context-bar-codex" model={model} mode="Codex" status="subscription login" />
-          </>
+              </span>
+              {emptyHeading}
+            </h2>
+            {composerBlock}
+          </div>
         ) : (
           <>
             <header className="chat-header">
@@ -563,13 +881,19 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
             </header>
             <AgentStatusStrip
               agent="Codex"
-              status={running ? 'Running' : 'Ready'}
+              status={running ? (codexStatusPhrase ?? 'Running') : 'Ready'}
               tone={running ? 'info' : 'success'}
+              running={running}
               detail={`${model} · ${sandbox}${skipGitRepoCheck ? ' · untrusted allowed' : ''}`}
             />
 
             <div className="chat-scroll" ref={scrollRef}>
-              {messages.map(renderMessage)}
+              {messages.length > RENDER_LIMIT + renderOffset && (
+                <button className="ghost load-older-btn" onClick={() => setRenderOffset((o) => o + RENDER_LIMIT)}>
+                  Load older messages
+                </button>
+              )}
+              {visibleMessages.map(renderMessage)}
               {running && (
                 <div className="cc-live">
                   {note && <div className="cc-note muted small">{note}</div>}
@@ -577,7 +901,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
                   {output ? (
                     <div className="msg assistant"><div className="msg-body md-body"><Markdown>{output}</Markdown><span className="cursor">▋</span></div></div>
                   ) : (
-                    activity.length === 0 && <div className="cc-note muted small">Working…<span className="cursor">▋</span></div>
+                    activity.length === 0 && <div className="cc-note muted small">{codexStatusPhrase ?? 'Working…'}<span className="cursor">▋</span></div>
                   )}
                 </div>
               )}
@@ -585,55 +909,40 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
 
             {error && <AgentErrorNotice title="Codex could not run" testId="codex-error">{error}</AgentErrorNotice>}
 
-            {SafetyControls}
-
-            <AiContextBar testId="context-bar-codex" usedTokens={usageTokens ?? estimatedTokens} tokensApproximate={usageTokens == null} model={model} mode="Codex" status="subscription login" />
-
-            <div className="composer">
-              <AttachmentChips
-                attachments={attachments}
-                models={ollamaModels}
-                activeModel={model}
-                onRemove={id => setAttachments(prev => prev.filter(a => a.id !== id))}
-                onVisionModelChange={(id, vm) => setAttachments(prev => prev.map(a => a.id === id ? { ...a, visionModel: vm } : a))}
-              />
-              <textarea
-                ref={textareaRef}
-                data-composer="true"
-                data-testid="codex-composer"
-                placeholder="Describe a coding task…  (Enter to run · Shift+Enter for newline)"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onPaste={handlePaste}
-                onKeyDown={handleKeyDown}
-              />
-              <div className="composer-bar">
-                <span className="cc-hint muted small">Codex CLI · subscription login</span>
-                <div className="composer-actions">
-                  <button className="composer-attach-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>📎</button>
-                  {running
-                    ? <button className="danger send-btn stop-btn" onClick={stopRun} title="Stop Codex">■ Stop</button>
-                    : <button className="send-btn" data-testid="codex-send" disabled={!input.trim()} onClick={() => void run()}>Run</button>}
-                </div>
-              </div>
-            </div>
+            {composerBlock}
           </>
         )}
       </section>
 
       {/* ── Context menu portal ── */}
-      {contextMenu && ctxSession && createPortal(
-        <div className="session-context-menu" style={{ top: contextMenu.y, left: contextMenu.x }} onPointerDown={e => e.stopPropagation()}>
-          <button className="session-context-item" onClick={() => togglePin(contextMenu.sessionId)}>{pinnedIds.has(contextMenu.sessionId) ? 'Unpin' : 'Pin'}</button>
-          <button className="session-context-item" onClick={() => startRename(ctxSession)}>Rename</button>
-          <div className="session-context-divider" />
-          <button className="session-context-item danger" onClick={() => { setContextMenu(null); void deleteSession(ctxSession) }}>Delete</button>
-        </div>,
-        document.body
+      {contextMenu && ctxSession && (
+        <SessionContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          pinned={pinnedIds.has(contextMenu.sessionId)}
+          archived={!!ctxSession.archived}
+          confirmDestructive={confirmDestructive}
+          onTogglePin={() => togglePin(contextMenu.sessionId)}
+          onRename={() => startRename(ctxSession)}
+          onToggleArchive={() => void toggleArchive(ctxSession)}
+          onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+        />
       )}
     </div>
       {instructionsOpen && (
         <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
+      )}
+      {dangerConfirmOpen && (
+        <div className="codex-confirm-overlay" onPointerDown={() => setDangerConfirmOpen(false)}>
+          <div className="codex-confirm-dialog" role="alertdialog" aria-label="Confirm full access sandbox" onPointerDown={(e) => e.stopPropagation()}>
+            <h3>⚠ Enable full access?</h3>
+            <p className="muted">This allows Codex to modify files outside the project folder and run any command. Continue?</p>
+            <div className="codex-confirm-actions">
+              <button className="ghost" data-testid="codex-danger-cancel" onClick={() => setDangerConfirmOpen(false)}>Cancel</button>
+              <button className="danger" data-testid="codex-danger-enable" onClick={() => { setSandbox('danger-full-access'); setDangerConfirmOpen(false) }}>Enable</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

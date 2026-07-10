@@ -218,8 +218,77 @@ function migrate(db: DbWrapper): void {
     processed_at INTEGER
   );
 
+  -- Claude Code checkpoints: recorded HEAD commit before a task runs, so the
+  -- user can roll back a project folder to its pre-task state. Only written
+  -- when the repo is a clean git working tree at task start (see claudecode.ts
+  -- tryCreateCheckpoint) — never created against uncommitted work.
+  CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    message_id TEXT,
+    project_path TEXT NOT NULL,
+    commit_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    description TEXT NOT NULL
+  );
+
+  -- Daily per-agent usage counters (message/task counts + a rough token
+  -- estimate). Informational only — no pricing, since model pricing changes
+  -- too often to hardcode reliably. One row per (agent, date), upserted after
+  -- each completed exchange.
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    date TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    estimated_tokens INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- Contextual tips (see tips.ts): each tip is recorded here the moment it is
+  -- shown, so it never displays again — regardless of whether the user
+  -- dismissed it, clicked its CTA, or just moved on.
+  CREATE TABLE IF NOT EXISTS shown_tips (
+    tip_id TEXT PRIMARY KEY,
+    shown_at INTEGER,
+    dismissed INTEGER DEFAULT 0
+  );
+
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_items(project_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, mode);
+  CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_agent_date ON usage_log(agent, date);
   `)
+
+  // Session auto-summary + last-activity tracking (additive, nullable — safe for
+  // existing rows). SQLite has no "ADD COLUMN IF NOT EXISTS", so check first.
+  const sessionCols = new Set(
+    (db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[]).map((c) => c.name)
+  )
+  if (!sessionCols.has('summary')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN summary TEXT')
+  }
+  if (!sessionCols.has('updated_at')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN updated_at INTEGER')
+    db.exec('UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL')
+  }
+  if (!sessionCols.has('archived')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
+  }
+  // Codex `exec` sessions are resumable via a server-side thread id (returned
+  // as `thread_id` on the `thread.started` event). Persisted per session so
+  // later turns can resume the same Codex conversation instead of starting a
+  // fresh, context-less one-shot run each time. See codex.ts runCodex().
+  if (!sessionCols.has('codex_thread_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT')
+  }
+
+  // Quick-reaction capture (thumbs up/down) on assistant messages, for future
+  // prompt-tuning reference. No analytics UI reads this yet.
+  const messageCols = new Set(
+    (db.prepare('PRAGMA table_info(messages)').all() as { name: string }[]).map((c) => c.name)
+  )
+  if (!messageCols.has('reaction')) {
+    db.exec("ALTER TABLE messages ADD COLUMN reaction TEXT")
+  }
 }

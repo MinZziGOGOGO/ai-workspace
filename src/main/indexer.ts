@@ -181,17 +181,20 @@ async function drainQueue(): Promise<void> {
         if (await indexOne(entry.project_id, root, entry.path, relPath, entry.event)) {
           changed = true
           touchedProjects.add(entry.project_id)
+          emitIndexActivity(`${entry.event === 'unlink' ? 'Removed' : 'Indexed'}: ${relPath}`)
         }
       } catch (err) {
         console.error('[indexer] failed to index', relPath, err)
       }
     }
 
-    // Mark the rows we claimed as processed.
+    // Mark the rows we claimed as processed, then trim the queue so it
+    // doesn't grow unbounded (each rescan re-enqueues every watched file).
     const now = Date.now()
     for (const id of ids) {
       db.prepare(`UPDATE index_queue SET processed_at = ? WHERE id = ?`).run(now, id)
     }
+    db.prepare(`DELETE FROM index_queue WHERE processed_at IS NOT NULL`).run()
 
     if (changed) notifyRenderer(touchedProjects)
   } finally {
@@ -216,7 +219,16 @@ async function indexOne(
 
   let content: string
   try {
-    if (statSync(absPath).size > MAX_BYTES) return false
+    const stat = statSync(absPath)
+    if (stat.size > MAX_BYTES) return false
+    // Skip unchanged files: if the stored summary is newer than the file's
+    // last modification, re-summarizing would only burn the local model.
+    // (The 5-minute rescan re-enqueues every watched file, so without this
+    // check every cycle re-runs the LLM over the whole project.)
+    const existing = getDb()
+      .prepare(`SELECT updated_at FROM memory_items WHERE project_id = ? AND type = 'file' AND title = ?`)
+      .get(projectId, relPath) as { updated_at: number } | undefined
+    if (existing && existing.updated_at > stat.mtimeMs) return false
     content = readFileSync(absPath, 'utf-8')
   } catch {
     // File vanished between event and drain — treat as a removal.
@@ -249,6 +261,19 @@ async function summarizeFile(relPath: string, content: string): Promise<string> 
   const out = await chat(model, messages)
   if (!out || !out.trim()) return `Source file ${relPath}. Summary pending — model returned nothing.`
   return out.trim()
+}
+
+// Mirror indexing work into the Activity panel feed (same channel the other
+// sources use; see emitActivity in ipc.ts — the indexer has no sender window,
+// so it broadcasts to all).
+function emitIndexActivity(message: string): void {
+  try {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('activity:log', { source: 'INDEXER', message, timestamp: Date.now() })
+    }
+  } catch {
+    // No Electron window context (e.g. tests) — nothing to notify.
+  }
 }
 
 function notifyRenderer(projectIds: Set<string>): void {

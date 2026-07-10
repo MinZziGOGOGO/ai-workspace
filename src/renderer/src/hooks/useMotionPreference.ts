@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react'
-import { applyMotionPreference, prefersReducedMotion } from '../motion'
+import { applyMotionPreference, prefersReducedMotion, type MotionMode } from '../motion'
+
+function normalizeMotionMode(values: Record<string, string | null> | null): MotionMode {
+  const mode = values?.ui_motion_mode
+  if (mode === 'reduced' || mode === 'off') return mode
+  if (values?.ui_reduced_motion === 'true') return 'reduced'
+  return 'full'
+}
 
 export function useMotionPreference() {
   const [reduced, setReduced] = useState(() => prefersReducedMotion())
@@ -8,23 +15,23 @@ export function useMotionPreference() {
     let cancelled = false
     const media = window.matchMedia?.('(prefers-reduced-motion: reduce)')
 
-    function sync(userReduced: boolean, osReduced: boolean) {
+    function sync(userMode: MotionMode, osReduced: boolean) {
       if (cancelled) return
-      const next = userReduced || osReduced
+      const next = userMode === 'off' || userMode === 'reduced' || osReduced
       setReduced(next)
-      applyMotionPreference(userReduced, osReduced)
+      applyMotionPreference(userMode, osReduced)
     }
 
     window.api.settings
-      .get('ui_reduced_motion')
-      .then((value) => sync(value === 'true', media?.matches ?? prefersReducedMotion()))
-      .catch(() => sync(false, media?.matches ?? prefersReducedMotion()))
+      .getMany(['ui_motion_mode', 'ui_reduced_motion'])
+      .then((values) => sync(normalizeMotionMode(values), media?.matches ?? prefersReducedMotion()))
+      .catch(() => sync('full', media?.matches ?? prefersReducedMotion()))
 
     const onMediaChange = (event: MediaQueryListEvent) => {
       window.api.settings
-        .get('ui_reduced_motion')
-        .then((value) => sync(value === 'true', event.matches))
-        .catch(() => sync(false, event.matches))
+        .getMany(['ui_motion_mode', 'ui_reduced_motion'])
+        .then((values) => sync(normalizeMotionMode(values), event.matches))
+        .catch(() => sync('full', event.matches))
     }
 
     media?.addEventListener('change', onMediaChange)

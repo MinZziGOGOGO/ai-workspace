@@ -91,6 +91,15 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
     action: 'focus_composer',
   },
   {
+    id: 'command_palette',
+    label: 'Command Palette',
+    description: 'Quick actions and navigation',
+    defaultKey: 'ctrl+shift+k',
+    currentKey: 'ctrl+shift+k',
+    scope: 'global',
+    action: 'command_palette',
+  },
+  {
     id: 'open_terminal',
     label: 'Open Terminal',
     description: 'Open the Terminal panel',

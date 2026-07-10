@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import type { McpServer, McpServerConfig } from '../types'
+import type { HubSkillResult, McpServer, McpServerConfig, SkillItem } from '../types'
 import { useToast } from './ToastContext'
 
 type ExtTab = 'mcp' | 'skills' | 'agents'
@@ -51,7 +51,8 @@ const QUICK_ADDS: Array<{ name: string; description: string; config: McpServerCo
   {
     name: 'AI Workspace Knowledge',
     description: 'Your workspace knowledge base',
-    config: { command: 'node', args: ['<path to out/mcp/server.cjs>'] },
+    // Placeholder only — quickAdd resolves the real server.cjs path via IPC.
+    config: { command: 'node', args: [] },
     builtin: true
   }
 ]
@@ -370,6 +371,7 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
 
   // Fetch registry on search/category/page/tab change
   useEffect(() => {
+    if (!active) return
     if (tab !== 'mcp') return
     const requestId = ++regRequestSeq.current
     setRegLoading(true)
@@ -410,8 +412,15 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
       return
     }
     const name = form.name.trim()
-    if (form.originalName && form.originalName !== name) await window.api.mcp.remove(form.originalName)
-    await window.api.mcp.add(name, configFromForm(form))
+    try {
+      if (form.originalName && form.originalName !== name) await window.api.mcp.remove(form.originalName)
+      await window.api.mcp.add(name, configFromForm(form))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setForm({ ...form, error: `Failed to save server: ${message}` })
+      addToast(`Failed to save ${name}`)
+      return
+    }
     setForm(null)
     await loadServers(false)
     await checkOne(name)
@@ -419,9 +428,26 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
 
   async function quickAdd(item: (typeof QUICK_ADDS)[number]) {
     const safeName = uniqueName(item.name.replace(/\s+/g, '-').toLowerCase())
-    await window.api.mcp.add(safeName, item.config)
+    let config = item.config
+    // The knowledge server ships with the app — resolve its real script path
+    // instead of inserting a placeholder into the live config.
+    if (item.builtin) {
+      try {
+        const serverPath = await window.api.mcp.getKnowledgeServerPath()
+        config = { command: 'node', args: [serverPath] }
+      } catch {
+        addToast('Could not resolve the knowledge server path')
+        return
+      }
+    }
+    try {
+      await window.api.mcp.add(safeName, config)
+    } catch (err) {
+      addToast(`Failed to add ${item.name}: ${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
     await loadServers(false)
-    setForm(formFromConfig(safeName, item.config))
+    setForm(formFromConfig(safeName, config))
     await checkOne(safeName)
   }
 
@@ -572,6 +598,11 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
             </div>
           </div>
 
+          <div className="ext-enable-note muted small">
+            Enable/disable applies to new agent sessions immediately. Claude Desktop reads this
+            config on startup — restart it for changes to take effect there.
+          </div>
+
           {errorCount > 0 && (
             <div className="ext-error-banner">
               {errorCount} {errorCount === 1 ? 'server has' : 'servers have'} connection errors
@@ -667,18 +698,30 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
             {featuredOpen && (
               <div className="ext-featured-grid">
                 <div className="ext-quick-add-grid">
-                  {QUICK_ADDS.map((item) => (
-                    <div className="ext-quick-add-card" key={item.name}>
-                      <strong>{item.name}</strong>
-                      <span>
-                        {item.description}
-                        {item.builtin && (
-                          <span className="ext-transport-badge" style={{ marginLeft: 6, fontSize: 9, height: 14, verticalAlign: 'middle' }}>Built-in</span>
-                        )}
-                      </span>
-                      <button className="ghost tiny" onClick={() => void quickAdd(item)}>+ Add</button>
-                    </div>
-                  ))}
+                  {QUICK_ADDS.map((item) => {
+                    // The knowledge server is auto-registered on app startup;
+                    // don't offer a second copy when it is already configured.
+                    const builtinConfigured = Boolean(item.builtin && serverNames.has('ai-workspace-knowledge'))
+                    return (
+                      <div className="ext-quick-add-card" key={item.name}>
+                        <strong>{item.name}</strong>
+                        <span>
+                          {item.description}
+                          {item.builtin && (
+                            <span className="ext-transport-badge" style={{ marginLeft: 6, fontSize: 9, height: 14, verticalAlign: 'middle' }}>Built-in</span>
+                          )}
+                        </span>
+                        <button
+                          className="ghost tiny"
+                          onClick={() => void quickAdd(item)}
+                          disabled={builtinConfigured}
+                          title={builtinConfigured ? 'Added automatically on startup' : undefined}
+                        >
+                          {builtinConfigured ? '✓ Configured' : '+ Add'}
+                        </button>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}
@@ -1023,8 +1066,304 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
         </div>
       )}
 
-      {tab === 'skills' && <Placeholder title="Skills coming soon" body="Manage Hermes skills and agent capabilities here." />}
+      {tab === 'skills' && <SkillsTab />}
       {tab === 'agents' && <Placeholder title="Agent extensions coming soon" body="Connect Cursor, Gemini CLI, and other AI agents." />}
+    </div>
+  )
+}
+
+// ── Skills tab ────────────────────────────────────────────────────────────────
+// Hermes skills browser backed by the dashboard API (via IPC — the renderer
+// CSP blocks direct fetches). The installed list can exceed 1,900 items, so it
+// is search-first: never more than SKILLS_FILTER_LIMIT rows in the DOM.
+
+const SKILLS_DEFAULT_LIMIT = 30
+const SKILLS_FILTER_LIMIT = 50
+const SKILLS_INSTALL_RECHECK_MS = 3000
+
+function SkillsTab() {
+  const { addToast } = useToast()
+  const [skills, setSkills] = useState<SkillItem[] | null>(null)
+  const [skillsLoading, setSkillsLoading] = useState(false)
+  const [skillsError, setSkillsError] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+
+  const [hubOpen, setHubOpen] = useState(false)
+  const [hubQuery, setHubQuery] = useState('')
+  const [hubResults, setHubResults] = useState<HubSkillResult[]>([])
+  const [hubLoading, setHubLoading] = useState(false)
+  const [hubError, setHubError] = useState<string | null>(null)
+  const [installing, setInstalling] = useState<Set<string>>(new Set())
+  const hubRequestSeq = useRef(0)
+
+  async function loadSkills() {
+    setSkillsLoading(true)
+    setSkillsError(null)
+    const res = await window.api.hermesSkills.list()
+    setSkillsLoading(false)
+    if (res.success && res.skills) {
+      setSkills(res.skills)
+      return res.skills
+    }
+    // Keep an already-loaded list on refresh failure; only show the error
+    // state when there is nothing to display.
+    if (skills === null) setSkillsError(res.error ?? 'Unknown error')
+    else addToast('Could not refresh skills — Hermes unreachable')
+    return null
+  }
+
+  useEffect(() => {
+    void loadSkills()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const filtered = useMemo(() => {
+    if (!skills) return { rows: [] as SkillItem[], matches: 0 }
+    const q = search.trim().toLowerCase()
+    if (!q) return { rows: skills.slice(0, SKILLS_DEFAULT_LIMIT), matches: skills.length }
+    const matches = skills.filter(
+      (s) => s.name.toLowerCase().includes(q) || (s.description ?? '').toLowerCase().includes(q)
+    )
+    return { rows: matches.slice(0, SKILLS_FILTER_LIMIT), matches: matches.length }
+  }, [skills, search])
+
+  async function toggleSkill(skill: SkillItem) {
+    const next = !skill.enabled
+    setSkills((prev) => prev?.map((s) => (s.name === skill.name ? { ...s, enabled: next } : s)) ?? prev)
+    const res = await window.api.hermesSkills.toggle(skill.name, next)
+    if (!res.success) {
+      setSkills((prev) => prev?.map((s) => (s.name === skill.name ? { ...s, enabled: skill.enabled } : s)) ?? prev)
+      addToast(`Could not ${next ? 'enable' : 'disable'} ${skill.name}`)
+    }
+  }
+
+  // Hub search — debounced 400ms; a request sequence guards against stale
+  // responses overwriting newer ones (same pattern as the MCP registry).
+  useEffect(() => {
+    if (!hubOpen) return
+    const q = hubQuery.trim()
+    if (!q) {
+      hubRequestSeq.current++
+      setHubResults([])
+      setHubError(null)
+      setHubLoading(false)
+      return
+    }
+    const requestId = ++hubRequestSeq.current
+    setHubLoading(true)
+    setHubError(null)
+    const t = setTimeout(() => {
+      window.api.hermesSkills.search(q).then((res) => {
+        if (requestId !== hubRequestSeq.current) return
+        setHubLoading(false)
+        if (res.success && res.results) setHubResults(res.results)
+        else {
+          setHubResults([])
+          setHubError(res.error ?? 'Hub search failed')
+        }
+      })
+    }, 400)
+    return () => clearTimeout(t)
+  }, [hubQuery, hubOpen])
+
+  async function installSkill(result: HubSkillResult) {
+    setInstalling((prev) => new Set(prev).add(result.identifier))
+    const res = await window.api.hermesSkills.install(result.identifier)
+    if (!res.success) {
+      setInstalling((prev) => {
+        const next = new Set(prev)
+        next.delete(result.identifier)
+        return next
+      })
+      addToast(`Install failed: ${res.error ?? 'unknown error'}`)
+      return
+    }
+    addToast(`Installing ${result.name}... this may take a moment`)
+    // The install job is async server-side — re-fetch after a beat to see
+    // whether the skill has landed yet.
+    const installedName = res.name || result.name
+    setTimeout(async () => {
+      const refreshed = await loadSkills()
+      setInstalling((prev) => {
+        const next = new Set(prev)
+        next.delete(result.identifier)
+        return next
+      })
+      if (refreshed?.some((s) => s.name === installedName)) addToast(`✓ ${result.name} installed`)
+      else addToast(`${result.name} install started — refresh to check`)
+    }, SKILLS_INSTALL_RECHECK_MS)
+  }
+
+  const searchActive = search.trim().length > 0
+
+  return (
+    <div className="ext-tab-panel" data-testid="skills-tab">
+      <div className="skills-installed-header">
+        <span>
+          INSTALLED SKILLS{skills ? ` (${skills.length.toLocaleString('en-US')})` : ''}
+        </span>
+        <div className="ext-head-actions">
+          <button
+            className="ghost tiny"
+            onClick={() => void loadSkills()}
+            disabled={skillsLoading}
+            title="Reload the installed skills list"
+          >
+            ↻ Refresh
+          </button>
+        </div>
+      </div>
+
+      <input
+        className="skills-search-input"
+        placeholder="Search installed skills..."
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        disabled={!skills}
+        data-testid="skills-search"
+        aria-label="Search installed skills"
+      />
+
+      {skillsLoading && !skills && (
+        <div className="skills-list">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="ext-registry-row ext-registry-skeleton">
+              <div className="ext-reg-skel-name" />
+              <div className="ext-reg-skel-desc" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!skillsLoading && skillsError && !skills && (
+        <div className="ext-registry-state ext-registry-error" data-testid="skills-error">
+          <strong>Could not connect to Hermes dashboard</strong>
+          <span>Make sure Hermes is running and reachable, then try again.</span>
+          <span className="muted small">{skillsError}</span>
+          <button className="ghost tiny" onClick={() => void loadSkills()}>Retry</button>
+        </div>
+      )}
+
+      {skills && (
+        <>
+          <div className="skills-list" data-testid="skills-list">
+            {filtered.rows.map((skill) => (
+              <div className="skill-row" key={skill.name} data-testid="skill-row">
+                <span
+                  role="switch"
+                  aria-checked={skill.enabled}
+                  tabIndex={0}
+                  className={`settings-toggle ${skill.enabled ? 'on' : ''}`}
+                  title={skill.enabled ? `Disable ${skill.name}` : `Enable ${skill.name}`}
+                  onClick={() => void toggleSkill(skill)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      void toggleSkill(skill)
+                    }
+                  }}
+                >
+                  <span />
+                </span>
+                <span className="skill-name">{skill.name}</span>
+                <span className={`skill-provenance-badge ${skill.provenance === 'hub' ? 'hub' : 'agent'}`}>
+                  {skill.provenance === 'hub' ? 'HUB' : 'AGENT'}
+                </span>
+                <span className="skill-desc" title={skill.description}>{skill.description}</span>
+                {skill.usage > 0 && <span className="skill-usage">used {skill.usage}x</span>}
+              </div>
+            ))}
+          </div>
+
+          {!searchActive && skills.length > SKILLS_DEFAULT_LIMIT && (
+            <div className="skills-list-hint muted small">
+              Type to search {skills.length.toLocaleString('en-US')} skills
+            </div>
+          )}
+          {searchActive && filtered.matches === 0 && (
+            <div className="skills-list-hint muted small">No skills match “{search.trim()}”</div>
+          )}
+          {searchActive && filtered.matches > SKILLS_FILTER_LIMIT && (
+            <div className="skills-list-hint muted small">
+              Showing {SKILLS_FILTER_LIMIT} of {filtered.matches.toLocaleString('en-US')} matches — refine your search
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="skills-hub-section">
+        <button
+          className="skills-hub-header"
+          onClick={() => setHubOpen((v) => !v)}
+          aria-expanded={hubOpen}
+          data-testid="skills-hub-toggle"
+        >
+          <span>{hubOpen ? '▾' : '▸'}</span>
+          <span>Skill Hub</span>
+        </button>
+
+        {hubOpen && (
+          <div className="skills-hub-body">
+            <input
+              className="skills-search-input"
+              placeholder="Search the skill hub..."
+              value={hubQuery}
+              onChange={(e) => setHubQuery(e.target.value)}
+              data-testid="skills-hub-search"
+              aria-label="Search the skill hub"
+            />
+
+            {hubLoading && (
+              <div className="ext-registry-row ext-registry-skeleton">
+                <div className="ext-reg-skel-name" />
+                <div className="ext-reg-skel-desc" />
+              </div>
+            )}
+
+            {!hubLoading && hubError && (
+              <div className="ext-registry-state ext-registry-error">
+                <strong>Hub search failed</strong>
+                <span>{hubError}</span>
+              </div>
+            )}
+
+            {!hubLoading && !hubError && hubQuery.trim() && hubResults.length === 0 && (
+              <div className="ext-registry-state">
+                <strong>No hub skills found for “{hubQuery.trim()}”</strong>
+              </div>
+            )}
+
+            {!hubLoading && hubResults.map((result) => (
+              <div className="hub-result-row" key={result.identifier} data-testid="skills-hub-result">
+                <div className="hub-result-head">
+                  <span className="skill-name">{result.name}</span>
+                  <button
+                    className="primary tiny"
+                    onClick={() => void installSkill(result)}
+                    disabled={installing.has(result.identifier)}
+                  >
+                    {installing.has(result.identifier) ? 'Installing…' : 'Install'}
+                  </button>
+                </div>
+                <div className="hub-result-badges">
+                  {result.source && <span className="hub-trust-badge">{result.source}</span>}
+                  {result.trust_level && <span className="hub-trust-badge">{result.trust_level}</span>}
+                </div>
+                {result.description && <p className="hub-result-desc">{result.description}</p>}
+                {result.repo && (
+                  <button
+                    className="ghost tiny"
+                    onClick={() => void window.api.shell.openExternal(result.repo)}
+                    title={result.repo}
+                  >
+                    Repository
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

@@ -72,6 +72,22 @@ export function writeMcpServers(servers: Record<string, McpServerConfig>): void 
   renameSync(tmpPath, path)
 }
 
+/**
+ * Servers from claude_desktop_config.json filtered by the app's local
+ * enabled/disabled state (app_meta). This is what in-app consumers (e.g. the
+ * Hermes session MCP list) must use, so the Extensions toggle actually gates
+ * which servers get wired up — not just how they render in the list.
+ */
+export function getActiveMcpServers(): Record<string, McpServerConfig> {
+  const servers = readMcpServers()
+  const enabled = getEnabledState()
+  const active: Record<string, McpServerConfig> = {}
+  for (const [name, config] of Object.entries(servers)) {
+    if (enabled[name] !== false) active[name] = config
+  }
+  return active
+}
+
 export async function checkMcpServer(name: string, config: McpServerConfig): Promise<McpCheckResult> {
   if (config.url) return checkHttpServer(config.url)
   if (!config.command?.trim()) return { status: 'error', message: 'Missing command' }

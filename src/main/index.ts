@@ -1,7 +1,7 @@
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
 import { registerIpc, killAllPtys } from './ipc'
-import { initDb } from './db'
+import { initDb, flushDb } from './db'
 import { stopAllWatchers } from './indexer'
 import { consolidateIfOverdue } from './extractor'
 import { initWebCompanionFromConfig, stopWebCompanion } from './webCompanion'
@@ -20,7 +20,15 @@ app.commandLine.appendSwitch('disable-software-rasterizer')
 app.commandLine.appendSwitch('in-process-gpu')
 app.disableHardwareAcceleration()
 
-function createWindow(): void {
+const perfLogsEnabled = process.env.AIWORKSPACE_PERF_LOGS === '1'
+const startupStartedAt = Date.now()
+
+function perfLog(label: string): void {
+  if (!perfLogsEnabled) return
+  console.log(`[perf:start] ${label} ${Date.now() - startupStartedAt}ms`)
+}
+
+function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
     height: 840,
@@ -34,6 +42,13 @@ function createWindow(): void {
   })
   if (process.env.ELECTRON_RENDERER_URL) win.loadURL(process.env.ELECTRON_RENDERER_URL)
   else win.loadFile(join(__dirname, '../renderer/index.html'))
+  win.webContents.once('did-finish-load', () => perfLog('renderer-loaded'))
+  // Clear whatever background-completion attention cue window:notifyActivity set.
+  win.on('focus', () => {
+    win.flashFrame(false)
+    app.setBadgeCount(0)
+  })
+  return win
 }
 
 async function ensureKnowledgeMcp(): Promise<void> {
@@ -59,25 +74,37 @@ async function ensureKnowledgeMcp(): Promise<void> {
 
 app.whenReady().then(async () => {
   try {
+    perfLog('app-ready')
     console.log('[Main] App ready, initializing database...')
     await initDb(app.getPath('userData'))
     console.log('[Main] Database initialized successfully')
-
-    await ensureKnowledgeMcp()
+    perfLog('db-ready')
 
     console.log('[Main] Registering IPC handlers...')
     registerIpc()
     console.log('[Main] IPC handlers registered')
-
-    initWebCompanionFromConfig()
-      .then((status) => {
-        if (status.running) console.log(`[Main] Web Companion listening on ${status.localUrl}`)
-      })
-      .catch((err) => console.error('[Main] Web Companion startup failed:', err))
+    perfLog('ipc-ready')
 
     console.log('[Main] Creating window...')
-    createWindow()
+    const win = createWindow()
     console.log('[Main] Window created')
+    perfLog('window-created')
+
+    const startDeferredStartupTasks = () => {
+      perfLog('deferred-start')
+      ensureKnowledgeMcp().finally(() => perfLog('knowledge-mcp-ready'))
+
+      initWebCompanionFromConfig()
+        .then((status) => {
+          if (status.running) console.log(`[Main] Web Companion listening on ${status.localUrl}`)
+          perfLog('web-companion-ready')
+        })
+        .catch((err) => console.error('[Main] Web Companion startup failed:', err))
+    }
+
+    win.webContents.once('did-finish-load', () => {
+      setTimeout(startDeferredStartupTasks, 0)
+    })
 
     // M4: overdue-triggered memory consolidation. Non-blocking — never delay
     // the UI on startup hygiene, and never crash the app if it fails.
@@ -96,11 +123,19 @@ app.on('window-all-closed', () => {
   process.platform !== 'darwin' && app.quit()
 })
 
+// Flush the debounced sql.js persist before teardown starts, so the last
+// write batch is never lost to the 500ms persist window.
+app.on('before-quit', () => {
+  flushDb()
+})
+
 // Stop watchers and kill PTYs cleanly before the app exits.
 app.on('will-quit', () => {
   stopAllWatchers()
   killAllPtys()
   void stopWebCompanion()
+  // Final flush: teardown above may have triggered one last debounced write.
+  flushDb()
 })
 
 process.on('uncaughtException', (err) => {

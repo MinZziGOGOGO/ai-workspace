@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Project, MemoryItem } from '../types'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceEmptyState } from './WorkspacePrimitives'
+import { useToast } from './ToastContext'
+import { collapseElement } from '../motion'
 
 // Memory you can't inspect is memory you can't trust. This panel ships with
 // the memory system itself, not after it: list, search, delete - now across
@@ -40,12 +42,22 @@ function KnowledgeIcon() {
   )
 }
 
-export default function KnowledgePanel(props: { project: Project }) {
+export default function KnowledgePanel(props: {
+  project: Project
+  onOpenProject?: (p: Project) => void
+}) {
   const [items, setItems] = useState<MemoryItem[]>([])
   const [selectedItem, setSelectedItem] = useState<MemoryItem | null>(null)
+  const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [query, setQuery] = useState('')
   const [scope, setScope] = useState<Scope>('project')
+  const [linkedProjects, setLinkedProjects] = useState<Project[]>([])
+  const [showLinkModal, setShowLinkModal] = useState(false)
+  const [availableProjects, setAvailableProjects] = useState<Project[]>([])
+  const [linkTarget, setLinkTarget] = useState('')
+  const { addToast } = useToast()
+  const itemRefs = useRef<Record<string, HTMLLIElement | null>>({})
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   // Use the sentinel for global-panel "project" scope. The backend's project
   // scope returns sentinel-scoped items plus project_id NULL shared memories,
@@ -63,6 +75,16 @@ export default function KnowledgePanel(props: { project: Project }) {
     setSelectedItem(null)
     window.api.memory.list(scopedProjectId).then(setItems)
   }, [props.project.id, scopedProjectId])
+
+  // Linked projects only exist for folder-backed projects, not the sentinel.
+  useEffect(() => {
+    setShowLinkModal(false)
+    if (isGlobalWorkspace) {
+      setLinkedProjects([])
+      return
+    }
+    window.api.projects.getLinks(props.project.id).then(setLinkedProjects)
+  }, [props.project.id, isGlobalWorkspace])
 
   useEffect(() => {
     setSelectedItem((current) => {
@@ -101,6 +123,55 @@ export default function KnowledgePanel(props: { project: Project }) {
     setScope(s)
     // Re-run the current view (search or list) under the new scope.
     void search(s)
+  }
+
+  // Persist an edited memory: memory:save always inserts a new row, so save
+  // the corrected copy first (re-embedding it), then remove the stale one.
+  async function commitEdit(item: MemoryItem) {
+    const content = editing?.value.trim() ?? ''
+    setEditing(null)
+    if (!content || content === item.content) return
+    await window.api.memory.save({
+      projectId: item.project_id,
+      type: item.type,
+      title: item.title,
+      content,
+      source: item.source,
+      tags: item.tags
+    })
+    await window.api.memory.delete(item.id)
+    if (selectedItem?.id === item.id) setSelectedItem(null)
+    refresh()
+  }
+
+  async function openLinkModal() {
+    const available = await window.api.projects.getAvailableLinkTargets(props.project.id)
+    setAvailableProjects(available)
+    setLinkTarget(available[0]?.id ?? '')
+    setShowLinkModal(true)
+  }
+
+  async function linkProject() {
+    if (!linkTarget) return
+    const result = await window.api.projects.addLink(props.project.id, linkTarget)
+    if (result.success) {
+      const target = availableProjects.find((p) => p.id === linkTarget)
+      setLinkedProjects(await window.api.projects.getLinks(props.project.id))
+      setShowLinkModal(false)
+      addToast(`Linked to ${target?.name ?? 'project'}`)
+    } else {
+      addToast(`Failed to link: ${result.error}`)
+    }
+  }
+
+  async function removeLink(target: Project) {
+    const result = await window.api.projects.removeLink(props.project.id, target.id)
+    if (result.success) {
+      setLinkedProjects((prev) => prev.filter((p) => p.id !== target.id))
+      addToast(`Unlinked from ${target.name}`)
+    } else {
+      addToast(`Failed to unlink: ${result.error}`)
+    }
   }
 
   async function copySelectedContent() {
@@ -175,22 +246,53 @@ export default function KnowledgePanel(props: { project: Project }) {
       )}
       <ul className="memory-list motion-list motion-list-tight">
         {items.map((m) => (
-          <li key={m.id} className={`memory-item ${selectedItem?.id === m.id ? 'selected' : ''}`}>
-            <button
-              type="button"
-              className="memory-open"
-              data-testid="knowledge-item"
-              aria-label={`Inspect knowledge item: ${m.title}`}
-              onClick={() => setSelectedItem(m)}
-            >
-              <div className="memory-head">
-                <span className={`pill pill-${m.type}`}>{m.type}</span>
-                <span className="muted small">
-                  {m.source}{m.score !== undefined ? ` - ${(m.score * 100).toFixed(0)}%` : ''}
-                </span>
+          <li key={m.id} ref={(el) => { itemRefs.current[m.id] = el }} className={`memory-item ${selectedItem?.id === m.id ? 'selected' : ''}`}>
+            {editing?.id === m.id ? (
+              <div className="memory-open memory-editing">
+                <div className="memory-head">
+                  <span className={`pill pill-${m.type}`}>{m.type}</span>
+                  <span className="muted small">{m.source}</span>
+                </div>
+                <div className="memory-title">{m.title}</div>
+                <textarea
+                  className="memory-edit-area"
+                  value={editing.value}
+                  autoFocus
+                  aria-label={`Edit memory: ${m.title}`}
+                  onChange={(e) => setEditing({ id: m.id, value: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void commitEdit(m) }
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
+                  }}
+                  onBlur={() => void commitEdit(m)}
+                />
+                <div className="memory-edit-hint muted small">Enter to save · Shift+Enter for newline · Esc to cancel</div>
               </div>
-              <div className="memory-title">{m.title}</div>
-              <div className="memory-content muted small">{snippetAt(m.content, 200)}</div>
+            ) : (
+              <button
+                type="button"
+                className="memory-open"
+                data-testid="knowledge-item"
+                aria-label={`Inspect knowledge item: ${m.title}`}
+                onClick={() => setSelectedItem(m)}
+              >
+                <div className="memory-head">
+                  <span className={`pill pill-${m.type}`}>{m.type}</span>
+                  <span className="muted small">
+                    {m.source}{m.score !== undefined ? ` - ${(m.score * 100).toFixed(0)}%` : ''}
+                  </span>
+                </div>
+                <div className="memory-title">{m.title}</div>
+                <div className="memory-content muted small">{snippetAt(m.content, 200)}</div>
+              </button>
+            )}
+            <button
+              className="ghost tiny memory-edit"
+              title="Edit memory"
+              aria-label={`Edit memory: ${m.title}`}
+              onClick={() => setEditing(editing?.id === m.id ? null : { id: m.id, value: m.content })}
+            >
+              ✎
             </button>
             <button
               className="ghost tiny memory-delete"
@@ -198,11 +300,13 @@ export default function KnowledgePanel(props: { project: Project }) {
               aria-label={`Delete memory: ${m.title}`}
               onClick={async () => {
                 await window.api.memory.delete(m.id)
+                const row = itemRefs.current[m.id]
+                if (row) await collapseElement(row)
                 if (selectedItem?.id === m.id) setSelectedItem(null)
                 refresh()
               }}
             >
-              x
+              ×
             </button>
           </li>
         ))}
@@ -252,6 +356,94 @@ export default function KnowledgePanel(props: { project: Project }) {
             </button>
           </div>
         </section>
+      )}
+      {!isGlobalWorkspace && (
+        <div className="knowledge-related-projects" data-testid="related-projects">
+          <div className="related-projects-header">
+            <span className="related-projects-title">Related Projects</span>
+            <button
+              type="button"
+              className="related-projects-add-btn"
+              data-testid="related-projects-add"
+              onClick={openLinkModal}
+            >
+              + Link project
+            </button>
+          </div>
+          {linkedProjects.length === 0 ? (
+            <p className="muted small">
+              No linked projects. Link a project to share context across codebases.
+            </p>
+          ) : (
+            <div className="related-projects-list">
+              {linkedProjects.map((p) => (
+                <div
+                  key={p.id}
+                  className="related-project-item"
+                  data-testid="related-project-item"
+                  title={p.path}
+                  onClick={() => props.onOpenProject?.(p)}
+                >
+                  <span>{p.name}</span>
+                  <button
+                    type="button"
+                    className="related-project-remove"
+                    title={`Unlink ${p.name}`}
+                    aria-label={`Unlink ${p.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void removeLink(p)
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {showLinkModal && (
+        <div className="link-project-modal" onClick={() => setShowLinkModal(false)}>
+          <div
+            className="link-project-card"
+            role="dialog"
+            aria-label="Link a project"
+            data-testid="link-project-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="link-project-title">Link a project</div>
+            {availableProjects.length === 0 ? (
+              <p className="muted small">No other projects available to link.</p>
+            ) : (
+              <select
+                className="link-project-select"
+                aria-label="Select a project to link"
+                value={linkTarget}
+                onChange={(e) => setLinkTarget(e.target.value)}
+              >
+                {availableProjects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <div className="link-project-actions">
+              <button type="button" onClick={() => setShowLinkModal(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={!linkTarget}
+                onClick={() => void linkProject()}
+              >
+                Link
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </aside>
   )

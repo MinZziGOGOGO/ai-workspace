@@ -8,11 +8,14 @@ import { extname, join } from 'path'
 // events the renderer can show as streaming text + an activity log, with the
 // turn persisted as messages by the caller in ipc.ts.
 //
-// Codex `exec` is one-shot (no resumable session), so each send is an
-// independent run; we still record the turns as session messages so past work
-// is reviewable, exactly like Claude Code.
+// Each `codex exec` invocation is a separate process, but the CLI supports
+// server-side session resume: the first run's `thread.started` event carries
+// a `thread_id`, and passing that id to `codex exec resume <id> <prompt>`
+// continues the same conversation with full model context (no client-side
+// prompt stitching needed). The caller (ipc.ts) persists the thread id per
+// session and passes it back in as `opts.threadId` on later turns.
 
-export type CodexSandboxMode = 'read-only' | 'workspace-write'
+export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 
 // ---- normalized events -----------------------------------------------------
 export interface CodexActivityEntry {
@@ -43,6 +46,7 @@ export interface CodexRunResult {
   loginRequired?: boolean
   trustRequired?: boolean
   error?: string
+  threadId?: string
 }
 
 const IS_WIN = process.platform === 'win32'
@@ -224,8 +228,11 @@ export function runCodex(opts: {
   imagePaths?: string[]
   onEvent: (e: CodexEvent) => void
   signal?: AbortSignal
+  /** Thread id from a prior turn's `thread.started` event — resumes that Codex session instead of starting a fresh one. */
+  threadId?: string
 }): Promise<CodexRunResult> {
-  const sandbox: CodexSandboxMode = opts.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only'
+  const sandbox: CodexSandboxMode =
+    opts.sandbox === 'workspace-write' || opts.sandbox === 'danger-full-access' ? opts.sandbox : 'read-only'
 
   // E2E fakes — exercise the full UI flow without a real CLI or login.
   if (isFakeCodex() || isTrustErrorFake()) {
@@ -249,7 +256,11 @@ export function runCodex(opts: {
     const bin = resolveCodexBin()
     // Codex v0.139.0+ command format: codex exec --json -C <cwd> -s <sandbox> -m <model>
     // Prompt MUST be the last positional argument — never via stdin, including when -i flags are present.
-    const args = ['exec', '--json', '-C', opts.projectPath, '-s', sandbox]
+    //
+    // `codex exec resume <thread-id>` continues a prior session server-side —
+    // it inherits that session's cwd/sandbox, so -C/-s are not passed (and
+    // are in fact rejected by the `resume` subcommand).
+    const args = opts.threadId ? ['exec', 'resume', opts.threadId, '--json'] : ['exec', '--json', '-C', opts.projectPath, '-s', sandbox]
     if (opts.model) args.push('-m', opts.model)
     if (opts.skipGitRepoCheck) args.push('--skip-git-repo-check')
     for (const imgPath of opts.imagePaths ?? []) args.push('-i', imgPath)
@@ -267,6 +278,7 @@ export function runCodex(opts: {
     const activity: CodexActivityEntry[] = []
     let streamedText = ''
     let usedTokens: number | undefined
+    let threadId = opts.threadId
     let emittedAssistantText = false
     let stdoutBuf = ''
     let rawStdout = ''
@@ -299,6 +311,7 @@ export function runCodex(opts: {
 
       switch (parsed.type as string | undefined) {
         case 'thread.started':
+          if (typeof parsed.thread_id === 'string') threadId = parsed.thread_id
           opts.onEvent({ kind: 'system', summary: 'Thread started' })
           break
         case 'turn.started':
@@ -372,7 +385,7 @@ export function runCodex(opts: {
           streamedText = 'Codex finished without assistant output.'
           opts.onEvent({ kind: 'text', text: streamedText })
         }
-        finish({ ok: true, result: streamedText, activity, usedTokens })
+        finish({ ok: true, result: streamedText, activity, usedTokens, threadId })
       } else {
         const raw = (stderr || rawStdout).trim()
         const trust = isTrustError(raw)
@@ -383,7 +396,7 @@ export function runCodex(opts: {
           ? CODEX_AUTH_ERROR
           : raw || `Codex exited with code ${code}.`
         opts.onEvent({ kind: 'error', message })
-        finish({ ok: false, result: message, activity, error: message, trustRequired: trust, loginRequired: auth })
+        finish({ ok: false, result: message, activity, error: message, trustRequired: trust, loginRequired: auth, threadId })
       }
     })
 

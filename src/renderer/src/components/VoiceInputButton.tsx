@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useToast } from './ToastContext'
 
 type SpeechRecognitionCtor = new () => SpeechRecognitionLike
 
@@ -51,6 +52,13 @@ export default function VoiceInputButton(props: {
   const [supported, setSupported] = useState(false)
   const [listening, setListening] = useState(false)
   const [error, setError] = useState('')
+  const { addToast } = useToast()
+
+  // Surface failures visibly — a tooltip-only error looks like a dead button.
+  function reportError(message: string) {
+    setError(message)
+    addToast(`Voice input failed: ${message}`)
+  }
 
   useEffect(() => {
     setSupported(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition))
@@ -87,7 +95,7 @@ export default function VoiceInputButton(props: {
       props.onChange(appendText(baseTextRef.current, `${finalText} ${interimText}`))
     }
     recognition.onerror = (event) => {
-      setError(event.message || event.error || 'Voice input failed.')
+      reportError(event.message || event.error || 'unknown error')
       setListening(false)
     }
     recognition.onend = () => setListening(false)
@@ -96,7 +104,7 @@ export default function VoiceInputButton(props: {
     try {
       recognition.start()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Voice input failed.')
+      reportError(err instanceof Error ? err.message : 'could not start recognition')
       setListening(false)
     }
   }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Project } from '../types'
 import {
   GLOBAL_PROJECT_NAME,
@@ -6,6 +6,7 @@ import {
   isGlobalProjectId
 } from '../../../shared/globalWorkspace'
 import NavigatorFileTree from './NavigatorFileTree'
+import anime, { prefersReducedMotion, stopMotion, type MotionHandle } from '../motion'
 
 export default function ProjectPicker(props: {
   projects: Project[]
@@ -21,6 +22,8 @@ export default function ProjectPicker(props: {
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
   const [showArchived, setShowArchived] = useState(false)
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  const introAnimRef = useRef<MotionHandle>(null)
 
   const isNavigator = props.variant === 'navigator'
   const isPanel = props.variant === 'panel'
@@ -47,6 +50,21 @@ export default function ProjectPicker(props: {
   const rootClass = isPanel ? 'navigator-panel' : isNavigator ? 'navigator-overlay' : 'picker'
   const cardClass = isPanel ? 'navigator-card navigator-card-inline' : isNavigator ? 'navigator-card picker-card' : 'picker-card'
 
+  useEffect(() => {
+    const card = cardRef.current
+    if (!card || prefersReducedMotion()) return
+    const rows = card.querySelectorAll('.project-row, .picker-actions button')
+    stopMotion(introAnimRef.current)
+    introAnimRef.current = anime(rows, {
+      opacity: [0, 1],
+      translateY: [8, 0],
+      duration: 220,
+      delay: (_: unknown, i: number) => i * 28,
+      ease: 'outExpo',
+    })
+    return () => stopMotion(introAnimRef.current)
+  }, [props.projects.length, isPanel, isNavigator])
+
   return (
     <div
       className={rootClass}
@@ -55,7 +73,7 @@ export default function ProjectPicker(props: {
       aria-modal={isNavigator ? 'true' : undefined}
       aria-label={isNavigator || isPanel ? 'Workspace Navigator' : undefined}
     >
-      <div className={cardClass}>
+      <div className={cardClass} ref={cardRef}>
         <div className="navigator-head">
           <div>
             <h1>{isNavigator || isPanel ? 'Navigator' : 'Projects'}</h1>

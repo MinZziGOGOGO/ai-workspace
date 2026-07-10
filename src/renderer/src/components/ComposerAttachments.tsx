@@ -1,5 +1,40 @@
 import type { ComposerAttachment, FileAttachment } from '../types'
 
+// Electron sets a real filesystem `.path` on File objects that come from an OS drag,
+// but the DOM lib's File type doesn't declare it.
+export function electronFilePath(file: File): string | undefined {
+  return (file as unknown as { path?: string }).path
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = ''
+  const bytes = new Uint8Array(buffer)
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
+}
+
+// Builds a ComposerAttachment from a clipboard image item (e.g. Ctrl+V of a
+// screenshot). Returns null if the item has no readable file data.
+export async function attachmentFromImageClipboardItem(item: DataTransferItem): Promise<ComposerAttachment | null> {
+  const blob = item.getAsFile()
+  if (!blob) return null
+  const buffer = await blob.arrayBuffer()
+  return {
+    id: crypto.randomUUID(),
+    file: {
+      type: 'image',
+      name: `pasted-image-${Date.now()}.png`,
+      size: buffer.byteLength,
+      mimeType: item.type,
+      base64: arrayBufferToBase64(buffer),
+      ext: '.png'
+    }
+  }
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`

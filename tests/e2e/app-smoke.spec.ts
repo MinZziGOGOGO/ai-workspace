@@ -1,5 +1,5 @@
 import { test, expect, _electron as electron, type Page } from '@playwright/test'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { cleanupGeneratedTitle, fallbackTitleFromText, isGenericSessionTitle } from '../../src/shared/sessionTitles'
 
@@ -30,6 +30,24 @@ async function expectSingleContextBarWithinPanel(page: Page, panel: string, test
   expect(barBox.width).toBeLessThanOrEqual(panelBox.width + 1)
 }
 
+async function expectComposerHeaderReadable(page: Page, panel: string, composerTestId: string) {
+  const colors = await page.evaluate(({ panel, composerTestId }) => {
+    const header = document.querySelector(`.workspace-panel-head.panel-${panel}`)
+    const composer = document.querySelector(`[data-testid="${composerTestId}"]`)?.closest('.composer')
+    if (!header || !composer) throw new Error(`Missing ${panel} header or composer`)
+    const headerStyles = getComputedStyle(header)
+    const composerStyles = getComputedStyle(composer)
+    return {
+      headerBg: headerStyles.backgroundColor,
+      headerFg: headerStyles.color,
+      composerBg: composerStyles.backgroundColor,
+      composerFg: composerStyles.color,
+    }
+  }, { panel, composerTestId })
+  expect(colors.headerBg).not.toBe(colors.headerFg)
+  expect(colors.composerBg).not.toBe(colors.composerFg)
+}
+
 test('session title cleanup preserves only descriptive titles', () => {
   expect(isGenericSessionTitle('Chat 11.6.2026')).toBe(true)
   expect(isGenericSessionTitle('New Chat')).toBe(true)
@@ -41,6 +59,205 @@ test('session title cleanup preserves only descriptive titles', () => {
   expect(fallbackTitleFromText('Please help me debug nested split persistence after reload')).toBe(
     'Please help me debug nested'
   )
+})
+
+test('dark mode menus and topbar hover stay readable and calm', async ({}, testInfo) => {
+  const repoRoot = path.resolve(__dirname, '..', '..')
+  const userDataDir = testInfo.outputPath('user-data')
+  await mkdir(userDataDir, { recursive: true })
+
+  const electronApp = await electron.launch({
+    args: [
+      '--disable-gpu',
+      '--disable-gpu-compositing',
+      '--disable-software-rasterizer',
+      '--in-process-gpu',
+      '--no-sandbox',
+      path.join(repoRoot, 'out', 'main', 'index.js')
+    ],
+    env: {
+      ...process.env,
+      AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
+      E2E_FAKE_CODEX: '1',
+      E2E_FAKE_REGISTRY: '1',
+      ELECTRON_DISABLE_GPU: '1'
+    }
+  })
+
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    await page.evaluate(async () => {
+      await window.api.settings.set('ui_theme', 'dark')
+      await window.api.settings.set('ui_motion_mode', 'off')
+      document.documentElement.dataset.theme = 'dark'
+      document.documentElement.dataset.motion = 'off'
+      document.documentElement.dataset.motionPreference = 'off'
+      document.documentElement.dataset.reducedMotion = 'true'
+    })
+
+    const aiButton = page.locator('.topbar-group-btn').filter({ hasText: /^AI/ })
+    await aiButton.hover()
+    await expect(aiButton).toHaveCSS('box-shadow', 'none')
+
+    await aiButton.click()
+    await expect(page.locator('.topbar-dropdown')).toBeVisible()
+    const menuColors = await page.evaluate(() => {
+      const menu = document.querySelector('.topbar-dropdown')
+      const item = document.querySelector('.topbar-dropdown-item')
+      if (!menu || !item) throw new Error('Missing dark mode topbar dropdown')
+      const menuStyles = getComputedStyle(menu)
+      const itemStyles = getComputedStyle(item)
+      return {
+        menuBackground: menuStyles.backgroundColor,
+        itemColor: itemStyles.color,
+        backdropFilter: menuStyles.backdropFilter || (menuStyles as any).webkitBackdropFilter || '',
+      }
+    })
+    expect(menuColors.menuBackground).not.toBe('rgb(255, 255, 255)')
+    expect(menuColors.itemColor).not.toBe('rgb(255, 255, 255)')
+    expect(menuColors.backdropFilter === '' || menuColors.backdropFilter === 'none').toBe(true)
+
+    await page.mouse.click(20, 100)
+    await page.getByTestId('open-settings').click()
+    await expect(page.locator('.settings-shell')).toBeVisible()
+    await page.getByRole('button', { name: 'Appearance' }).click()
+    const selectStyles = await page.evaluate(() => {
+      const select = document.querySelector('.settings-control select')
+      const option = select?.querySelector('option')
+      if (!select || !option) throw new Error('Missing settings select')
+      const selectComputed = getComputedStyle(select)
+      const optionComputed = getComputedStyle(option)
+      return {
+        selectBackground: selectComputed.backgroundColor,
+        selectColor: selectComputed.color,
+        optionBackground: optionComputed.backgroundColor,
+        optionColor: optionComputed.color,
+      }
+    })
+    expect(selectStyles.selectBackground).not.toBe('rgb(255, 255, 255)')
+    expect(selectStyles.optionBackground).not.toBe('rgb(255, 255, 255)')
+    expect(selectStyles.selectColor).not.toBe(selectStyles.selectBackground)
+    expect(selectStyles.optionColor).not.toBe(selectStyles.optionBackground)
+  } finally {
+    await electronApp.close()
+  }
+})
+
+test('project home command center shows global and project states with working actions', async ({}, testInfo) => {
+  const repoRoot = path.resolve(__dirname, '..', '..')
+  const userDataDir = testInfo.outputPath('user-data')
+  const projectParent = testInfo.outputPath('projects')
+  await mkdir(userDataDir, { recursive: true })
+  await mkdir(projectParent, { recursive: true })
+
+  const electronApp = await electron.launch({
+    args: [
+      '--disable-gpu',
+      '--disable-gpu-compositing',
+      '--disable-software-rasterizer',
+      '--in-process-gpu',
+      '--no-sandbox',
+      path.join(repoRoot, 'out', 'main', 'index.js')
+    ],
+    env: {
+      ...process.env,
+      AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
+      E2E_FAKE_SETUP_TOOLS: '1',
+      E2E_FAKE_CODEX: '1',
+      E2E_FAKE_REGISTRY: '1',
+      ELECTRON_DISABLE_GPU: '1'
+    }
+  })
+
+  const consoleErrors: string[] = []
+  try {
+    const page = await electronApp.firstWindow()
+    page.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text())
+    })
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    await expect(page.getByTestId('workspace-panel-home')).toBeVisible()
+    await expect(page.getByTestId('project-home')).toContainText('Welcome to Global Workspace')
+    await expect(page.getByTestId('project-home-tool-readiness')).toContainText('Ollama')
+    await expect(page.getByTestId('project-home-tool-readiness')).toContainText('Web Companion')
+
+    await page.getByTestId('project-home-action-start-chat').click()
+    await expect(page.getByTestId('workspace-panel-chat')).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-chat').locator('[data-composer="true"]')).toHaveValue(/global workspace/i)
+
+    await page.getByTestId('project-home-action-open-knowledge').click()
+    await expect(page.getByTestId('workspace-panel-knowledge')).toBeVisible()
+
+    await page.getByTestId('project-home-action-open-settings').click()
+    await expect(page.getByTestId('settings-shell')).toBeVisible()
+    await page.getByTestId('settings-close').click()
+    await expect(page.getByTestId('settings-shell')).not.toBeVisible()
+
+    const project = await page.evaluate(async (parentDir) => {
+      return await (window as any).api.projects.create('Home Command Project', parentDir)
+    }, projectParent) as { id: string; path: string }
+    await writeFile(path.join(project.path, 'README.md'), '# Home Command Project\n')
+    await writeFile(path.join(project.path, 'package.json'), '{"scripts":{"build":"echo ok"}}\n')
+
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByRole('button', { name: /Home Command Project/ }).click()
+
+    const home = page.getByTestId('project-home')
+    await expect(page.getByTestId('workspace-panel-home')).toBeVisible()
+    await expect(home).toContainText('Home Command Project')
+    await expect(page.getByTestId('project-home-summary')).toContainText('Project')
+    await expect(page.getByTestId('project-home-files')).toContainText('README found')
+    await expect(page.getByTestId('project-home-files')).toContainText('package.json found')
+
+    await page.getByTestId('project-home-starter-summarize-this-project').click()
+    await expect(page.getByTestId('workspace-panel-chat')).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-chat').locator('[data-composer="true"]')).toHaveValue(/Summarize this project/)
+
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = 'dark'
+    })
+    const darkReadable = await page.evaluate(() => {
+      const home = document.querySelector('[data-testid="project-home"]')
+      const title = document.querySelector('.project-home-title-block h1')
+      if (!home || !title) throw new Error('Missing Project Home for dark theme check')
+      const homeStyles = getComputedStyle(home)
+      const titleStyles = getComputedStyle(title)
+      return {
+        bg: homeStyles.backgroundColor,
+        fg: titleStyles.color,
+      }
+    })
+    expect(darkReadable.bg).not.toBe(darkReadable.fg)
+
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = 'light'
+    })
+    const lightReadable = await page.evaluate(() => {
+      const home = document.querySelector('[data-testid="project-home"]')
+      const title = document.querySelector('.project-home-title-block h1')
+      if (!home || !title) throw new Error('Missing Project Home for light theme check')
+      const homeStyles = getComputedStyle(home)
+      const titleStyles = getComputedStyle(title)
+      return {
+        bg: homeStyles.backgroundColor,
+        fg: titleStyles.color,
+      }
+    })
+    expect(lightReadable.bg).not.toBe(lightReadable.fg)
+
+    expect(consoleErrors).toEqual([])
+  } finally {
+    await electronApp.close()
+  }
 })
 
 test('global workspace UI smoke path', async ({}, testInfo) => {
@@ -60,6 +277,7 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     env: {
       ...process.env,
       AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
       E2E_FAKE_CODEX: '1',
       E2E_FAKE_REGISTRY: '1',
       ELECTRON_DISABLE_GPU: '1'
@@ -75,10 +293,16 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('project-picker')).toHaveCount(0)
     await expect(page.getByText('Global Workspace').first()).toBeVisible()
 
-    // Phase B: chat panel open by default; all tool buttons present in rack
+    // Phase B: Project Home opens by default; quick action opens Chat.
+    await expect(page.getByTestId('workspace-panel-home')).toBeVisible()
+    await expect(page.getByTestId('project-home')).toContainText('Welcome to Global Workspace')
+    await expect(page.getByTestId('workspace-panel-navigator')).toHaveCount(0)
+    await page.getByTestId('project-home-action-start-chat').click()
     await expect(page.getByTestId('workspace-panel-chat')).toBeVisible()
     await expectSingleContextBarWithinPanel(page, 'chat', 'context-bar-chat')
-    await page.getByRole('button', { name: 'Start a chat' }).click()
+    await expect(page.getByTestId('chat-composer')).toBeVisible()
+    await expect(page.getByTestId('chat-send')).toBeVisible()
+    await expect(page.getByTestId('chat-mode-pill')).toBeVisible()
     await expect(page.getByTestId('chat-extract-memories')).toBeVisible()
     await expect(page.getByTestId('chat-extract-memories')).toBeDisabled()
     await expect(page.getByTestId('voice-input-chat')).toBeVisible()
@@ -90,6 +314,12 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     } else {
       await expect(page.getByTestId('voice-input-chat')).toBeDisabled()
     }
+    await expect(page.locator('.workspace-panel-head.panel-chat .workspace-panel-kind')).toHaveCount(0)
+    await expect(page.locator('.workspace-panel-head.panel-chat')).not.toContainText(/Chat\s+Chat/)
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'dark' })
+    await expectComposerHeaderReadable(page, 'chat', 'chat-composer')
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'light' })
+    await expectComposerHeaderReadable(page, 'chat', 'chat-composer')
 
     await page.evaluate(() => {
       const now = Date.now()
@@ -523,7 +753,8 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('workspace-tool-knowledge')).toBeVisible()
     await expect(page.getByTestId('workspace-panel-navigator')).not.toBeVisible()
     await expect(page.getByTestId('workspace-panel-knowledge')).not.toBeVisible()
-    await expect(page.locator('.workspace-panel-head.panel-chat .workspace-panel-kind')).toContainText('Chat')
+    await expect(page.locator('.workspace-panel-head.panel-chat .workspace-panel-kind')).toHaveCount(0)
+    await expect(page.locator('.workspace-panel-head.panel-chat')).not.toContainText(/Chat\s+Chat/)
     await expect(page.locator('.workspace-panel-head.panel-chat .workspace-status-badge')).toContainText('Ready')
 
     const workspaceHeights = await page.evaluate(() => {
@@ -645,7 +876,7 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     expect(topBottom.knowledge.width).toBeGreaterThan(topBottom.area.width * 0.9)
     // reset layout — back to default (chat only, full slot)
     await page.getByTestId('workspace-reset-layout').click()
-    await expect(page.getByTestId('workspace-panel-chat')).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-home')).toBeVisible()
     await expect(page.getByTestId('workspace-panel-navigator')).not.toBeVisible()
     await expect(page.getByTestId('workspace-panel-knowledge')).not.toBeVisible()
 
@@ -691,7 +922,10 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     expect(localSplit.editor.y).toBeGreaterThan(localSplit.area.y + localSplit.area.height * 0.35)
     expect(localSplit.terminal.height).toBeLessThan(localSplit.area.height * 0.7)
     expect(localSplit.editor.height).toBeLessThan(localSplit.area.height * 0.7)
+    await page.getByTestId('workspace-tool-chat').click()
     await expectSingleContextBarWithinPanel(page, 'chat', 'context-bar-chat')
+    await page.getByTestId('workspace-panel-close-chat').click()
+    await expect(page.getByTestId('workspace-panel-chat')).not.toBeVisible()
     await expect(page.locator('.local-drop-highlight')).toHaveCount(0)
 
     const terminalHeader = await page.locator('.workspace-panel-head.panel-terminal').boundingBox()
@@ -781,6 +1015,10 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('workspace-panel-codex')).toBeVisible()
     await expect(page.getByTestId('codex-project-required')).toContainText('Open a project to use Codex.')
     await expect(page.getByTestId('workspace-panel-codex').locator('.xterm')).toHaveCount(0)
+    await page.locator('.topbar-group-btn').filter({ hasText: /^AI/ }).click()
+    await expect(page.locator('.topbar-dropdown-item.is-open').filter({ hasText: 'Codex' })).toBeVisible()
+    await page.locator('.topbar-dropdown-item').filter({ hasText: 'Codex' }).click()
+    await expect(page.getByTestId('workspace-panel-codex')).toBeVisible()
     await page.getByTestId('workspace-panel-close-codex').click()
     await expect(page.getByTestId('workspace-panel-codex')).not.toBeVisible()
 
@@ -890,8 +1128,12 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(extensionsPanel.getByTestId('mcp-registry-query-note')).toContainText('postgres')
     await expect(extensionsPanel.getByTestId('mcp-registry-result').first()).toContainText('postgres MCP Server')
 
-    await extensionsPanel.getByRole('button', { name: 'Skills' }).click()
-    await expect(extensionsPanel).toContainText('Skills coming soon')
+    await extensionsPanel.getByRole('button', { name: 'Skills', exact: true }).click()
+    // Deterministic chrome only: the list/error body depends on whether a real
+    // Hermes dashboard is reachable on the machine running the suite.
+    await expect(extensionsPanel).toContainText('INSTALLED SKILLS')
+    await expect(extensionsPanel.getByTestId('skills-search')).toBeVisible()
+    await expect(extensionsPanel.getByTestId('skills-hub-toggle')).toBeVisible()
 
     await page.getByTestId('workspace-panel-close-extensions').click()
     await expect(page.getByTestId('workspace-panel-extensions')).not.toBeVisible()
@@ -906,30 +1148,71 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await page.getByTestId('workspace-tool-navigator').click()
     await page.getByRole('button', { name: /Codex Smoke Project/ }).click()
     await expect(page.getByText('Codex Smoke Project').first()).toBeVisible()
+
+    await page.getByTestId('workspace-tool-chat').click()
+    const selectedChatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(selectedChatPanel).toBeVisible()
+    await expect(selectedChatPanel.locator('.empty-hero')).toBeVisible()
+    await expect(selectedChatPanel.locator('.empty-state-heading')).toBeVisible()
+    await expect(page.getByTestId('chat-composer')).toBeVisible()
+    await expect(page.getByTestId('chat-send')).toBeVisible()
+    await expect(page.getByTestId('chat-mode-pill')).toBeVisible()
+    await page.getByTestId('workspace-panel-close-chat').click()
+
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await expect(claudePanel).toBeVisible()
+    await page.waitForTimeout(100)
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('aiworkspace:test:set-claude-code-check')))
+    await expect(claudePanel.locator('.empty-hero')).toBeVisible()
+    await expect(claudePanel.locator('.empty-state-heading')).toBeVisible()
+    await expect(page.getByTestId('claude-code-composer')).toBeVisible()
+    await expect(page.getByTestId('claude-code-send')).toBeVisible()
+    await expect(page.getByTestId('claude-code-effort-pill')).toBeVisible()
+    await page.getByTestId('workspace-panel-close-claudecode').click()
+
+    await page.getByTestId('workspace-tool-hermes').click()
+    const hermesPanel = page.getByTestId('workspace-panel-hermes')
+    await expect(hermesPanel).toBeVisible()
+    await page.waitForTimeout(100)
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('aiworkspace:test:set-hermes-check')))
+    await expect(hermesPanel.locator('.empty-hero')).toBeVisible()
+    await expect(hermesPanel.locator('.empty-state-heading')).toBeVisible()
+    await expect(page.getByTestId('hermes-composer')).toBeVisible()
+    await expect(page.getByTestId('hermes-send')).toBeVisible()
+    await expect(page.getByTestId('hermes-mode-control')).toBeVisible()
+    await page.getByTestId('workspace-panel-close-hermes').click()
+
     await page.locator('.topbar-group-btn').filter({ hasText: /^AI/ }).click()
     await page.locator('.topbar-dropdown-item').filter({ hasText: 'Codex' }).click()
     const codexPanel = page.getByTestId('workspace-panel-codex')
     await expect(codexPanel).toBeVisible()
-    // Selected project + installed CLI → chat-layout with the empty "start a task" state.
-    await expect(codexPanel).toContainText('Hand off to Codex.')
-    await expect(page.getByTestId('codex-start-task')).toBeVisible()
+    // Selected project + installed CLI → chat-layout with the empty state.
+    // The empty state IS the composer now (heading + composer, no start button).
+    // Heading rotates between a few variations (see CODEX_EMPTY_HEADINGS), so match any of them.
+    await expect(codexPanel).toContainText(/What are we building\?|Ready when you are\.|Describe a task for Codex\./)
     await expect(codexPanel.locator('.xterm')).toHaveCount(0)
 
-    // Start a task → session created, composer + safety controls appear.
-    await page.getByTestId('codex-start-task').click()
+    // Composer + safety controls are available immediately in the empty state.
     await expect(page.getByTestId('codex-composer')).toBeVisible()
     await expect(page.getByTestId('codex-sandbox')).toBeVisible()
-    await expect(codexPanel.locator('.agent-status-strip')).toContainText('Codex')
-    await expect(codexPanel.locator('.agent-status-strip')).toContainText('Ready')
-    await page.getByTestId('codex-sandbox').selectOption('workspace-write')
+    await expect(codexPanel.locator('.empty-hero')).toBeVisible()
+    await expect(codexPanel.locator('.empty-state-heading')).toBeVisible()
+    // Sandbox is a segmented pill toggle now — click the segment instead of selectOption.
+    await page.getByTestId('codex-sandbox-workspace-write').click()
     await page.getByTestId('codex-composer').fill('Create a tiny hello file')
     await expect(page.getByTestId('codex-send')).toBeEnabled()
     await page.getByTestId('codex-send').click()
-    // Composer clears immediately on send.
+    // Composer clears immediately on send; sending creates the session.
     await expect(page.getByTestId('codex-composer')).toHaveValue('')
     await expect(codexPanel).toContainText('Fake Codex received: Create a tiny hello file')
     await expect(codexPanel).toContainText('sandbox=workspace-write skipGitRepoCheck=false')
     await expect(codexPanel).toContainText('sandbox: workspace-write')
+    await expect(codexPanel.locator('.activity-line').first()).toContainText('codex')
+    await expect(codexPanel.locator('.session-item.active')).toContainText('Create a tiny hello')
+    // Session view now shows the agent status strip, back to Ready after the run.
+    await expect(codexPanel.locator('.agent-status-strip')).toContainText('Codex')
+    await expect(codexPanel.locator('.agent-status-strip')).toContainText('Ready')
     // Back to the idle Run button (no Stop) once the run completes.
     await expect(page.getByTestId('codex-send')).toBeVisible()
   } finally {
@@ -954,6 +1237,7 @@ test('extensions registry browser supports categories, search, paging, and detai
     env: {
       ...process.env,
       AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
       E2E_FAKE_CODEX: '1',
       E2E_FAKE_REGISTRY: '1',
       ELECTRON_DISABLE_GPU: '1'
@@ -1038,6 +1322,7 @@ test('codex missing CLI diagnostic is retryable without real CLI login', async (
     env: {
       ...process.env,
       AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
       E2E_MISSING_CODEX: '1',
       ELECTRON_DISABLE_GPU: '1'
     }
@@ -1089,6 +1374,7 @@ test('codex trust error requires explicit skip-git consent before retry', async 
     env: {
       ...process.env,
       AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
       E2E_CODEX_TRUST_ERROR: '1',
       ELECTRON_DISABLE_GPU: '1'
     }
@@ -1109,8 +1395,9 @@ test('codex trust error requires explicit skip-git consent before retry', async 
     const codexPanel = page.getByTestId('workspace-panel-codex')
     await expect(codexPanel).toBeVisible()
 
-    // Installed CLI → start a task, then send without trust consent.
-    await page.getByTestId('codex-start-task').click()
+    // Installed CLI → the empty-state composer is ready immediately; send
+    // without trust consent (sending creates the session).
+    await expect(page.getByTestId('codex-composer')).toBeVisible()
     await page.getByTestId('codex-composer').fill('hello')
     await page.getByTestId('codex-send').click()
 
@@ -1148,6 +1435,7 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     env: {
       ...process.env,
       AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
       E2E_FAKE_CODEX: '1',
       ELECTRON_DISABLE_GPU: '1'
     }
@@ -1261,11 +1549,9 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     await page.getByTestId('settings-nav-appearance').click()
     await expect(page.getByTestId('settings-section-appearance')).toBeVisible()
 
-    // Toggle reduced motion (harmless toggle, fully wired)
-    const toggles = page.getByRole('switch', { name: 'Reduced motion' })
-    await expect(toggles).toBeVisible()
-    await toggles.click()
-    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.reducedMotion)).toBe('true')
+    // Motion mode is fully wired and updates the document-level motion guard.
+    await page.getByRole('combobox', { name: 'Motion' }).selectOption('off')
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.motion)).toBe('off')
     // Save feedback appears briefly
     await expect(page.getByTestId('settings-message')).toBeVisible({ timeout: 3000 })
 
@@ -1287,6 +1573,7 @@ test('settings control center opens, navigates, searches, saves, and reports dia
       env: {
         ...process.env,
         AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
         E2E_FAKE_CODEX: '1',
         ELECTRON_DISABLE_GPU: '1'
       }
@@ -1299,5 +1586,111 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     await expect(restartedPage.getByTestId('shortcut-key-nav_chat')).toContainText('Ctrl+Alt+Y')
   } finally {
     await electronApp.close()
+  }
+})
+
+test('setup wizard runs on first launch and stays dismissed after completion', async ({}, testInfo) => {
+  const repoRoot = path.resolve(__dirname, '..', '..')
+  const userDataDir = testInfo.outputPath('user-data')
+  await mkdir(userDataDir, { recursive: true })
+
+  // No E2E_SKIP_SETUP_WIZARD here: this test exercises the real first-run path.
+  // E2E_FAKE_SETUP_TOOLS makes detection deterministic and instant.
+  const launchApp = () =>
+    electron.launch({
+      args: [
+        '--disable-gpu',
+        '--disable-gpu-compositing',
+        '--disable-software-rasterizer',
+        '--in-process-gpu',
+        '--no-sandbox',
+        path.join(repoRoot, 'out', 'main', 'index.js')
+      ],
+      env: {
+        ...process.env,
+        AIWORKSPACE_TEST_USER_DATA: userDataDir,
+        E2E_FAKE_SETUP_TOOLS: '1',
+        ELECTRON_DISABLE_GPU: '1'
+      }
+    })
+
+  let electronApp = await launchApp()
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+
+    // Fresh DB → wizard appears instead of the workspace.
+    await expect(page.getByTestId('setup-wizard')).toBeVisible()
+    await expect(page.getByTestId('setup-wizard-step-1')).toBeVisible()
+    await expect(page.getByTestId('workspace-shell')).toHaveCount(0)
+    await expect(page.getByTestId('setup-wizard')).toContainText('Welcome to AI Workspace')
+
+    // Step 1 → 2: detection checklist fills in with the fake results.
+    await page.getByTestId('setup-wizard-get-started').click()
+    await expect(page.getByTestId('setup-wizard-step-2')).toBeVisible()
+    await expect(page.getByTestId('setup-tool-claudeCode')).toContainText('1.2.3', { timeout: 10000 })
+    await expect(page.getByTestId('setup-tool-codex')).toContainText('not found')
+    await expect(page.getByTestId('setup-tool-ollama')).toContainText('0.1.45')
+    await expect(page.getByTestId('setup-tool-hermes')).toContainText('not found')
+    await expect(page.getByTestId('setup-wizard-next')).toBeEnabled()
+
+    // Step 2 → 3: results summary with install CTAs for missing tools.
+    await page.getByTestId('setup-wizard-next').click()
+    await expect(page.getByTestId('setup-wizard-step-3')).toBeVisible()
+    await expect(page.getByTestId('setup-result-codex')).toContainText('npm install -g @openai/codex')
+    await expect(page.getByTestId('setup-result-hermes')).toContainText('github.com/nouresearch/hermes')
+    await expect(page.getByTestId('setup-result-claudeCode')).toContainText('1.2.3')
+
+    // Back returns to the detection step, results retained.
+    await page.getByTestId('setup-wizard-back').click()
+    await expect(page.getByTestId('setup-wizard-step-2')).toBeVisible()
+    await expect(page.getByTestId('setup-tool-claudeCode')).toContainText('1.2.3')
+    await page.getByTestId('setup-wizard-next').click()
+    await expect(page.getByTestId('setup-wizard-step-3')).toBeVisible()
+
+    // Step 3 → 4: keep the default "skip project" choice.
+    await page.getByTestId('setup-wizard-next').click()
+    await expect(page.getByTestId('setup-wizard-step-4')).toBeVisible()
+    await expect(page.getByTestId('setup-wizard-skip-project')).toBeChecked()
+
+    // Step 4 → 5: finish with "don't show again" checked (default).
+    await page.getByTestId('setup-wizard-next').click()
+    await expect(page.getByTestId('setup-wizard-step-5')).toBeVisible()
+    await expect(page.getByTestId('setup-wizard-dont-show')).toBeChecked()
+    await page.getByTestId('setup-wizard-start-working').click()
+
+    // Wizard closes, workspace renders.
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await expect(page.getByTestId('setup-wizard')).toHaveCount(0)
+
+    // Let the debounced sql.js persist land before quitting (flush also runs on quit).
+    await page.waitForTimeout(700)
+    await electronApp.close()
+
+    // Restart with the same userData: flag persisted → straight to the workspace.
+    electronApp = await launchApp()
+    const restarted = await electronApp.firstWindow()
+    await restarted.waitForLoadState('domcontentloaded')
+    await expect(restarted.getByTestId('workspace-shell')).toBeVisible()
+    await expect(restarted.getByTestId('setup-wizard')).toHaveCount(0)
+
+    // Settings → Advanced re-arms the wizard for the next launch.
+    await restarted.getByTestId('open-settings').click()
+    await restarted.getByTestId('settings-nav-advanced').click()
+    await expect(restarted.getByTestId('settings-show-setup-wizard')).toBeVisible()
+    await expect(restarted.getByTestId('settings-show-setup-wizard')).toHaveAttribute('aria-checked', 'false')
+    await restarted.getByTestId('settings-show-setup-wizard').click()
+    await expect(restarted.getByTestId('settings-show-setup-wizard')).toHaveAttribute('aria-checked', 'true')
+    await restarted.waitForTimeout(700)
+    await electronApp.close()
+
+    // Third launch: wizard shows again because the flag was cleared.
+    electronApp = await launchApp()
+    const third = await electronApp.firstWindow()
+    await third.waitForLoadState('domcontentloaded')
+    await expect(third.getByTestId('setup-wizard')).toBeVisible()
+    await expect(third.getByTestId('setup-wizard-step-1')).toBeVisible()
+  } finally {
+    await electronApp.close().catch(() => undefined)
   }
 })

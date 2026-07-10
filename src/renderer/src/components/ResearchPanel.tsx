@@ -3,6 +3,7 @@ import type { Project, MemoryItem, ResearchProgress } from '../types'
 import Markdown from './Markdown'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceNotice } from './WorkspacePrimitives'
+import { useToast } from './ToastContext'
 
 interface StageState {
   key: string
@@ -30,10 +31,12 @@ export default function ResearchPanel({
 }) {
   const isGlobal = isGlobalProjectId(project.id)
   const memoryProjectId = isGlobal ? null : project.id
+  const { addToast } = useToast()
 
   const [panelState, setPanelState] = useState<PanelState>('launcher')
   const [topic, setTopic] = useState('')
   const [scope, setScope] = useState<'web' | 'local' | 'both'>('both')
+  const [quick, setQuick] = useState(false)
   const [saveToProject, setSaveToProject] = useState(!isGlobal)
   const [stages, setStages] = useState<StageState[]>(
     STAGES.map(s => ({ ...s, status: 'pending', detail: '' }))
@@ -55,12 +58,15 @@ export default function ResearchPanel({
       .catch(() => {})
   }, [panelState, memoryProjectId])
 
-  // Load stored SearXNG URL on mount
+  // Load stored SearXNG URL and the default research scope on mount
   useEffect(() => {
     window.api.settings.get('searxng_url').then(val => {
       const url = val ?? 'http://localhost:8080'
       setSearxngInput(url)
       setSearxngSaved(url)
+    }).catch(() => {})
+    window.api.settings.get('research_default_scope').then(val => {
+      if (val === 'web' || val === 'local' || val === 'both') setScope(val)
     }).catch(() => {})
   }, [])
 
@@ -110,6 +116,7 @@ export default function ResearchPanel({
       scope,
       projectId: memoryProjectId,
       saveToProject,
+      quick,
     })
   }
 
@@ -184,6 +191,19 @@ export default function ResearchPanel({
             </button>
             <button className="ghost" onClick={onOpenKnowledge}>
               Open Knowledge
+            </button>
+            <button
+              className="ghost"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(report)
+                  addToast('Report copied')
+                } catch {
+                  addToast('Copy failed')
+                }
+              }}
+            >
+              Copy report
             </button>
           </div>
           <div className="research-report-scroll">
@@ -270,6 +290,30 @@ export default function ResearchPanel({
                 {label}
               </label>
             ))}
+          </fieldset>
+
+          <fieldset className="research-fieldset">
+            <legend className="research-legend">Mode</legend>
+            <label className="research-radio-row">
+              <input
+                type="radio"
+                name="research-mode"
+                value="standard"
+                checked={!quick}
+                onChange={() => setQuick(false)}
+              />
+              Standard — full pipeline, reads every source in depth
+            </label>
+            <label className="research-radio-row">
+              <input
+                type="radio"
+                name="research-mode"
+                value="quick"
+                checked={quick}
+                onChange={() => setQuick(true)}
+              />
+              Quick — 3 sources, snippets only, short brief
+            </label>
           </fieldset>
 
           <fieldset className="research-fieldset">
