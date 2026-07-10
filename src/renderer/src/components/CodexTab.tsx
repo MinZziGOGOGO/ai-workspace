@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexSandboxMode, ComposerAttachment } from '../types'
-import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexSandboxMode } from '../types'
+import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
+import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
@@ -97,27 +98,6 @@ function SetupNotice(props: { check: CodexCheck; onRecheck: () => void }) {
   )
 }
 
-function ProjectRequiredNotice() {
-  return (
-    <div className="chat-layout">
-      <aside className="session-list">
-        <div className="session-list-header">
-          <button className="session-new-btn" disabled title="Codex needs a project folder">
-            <span className="session-new-icon">＋</span> New task
-          </button>
-        </div>
-      </aside>
-      <section className="chat-main">
-        <AiContextBar testId="context-bar-codex" model={CODEX_MODEL} mode="Codex" status="Project required" disabledReason="Open a project folder" />
-        <div className="empty center cc-setup" data-testid="codex-project-required">
-          <h2>Open a project to use Codex.</h2>
-          <p className="muted">Codex runs against a selected project folder. Open a project workspace to use it — Global Workspace has no folder for it to work in.</p>
-        </div>
-      </section>
-    </div>
-  )
-}
-
 interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function CodexTab(props: { project: Project; active?: boolean }) {
@@ -149,8 +129,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
   const confirmDestructive = useConfirmDestructive()
   const [renderOffset, setRenderOffset] = useState(0)
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [isDragOver, setIsDragOver] = useState(false)
+  const { attachments, setAttachments, isDragOver, setIsDragOver, handlePaste, pickFile, handleDrop } = useComposerAttachments()
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [instructionsOpen, setInstructionsOpen] = useState<{ agentId: string; agentLabel: string } | null>(null)
   const [agentMdExists, setAgentMdExists] = useState(false)
@@ -169,8 +148,10 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const lastPromptRef = useRef('')
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
-  const contextText = [...messages.map((m) => m.content), output, input].filter(Boolean).join('\n')
-  const estimatedTokens = estimateTokensFromText(contextText)
+  const estimatedTokens = useMemo(
+    () => estimateTokensFromText([...messages.map((m) => m.content), output, input].filter(Boolean).join('\n')),
+    [messages, output, input]
+  )
   const notifyCompletion = useCompletionNotifier(active)
   const lastCodexActivity = activity[activity.length - 1]
   const codexStatusPhrase = useStatusPhrase({
@@ -217,7 +198,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     return () => setAgentActive('codex', false)
   }, [running, setAgentActive])
 
-  useEffect(() => { window.api.models.list().then(setOllamaModels) }, [])
+  useEffect(() => { if (active) window.api.models.list().then(setOllamaModels) }, [active])
 
   useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
@@ -343,8 +324,8 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   useEffect(() => {
     if (!contextMenu) return
     function handleDown() { setContextMenu(null) }
-    document.addEventListener('pointerdown', handleDown, true)
-    return () => document.removeEventListener('pointerdown', handleDown, true)
+    document.addEventListener('pointerdown', handleDown)
+    return () => document.removeEventListener('pointerdown', handleDown)
   }, [contextMenu])
 
   async function newSession() {
@@ -354,8 +335,13 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   newSessionRef.current = () => { if (!isGlobalWorkspace && check?.installed) void newSession() }
 
   async function deleteSession(target: Session) {
-    await window.api.sessions.delete(target.id)
+    const result = await window.api.sessions.delete(target.id)
+    if (!result.success) {
+      addToast(`Failed to delete session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
+    setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
     if (session?.id === target.id) { setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError('') }
     addToast('Session deleted')
   }
@@ -370,8 +356,13 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   async function commitRename(s: Session) {
     const title = renaming?.value.trim() || s.title; setRenaming(null)
     if (title === s.title) return
-    await window.api.sessions.rename(s.id, title)
+    const result = await window.api.sessions.rename(s.id, title)
+    if (!result.success) {
+      addToast(`Failed to rename session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
+    setArchivedSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
     if (session?.id === s.id) setSession(prev => prev ? { ...prev, title } : prev)
   }
 
@@ -383,7 +374,11 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   async function toggleArchive(target: Session) {
     setContextMenu(null)
     const archive = !target.archived
-    await window.api.sessions.archive(target.id, archive)
+    const result = await window.api.sessions.archive(target.id, archive)
+    if (!result.success) {
+      addToast(`Failed to ${archive ? 'archive' : 'unarchive'} session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     if (archive) {
       setSessions(prev => prev.filter(x => x.id !== target.id))
       setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
@@ -426,62 +421,20 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
 
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    for (const item of Array.from(e.clipboardData.items)) {
-      if (item.type.startsWith('image/')) {
-        e.preventDefault()
-        const att = await attachmentFromImageClipboardItem(item)
-        if (att) setAttachments(prev => [...prev, att])
-        return
-      }
-    }
-    const text = e.clipboardData.getData('text/plain')
-    if (text.length > 1500) {
-      e.preventDefault()
-      const att: ComposerAttachment = {
-        id: crypto.randomUUID(),
-        file: { type: 'text', name: 'Pasted text', size: text.length, content: text, ext: '.txt' }
-      }
-      setAttachments(prev => [...prev, att])
-    }
-  }
-
-  async function pickFile() {
-    try {
-      const path = await window.api.files.pick()
-      if (!path) return
-      const file = await window.api.files.read(path)
-      const att: ComposerAttachment = { id: crypto.randomUUID(), file }
-      setAttachments(prev => [...prev, att])
-    } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to read file')
-    }
-  }
-
-  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault()
-    setIsDragOver(false)
-    for (const file of Array.from(e.dataTransfer.files)) {
-      const path = electronFilePath(file)
-      if (!path) continue
-      try {
-        const fileAttachment = await window.api.files.read(path)
-        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
-      } catch (err) {
-        addToast(err instanceof Error ? err.message : 'Failed to read file')
-      }
-    }
-  }
-
   async function deleteManySessions(ids: string[]) {
-    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
-    const idSet = new Set(ids)
+    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
+    const failed = results.filter(({ result }) => !result.success)
+    if (failed.length > 0) {
+      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
+    }
+    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
+    if (idSet.size === 0) return
     setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     if (session && idSet.has(session.id)) {
       setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError('')
     }
-    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
+    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
   }
 
   async function run() {
@@ -577,15 +530,19 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   }
 
   async function saveOutputToKnowledge(m: Message) {
-    await window.api.memory.save({
-      projectId: props.project.id,
-      type: 'note',
-      title: m.content.slice(0, 60),
-      content: m.content,
-      source: 'codex',
-    })
-    addToast('Saved to Knowledge')
-    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    try {
+      await window.api.memory.save({
+        projectId: props.project.id,
+        type: 'note',
+        title: m.content.slice(0, 60),
+        content: m.content,
+        source: 'codex',
+      })
+      addToast('Saved to Knowledge')
+      window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    } catch (err) {
+      addToast(`Failed to save to Knowledge: ${err instanceof Error ? err.message : 'unknown error'}`)
+    }
   }
 
   // Regenerate / edit-resend / reactions — shared logic lives in the hook,
@@ -605,7 +562,8 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     setMessages,
     busy: running,
     fetchMessages: fetchCodexMessages,
-    resend: codexResend
+    resend: codexResend,
+    onError: addToast
   })
 
   const renderMessage = (m: Message) => {
@@ -926,6 +884,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
           onRename={() => startRename(ctxSession)}
           onToggleArchive={() => void toggleArchive(ctxSession)}
           onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+          onClose={() => setContextMenu(null)}
         />
       )}
     </div>

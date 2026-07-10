@@ -2,6 +2,8 @@
 // when the big laptop arrives, Nemotron drops in here as just another model tag.
 // Nothing in the app may assume a specific model.
 
+import { isE2EFakeEnabled } from './e2e'
+
 // OLLAMA_HOST is conventionally a *server* bind value (e.g. "0.0.0.0:11434")
 // and often has no URL scheme. Normalize it into a client-connectable URL:
 // add http:// when missing, and rewrite the bind-all 0.0.0.0 to a loopback
@@ -15,6 +17,10 @@ function resolveOllamaHost(): string {
 const OLLAMA = resolveOllamaHost()
 export const EMBED_MODEL = 'nomic-embed-text'
 
+function isFakeOllama(): boolean {
+  return isE2EFakeEnabled('E2E_FAKE_OLLAMA')
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -22,6 +28,7 @@ export interface ChatMessage {
 }
 
 export async function listModels(): Promise<string[]> {
+  if (isFakeOllama()) return ['e2e-chat-model']
   try {
     const res = await fetch(`${OLLAMA}/api/tags`)
     const data = (await res.json()) as { models: { name: string }[] }
@@ -36,6 +43,15 @@ export async function* streamChat(
   messages: ChatMessage[],
   signal?: AbortSignal
 ): AsyncGenerator<string> {
+  if (isFakeOllama()) {
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user')
+    const text = `Fake Chat response: ${lastUser?.content ?? 'empty prompt'}`
+    for (const token of text.match(/.{1,24}/g) ?? [text]) {
+      if (signal?.aborted) return
+      yield token
+    }
+    return
+  }
   const res = await fetch(`${OLLAMA}/api/chat`, {
     method: 'POST',
     body: JSON.stringify({ model, messages, stream: true }),
@@ -82,6 +98,21 @@ export async function defaultChatModel(): Promise<string | null> {
  * indexer to summarize files; nothing here assumes a particular model.
  */
 export async function chat(model: string, messages: ChatMessage[], timeoutMs?: number): Promise<string | null> {
+  if (isFakeOllama()) {
+    const last = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+    if (/Reply with ONLY a JSON object/i.test(last) && /handoff/i.test(last)) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      const message = last.match(/Message:\s*"([\s\S]*?)"/)?.[1] ?? ''
+      const agent = /hermes/i.test(message) ? 'hermes' : /claude\s*code|claude/i.test(message) ? 'claudecode' : /codex/i.test(message) ? 'codex' : null
+      return JSON.stringify({ handoff: Boolean(agent), agent, newSession: /\b(new|fresh|start a new)\b/i.test(message) })
+    }
+    if (/write a\s+clear, complete, well-structured prompt/i.test(last)) {
+      const task = last.match(/User:\s*([^\n]+)\s*$/)?.[1] ?? 'Complete the requested task.'
+      return `# E2E handoff prompt\n\n${task}\n\nVerify the result before finishing.`
+    }
+    if (/concise 3 to 5 word title|one short phrase/i.test(last)) return 'E2E session summary'
+    return `Fake Chat completion: ${last.slice(0, 120)}`
+  }
   try {
     // Optional bound so a wedged model can't hang a caller's UI forever. Omitted
     // by default (the indexer is happy to wait); the extractor passes a budget.
@@ -104,6 +135,7 @@ export async function chat(model: string, messages: ChatMessage[], timeoutMs?: n
  * chat model would be used by default (same rule as defaultChatModel)?
  */
 export async function ollamaStatus(): Promise<{ connected: boolean; defaultModel: string | null }> {
+  if (isFakeOllama()) return { connected: true, defaultModel: 'e2e-chat-model' }
   try {
     const res = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(2500) })
     if (!res.ok) return { connected: false, defaultModel: null }

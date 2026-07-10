@@ -1,6 +1,7 @@
 import { spawn } from 'child_process'
-import { existsSync, readdirSync, readFileSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { isE2EFakeEnabled } from './e2e'
 
 // Milestone 5 — Claude Code launcher.
 //
@@ -25,6 +26,10 @@ import { join } from 'path'
 
 const IS_WIN = process.platform === 'win32'
 const CLAUDE_EXE = IS_WIN ? 'claude.exe' : 'claude'
+
+function isFakeClaudeCode(): boolean {
+  return isE2EFakeEnabled('E2E_FAKE_CLAUDE_CODE')
+}
 
 // ---- normalized events -----------------------------------------------------
 export interface FileDiff {
@@ -111,6 +116,10 @@ function isDirectExe(bin: string): boolean {
 // ---- installation check ----------------------------------------------------
 export function checkClaudeCode(): Promise<CCCheck> {
   return new Promise((resolve) => {
+    if (isFakeClaudeCode()) {
+      resolve({ installed: true, version: 'fake-claude-code', bin: 'fake-claude' })
+      return
+    }
     const bin = resolveClaudeBin()
     const shell = !isDirectExe(bin)
     let out = ''
@@ -171,6 +180,22 @@ export function runClaudeCode(opts: {
   onEvent: (e: CCEvent) => void
   signal?: AbortSignal
 }): Promise<RunResult> {
+  if (isFakeClaudeCode()) {
+    const activity: ActivityEntry[] = [{ name: 'Write', summary: 'e2e-claude-output.txt', ok: true }]
+    const before = existsSync(join(opts.projectPath, 'e2e-claude-output.txt'))
+      ? readFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), 'utf8')
+      : null
+    const after = `Fake Claude Code modified files for: ${opts.prompt}\n`
+    writeFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), after, 'utf8')
+    activity[0].diff = { path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after }
+    opts.onEvent({ kind: 'system', summary: 'Fake Claude Code session started', model: opts.model })
+    opts.onEvent({ kind: 'tool', id: 'fake-write', name: 'Write', summary: 'e2e-claude-output.txt' })
+    opts.onEvent({ kind: 'tool-result', id: 'fake-write', ok: true, summary: 'wrote e2e-claude-output.txt' })
+    opts.onEvent({ kind: 'file_diff', toolCallId: 'fake-write', path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after })
+    const result = `Fake Claude Code completed: ${opts.prompt}`
+    opts.onEvent({ kind: 'text', text: result })
+    return Promise.resolve({ ok: true, result, activity })
+  }
   return new Promise((resolve) => {
     const bin = resolveClaudeBin()
     const direct = isDirectExe(bin)

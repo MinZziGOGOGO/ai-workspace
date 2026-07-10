@@ -34,6 +34,7 @@ export interface MessageActionsDeps {
   fetchMessages: (sessionId: string) => Promise<Message[]>
   /** Kick off a fresh model/agent turn reusing an existing user message. */
   resend: (content: string, regenerateMessageId: string) => void
+  onError?: (message: string) => void
 }
 
 // Shared regenerate / edit-resend / reaction logic for all four agent tabs.
@@ -41,7 +42,7 @@ export interface MessageActionsDeps {
 // IPC and running-state fields differ, but the message-graph surgery
 // (delete-after, then resend without duplicating the user turn) is identical.
 export function useMessageActions(deps: MessageActionsDeps) {
-  const { sessionId, messages, setMessages, busy, fetchMessages, resend } = deps
+  const { sessionId, messages, setMessages, busy, fetchMessages, resend, onError } = deps
 
   const regenerate = useCallback(async () => {
     if (!sessionId || busy) return
@@ -52,11 +53,15 @@ export function useMessageActions(deps: MessageActionsDeps) {
     if (!lastAssistant) return
     const precedingUser = findPrecedingUserMessage(messages, lastAssistant.id)
     if (!precedingUser) return
-    await window.api.messages.deleteAfter(sessionId, precedingUser.id)
+    const result = await window.api.messages.deleteAfter(sessionId, precedingUser.id)
+    if (!result.success) {
+      onError?.(`Failed to regenerate response: ${result.error ?? 'unknown error'}`)
+      return
+    }
     const fresh = await fetchMessages(sessionId)
     setMessages(() => fresh)
     resend(precedingUser.content, precedingUser.id)
-  }, [sessionId, messages, busy, fetchMessages, resend, setMessages])
+  }, [sessionId, messages, busy, fetchMessages, resend, setMessages, onError])
 
   const editAndResend = useCallback(async (messageId: string, newContent: string) => {
     if (!sessionId || busy) return
@@ -65,19 +70,31 @@ export function useMessageActions(deps: MessageActionsDeps) {
       const ok = window.confirm(`This will remove ${after} messages after this point. Continue?`)
       if (!ok) return
     }
-    await window.api.messages.update(messageId, newContent)
-    await window.api.messages.deleteAfter(sessionId, messageId)
+    const updateResult = await window.api.messages.update(messageId, newContent)
+    if (!updateResult.success) {
+      onError?.(`Failed to update message: ${updateResult.error ?? 'unknown error'}`)
+      return
+    }
+    const deleteResult = await window.api.messages.deleteAfter(sessionId, messageId)
+    if (!deleteResult.success) {
+      onError?.(`Failed to prepare edited resend: ${deleteResult.error ?? 'unknown error'}`)
+      return
+    }
     const fresh = await fetchMessages(sessionId)
     setMessages(() => fresh)
     resend(newContent, messageId)
-  }, [sessionId, messages, busy, fetchMessages, resend, setMessages])
+  }, [sessionId, messages, busy, fetchMessages, resend, setMessages, onError])
 
   const setReaction = useCallback(async (messageId: string, reaction: 'up' | 'down') => {
     const current = messages.find((m) => m.id === messageId)
     const next: 'up' | 'down' | null = current?.reaction === reaction ? null : reaction
     setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, reaction: next } : m)))
-    await window.api.messages.setReaction(messageId, next)
-  }, [messages, setMessages])
+    const result = await window.api.messages.setReaction(messageId, next)
+    if (!result.success) {
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, reaction: current?.reaction ?? null } : m)))
+      onError?.(`Failed to save reaction: ${result.error ?? 'unknown error'}`)
+    }
+  }, [messages, setMessages, onError])
 
   return { regenerate, editAndResend, setReaction }
 }

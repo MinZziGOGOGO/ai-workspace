@@ -15,23 +15,32 @@ Rules
   claudecode=violet.
 - Schema changes: add migrations in src/main/db.ts; never edit tables destructively.
 
-## ⚠️ sql.js concurrency caveat (M2 onwards)
+## Storage engine: better-sqlite3 + WAL (resolves the old sql.js hazard)
 
-The swap from `better-sqlite3` to `sql.js` (to avoid native compilation) changed the
-concurrency model. `sql.js` loads the entire `workspace.db` into memory and **rewrites
-the whole file on every write** (see `persist()` in src/main/db.ts). It has no multi-process
-locking.
+`workspace.db` is accessed through **better-sqlite3** (native, synchronous) in **WAL
+mode** — see `src/main/db.ts`. WAL gives real single-writer/multi-reader concurrency and
+durable-on-return writes; there is no whole-file rewrite and no debounced persist buffer.
 
-As of M2, **two processes can open the same `workspace.db`:**
-- The Electron app (src/main/index.ts)
-- The standalone knowledge MCP server (src/main/mcp/server.ts, run by Claude Desktop / Hermes / Claude Code)
+This replaced the previous `sql.js` backend, which loaded the entire DB into memory,
+**rewrote the whole file on every debounced write**, and had no multi-process locking.
+Under sql.js the two hosts that both open `workspace.db` —
 
-**Do not allow both to write at the same time.** The single-writer queue in `knowledge.ts`
-only serializes within one process; concurrent writes from both processes suffer last-writer-wins
-and data clobber silently.
+- the Electron app (`src/main/index.ts`), and
+- the standalone knowledge MCP server (`src/main/mcp/server.ts`)
 
-**Proper fix (future milestone):** route all DB writes through one owner—e.g. the MCP server
-talks to the Electron main process over IPC instead of opening the file directly, or move to
-a storage layer with genuine multi-process access (e.g. PostgreSQL for a cloud version).
+— could clobber each other with silent last-writer-wins. **WAL fixes this:** concurrent
+writes from both processes are serialized safely by SQLite (with `busy_timeout`), verified
+with a two-process concurrent-writer test during the migration.
+
+**ABI note — do not launch the MCP server with a bare `node`.** better-sqlite3 is a native
+addon compiled for **Electron's ABI**. The standalone server must therefore run on that same
+ABI, so it is launched through the app's Electron binary with `ELECTRON_RUN_AS_NODE=1` (one
+native build serves both hosts). The single source of truth for this launch config is
+`knowledgeMcpLaunchConfig()` in `src/main/mcp.ts`; every registration path (Claude Desktop
+config, the Extensions quick-add, the Hermes/WSL wiring) goes through it. A plain-`node`
+launch would load a mismatched better-sqlite3 and fail on startup.
+
+The single-writer queue in `knowledge.ts` still serializes writes within a process; it is
+complementary to WAL, not replaced by it.
 
 Current milestone status: see docs/ROADMAP.md.

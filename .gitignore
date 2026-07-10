@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+release/
+*.tsbuildinfo
+
+# Test artifacts
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# Caches
+.npm-cache/
+.cache/
+.vite/
+tmp/
+*.tmp
+.tmp/
+
+# Backups
+.codex/
+.codex-backups/
+.backup-settings-*/
+
+# Local runtime data / databases
+*.db
+*.db-shm
+*.db-wal
+workspace.db*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.log
+*.bak
+
+# Python bytecode (from skill scripts)
+__pycache__/
+*.pyc
+
+# Local-only Claude settings (keep shared config, ignore personal overrides)
+.claude/settings.local.json

@@ -1,5 +1,6 @@
 import { test, expect, _electron as electron, type Page } from '@playwright/test'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { cleanupGeneratedTitle, fallbackTitleFromText, isGenericSessionTitle } from '../../src/shared/sessionTitles'
 
@@ -48,6 +49,119 @@ async function expectComposerHeaderReadable(page: Page, panel: string, composerT
   expect(colors.composerBg).not.toBe(colors.composerFg)
 }
 
+async function contrastForSelector(page: Page, selector: string): Promise<number> {
+  return page.evaluate((targetSelector) => {
+    function parseRgb(value: string): { r: number; g: number; b: number; a: number } | null {
+      const match = value.match(/rgba?\(([^)]+)\)/)
+      if (!match) return null
+      const parts = match[1].split(',').map((part) => Number.parseFloat(part.trim()))
+      return { r: parts[0], g: parts[1], b: parts[2], a: parts[3] ?? 1 }
+    }
+    function composite(
+      fg: { r: number; g: number; b: number; a: number },
+      bg: { r: number; g: number; b: number; a: number }
+    ) {
+      return {
+        r: fg.r * fg.a + bg.r * (1 - fg.a),
+        g: fg.g * fg.a + bg.g * (1 - fg.a),
+        b: fg.b * fg.a + bg.b * (1 - fg.a),
+        a: 1,
+      }
+    }
+    function luminance(color: { r: number; g: number; b: number }) {
+      const [r, g, b] = [color.r, color.g, color.b].map((raw) => {
+        const value = raw / 255
+        return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+      })
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+    function contrast(fg: { r: number; g: number; b: number }, bg: { r: number; g: number; b: number }) {
+      let foreground = luminance(fg)
+      let background = luminance(bg)
+      if (foreground < background) [foreground, background] = [background, foreground]
+      return Number(((foreground + 0.05) / (background + 0.05)).toFixed(2))
+    }
+    function backgroundFor(el: Element) {
+      let current: Element | null = el
+      while (current) {
+        const background = getComputedStyle(current).backgroundColor
+        const parsed = parseRgb(background)
+        if (parsed && parsed.a > 0) return parsed
+        current = current.parentElement
+      }
+      return parseRgb(getComputedStyle(document.body).backgroundColor) ?? { r: 255, g: 255, b: 255, a: 1 }
+    }
+
+    const el = document.querySelector(targetSelector)
+    if (!el) throw new Error(`Missing selector: ${targetSelector}`)
+    const fg = parseRgb(getComputedStyle(el).color)
+    const bg = backgroundFor(el)
+    if (!fg) throw new Error(`Could not parse foreground for ${targetSelector}`)
+    return contrast(composite(fg, bg), bg)
+  }, selector)
+}
+
+async function focusMetrics(page: Page, selector: string): Promise<{ outlineWidth: number; width: number; height: number }> {
+  return page.evaluate((targetSelector) => {
+    const el = document.querySelector<HTMLElement>(targetSelector)
+    if (!el) throw new Error(`Missing selector: ${targetSelector}`)
+    el.focus()
+    const styles = getComputedStyle(el)
+    const rect = el.getBoundingClientRect()
+    return {
+      outlineWidth: Number.parseFloat(styles.outlineWidth || '0'),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    }
+  }, selector)
+}
+
+async function launchSmokeApp(testInfo: { outputPath: (name: string) => string }, env: Record<string, string> = {}) {
+  const repoRoot = path.resolve(__dirname, '..', '..')
+  const userDataDir = testInfo.outputPath('user-data')
+  await mkdir(userDataDir, { recursive: true })
+  return electron.launch({
+    args: [
+      '--disable-gpu',
+      '--disable-gpu-compositing',
+      '--disable-software-rasterizer',
+      '--in-process-gpu',
+      '--no-sandbox',
+      path.join(repoRoot, 'out', 'main', 'index.js')
+    ],
+    env: {
+      ...process.env,
+      AIWORKSPACE_TEST_USER_DATA: userDataDir,
+      E2E_SKIP_SETUP_WIZARD: '1',
+      ELECTRON_DISABLE_GPU: '1',
+      ...env
+    }
+  })
+}
+
+async function createAndSelectProject(page: Page, testInfo: { outputPath: (name: string) => string }, name: string) {
+  const projectParent = testInfo.outputPath(`${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-projects`)
+  await mkdir(projectParent, { recursive: true })
+  const project = await page.evaluate(async ({ projectName, parentDir }) => {
+    return await (window as any).api.projects.create(projectName, parentDir)
+  }, { projectName: name, parentDir: projectParent }) as { id: string; path: string }
+  await page.reload()
+  await page.waitForLoadState('domcontentloaded')
+  await page.getByTestId('workspace-tool-navigator').click()
+  await page.getByRole('button', { name: new RegExp(name) }).click()
+  await expect(page.getByText(name).first()).toBeVisible()
+  return project
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
 test('session title cleanup preserves only descriptive titles', () => {
   expect(isGenericSessionTitle('Chat 11.6.2026')).toBe(true)
   expect(isGenericSessionTitle('New Chat')).toBe(true)
@@ -59,6 +173,362 @@ test('session title cleanup preserves only descriptive titles', () => {
   expect(fallbackTitleFromText('Please help me debug nested split persistence after reload')).toBe(
     'Please help me debug nested'
   )
+})
+
+test('shared session rail supports pin, rename, archive, search, and confirmed delete', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    await page.evaluate(async () => {
+      const api = (window as any).api
+      for (let i = 0; i < 9; i++) {
+        await api.sessions.create('__global__', 'chat', i === 4 ? 'Session parity target' : `Session parity extra ${i}`)
+      }
+    })
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel.getByTestId('session-item')).toHaveCount(9)
+
+    // AgentSessionRail is shared by Chat, Hermes, Claude Code, and Codex; this
+    // one-tab test covers the shared session-management behavior for all four.
+    await chatPanel.getByLabel('Options for Session parity target').click()
+    await page.getByTestId('session-menu-pin').click()
+    const targetRow = chatPanel.locator('.session-row').filter({ hasText: 'Session parity target' })
+    await expect(targetRow).toBeVisible()
+    await targetRow.getByTestId('session-options').click()
+    await expect(page.getByTestId('session-menu-pin')).toContainText('Unpin')
+    await page.keyboard.press('Escape')
+
+    await targetRow.getByTestId('session-options').click()
+    await page.getByTestId('session-menu-rename').click()
+    await page.getByTestId('session-rename-input').fill('Renamed parity session')
+    await page.keyboard.press('Enter')
+    await expect(chatPanel.getByTestId('session-item').filter({ hasText: 'Renamed parity session' })).toHaveCount(1)
+
+    await chatPanel.getByPlaceholder('Search sessions...').fill('Renamed parity')
+    await expect(chatPanel.getByTestId('session-item')).toHaveCount(1)
+    await expect(chatPanel.getByTestId('session-item').first()).toContainText('Renamed parity session')
+    await chatPanel.getByPlaceholder('Search sessions...').fill('')
+    await expect(chatPanel.getByTestId('session-item')).toHaveCount(9)
+
+    await chatPanel.locator('.session-row').filter({ hasText: 'Renamed parity session' }).getByTestId('session-options').click()
+    await page.getByTestId('session-menu-archive').click()
+    await expect(chatPanel.getByTestId('session-item').filter({ hasText: 'Renamed parity session' })).toHaveCount(0)
+    await expect(chatPanel.getByRole('button', { name: /1 archived session/ })).toBeVisible()
+    await chatPanel.getByRole('button', { name: /1 archived session/ }).click()
+    await expect(chatPanel.locator('.session-archived-list').getByTestId('session-item')).toContainText('Renamed parity session')
+
+    await chatPanel.locator('.session-archived-list').getByTestId('session-options').click()
+    await page.getByTestId('session-menu-delete').click()
+    await expect(page.getByTestId('session-menu-delete')).toContainText('Click again to confirm')
+    await page.getByTestId('session-menu-delete').click()
+    await expect(chatPanel.locator('.session-archived-list')).toHaveCount(0)
+    await expect(chatPanel.getByRole('button', { name: /archived session/ })).toHaveCount(0)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('accessibility mechanics keep focus, contrast, and compact targets usable', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    await page.evaluate(async () => {
+      const api = (window as any).api
+      await api.sessions.create('__global__', 'chat', 'Accessibility audit row')
+      await api.memory.save({
+        projectId: null,
+        type: 'note',
+        title: 'Accessibility audit memory',
+        content: 'Muted text, controls, and menus should remain readable in both themes.',
+        source: 'e2e',
+      })
+    })
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-chat').click()
+    await page.getByTestId('workspace-tool-knowledge').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel.getByTestId('session-item').filter({ hasText: 'Accessibility audit row' })).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-knowledge').getByTestId('knowledge-item')).toBeVisible()
+
+    for (const theme of ['light', 'dark'] as const) {
+      await page.evaluate((nextTheme) => {
+        if (nextTheme === 'dark') document.documentElement.dataset.theme = 'dark'
+        else document.documentElement.removeAttribute('data-theme')
+      }, theme)
+      await expect.poll(() => contrastForSelector(page, '.knowledge-panel-head .muted')).toBeGreaterThanOrEqual(4.5)
+      await expect.poll(() => contrastForSelector(page, '.memory-content')).toBeGreaterThanOrEqual(4.5)
+
+      await page.locator('.topbar-group-btn').filter({ hasText: /^AI/ }).click()
+      await expect(page.locator('.topbar-dropdown-item').first()).toBeVisible()
+      await expect.poll(() => contrastForSelector(page, '.topbar-dropdown-item')).toBeGreaterThanOrEqual(4.5)
+      await page.keyboard.press('Escape')
+      await expect(page.locator('.topbar-dropdown')).toHaveCount(0)
+    }
+
+    const composer = await page.evaluate(() => {
+      const textarea = document.querySelector<HTMLElement>('[data-testid="chat-composer"]')
+      textarea?.focus()
+      const shell = textarea?.closest<HTMLElement>('.composer-shell')
+      const styles = shell ? getComputedStyle(shell) : null
+      return { borderColor: styles?.borderTopColor ?? '' }
+    })
+    expect(composer.borderColor).not.toBe('rgba(0, 0, 0, 0)')
+
+    const sessionFocus = await focusMetrics(page, '[data-testid="workspace-panel-chat"] [data-testid="session-item"]')
+    expect(sessionFocus.outlineWidth).toBeGreaterThanOrEqual(2)
+
+    const closeFocus = await focusMetrics(page, '[data-testid="workspace-panel-close-chat"]')
+    expect(closeFocus.outlineWidth).toBeGreaterThanOrEqual(2)
+    expect(closeFocus.height).toBeGreaterThanOrEqual(28)
+
+    const optionsMetrics = await focusMetrics(page, '[data-testid="workspace-panel-chat"] [data-testid="session-options"]')
+    expect(optionsMetrics.width).toBeGreaterThanOrEqual(28)
+    expect(optionsMetrics.height).toBeGreaterThanOrEqual(28)
+
+    await page.getByTestId('workspace-panel-chat').getByTestId('session-options').first().click()
+    await expect(page.getByTestId('session-menu-pin')).toBeFocused()
+    const menuItemBox = await page.getByTestId('session-menu-pin').boundingBox()
+    if (!menuItemBox) throw new Error('Missing session menu geometry')
+    expect(menuItemBox.height).toBeGreaterThanOrEqual(32)
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.session-context-menu')).toHaveCount(0)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('execute-mode handoff sends a generated prompt to Codex', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_OLLAMA: '1',
+    E2E_FAKE_CODEX: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Handoff Codex Project')
+
+    await page.getByTestId('workspace-tool-codex').click()
+    await expect(page.getByTestId('workspace-panel-codex')).toBeVisible()
+    await page.getByTestId('workspace-tool-chat').click()
+    await expect(page.getByTestId('workspace-panel-chat')).toBeVisible()
+    await expect.poll(() => page.getByTestId('workspace-panel-chat').locator('select').first().inputValue()).toBe('e2e-chat-model')
+    await page.getByTestId('workspace-panel-chat').getByRole('button', { name: 'New chat' }).click()
+    await expect(page.getByTestId('workspace-panel-chat').locator('.chat-scroll')).toBeVisible()
+
+    await page.getByTestId('chat-mode-execute').click()
+    await expect(page.getByTestId('chat-mode-execute')).toHaveClass(/active/)
+    await page.getByTestId('chat-composer').fill('Please send this plan to Codex in a new session')
+    await page.getByTestId('chat-send').click()
+    await expect(page.getByTestId('handoff-checking')).toBeVisible()
+    await expect(page.getByTestId('handoff-card')).toBeVisible()
+    await expect(page.getByTestId('handoff-card')).toContainText('Ready to send to Codex')
+    await expect(page.getByTestId('handoff-card')).toContainText('E2E handoff prompt')
+
+    await page.getByTestId('handoff-send').click()
+    await expect(page.getByTestId('handoff-confirm')).toContainText('Sent to Codex')
+    await expect(page.getByTestId('workspace-panel-codex')).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-codex')).toContainText('Fake Codex received: # E2E handoff prompt')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Claude Code creates checkpoints and can roll back fake file changes', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CLAUDE_CODE: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    const project = await createAndSelectProject(page, testInfo, 'Checkpoint Project')
+
+    await writeFile(path.join(project.path, 'README.md'), '# checkpoint project\n')
+    await writeFile(path.join(project.path, 'e2e-claude-output.txt'), 'before checkpoint\n')
+    execFileSync('git', ['init'], { cwd: project.path, stdio: 'ignore' })
+    execFileSync('git', ['config', 'user.email', 'e2e@example.test'], { cwd: project.path, stdio: 'ignore' })
+    execFileSync('git', ['config', 'user.name', 'E2E'], { cwd: project.path, stdio: 'ignore' })
+    execFileSync('git', ['add', '.'], { cwd: project.path, stdio: 'ignore' })
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: project.path, stdio: 'ignore' })
+
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await expect(claudePanel).toBeVisible()
+    await expect(page.getByTestId('claude-code-send')).toBeEnabled()
+    await page.getByTestId('claude-code-composer').fill('Modify files for checkpoint coverage')
+    await page.getByTestId('claude-code-send').click()
+
+    await expect(claudePanel).toContainText('Fake Claude Code completed: Modify files for checkpoint coverage')
+    await expect(page.getByTestId('claude-code-checkpoint')).toBeVisible()
+    const activeSessionId = await page.evaluate(async (projectId) => {
+      const sessions = await (window as any).api.sessions.list(projectId, 'claudecode')
+      const target = sessions.find((s: any) => s.title.includes('Modify files'))
+      const rows = await (window as any).api.checkpoints.list(target.id)
+      return { sessionId: target.id, checkpointRows: rows.length }
+    }, project.id) as { sessionId: string; checkpointRows: number }
+    expect(activeSessionId.checkpointRows).toBe(1)
+    expect(await pathExists(path.join(project.path, 'e2e-claude-output.txt'))).toBe(true)
+    expect(await readFile(path.join(project.path, 'e2e-claude-output.txt'), 'utf8')).toContain('Fake Claude Code modified files')
+
+    await page.getByTestId('claude-code-checkpoint-open').click()
+    await expect(page.getByTestId('claude-code-checkpoint-panel')).toBeVisible()
+    await page.getByTestId('claude-code-checkpoint-rollback').click()
+    await expect(page.getByTestId('claude-code-checkpoint-rollback')).toContainText('Continue?')
+    await page.getByTestId('claude-code-checkpoint-rollback').click()
+    await expect(page.locator('.toast')).toContainText('Rolled back to checkpoint')
+    await expect(claudePanel).toContainText('Rolled back: file changes made after this checkpoint were discarded.')
+    await expect.poll(async () => (await readFile(path.join(project.path, 'e2e-claude-output.txt'), 'utf8')).replace(/\r\n/g, '\n')).toBe('before checkpoint\n')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Hermes ask mode renders permission approvals for deny, allow once, and allow for session', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_HERMES: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Hermes Permission Project')
+    await page.getByTestId('workspace-tool-hermes').click()
+    const hermesPanel = page.getByTestId('workspace-panel-hermes')
+    await expect(hermesPanel).toBeVisible()
+    await page.getByTestId('hermes-permission-mode').selectOption('1')
+    await expect(page.getByTestId('hermes-permission-mode')).toHaveValue('1')
+
+    await page.getByTestId('hermes-composer').fill('deny this permission request')
+    await page.getByTestId('hermes-send').click()
+    await expect(page.getByTestId('hermes-permission-card')).toContainText('Run command `npm test`')
+    await expect(page.getByTestId('hermes-permission-deny')).toBeVisible()
+    await expect(page.getByTestId('hermes-permission-allow-once')).toBeVisible()
+    await expect(page.getByTestId('hermes-permission-allow-session')).toBeVisible()
+    await page.getByTestId('hermes-permission-deny').click()
+    await expect(page.getByTestId('hermes-permission-card')).toHaveCount(0)
+    await expect(hermesPanel).toContainText('Fake Hermes permission denied')
+
+    await page.getByTestId('hermes-composer').fill('allow this permission once')
+    await page.getByTestId('hermes-send').click()
+    await expect(page.getByTestId('hermes-permission-card')).toBeVisible()
+    await page.getByTestId('hermes-permission-allow-once').click()
+    await expect(page.getByTestId('hermes-permission-card')).toHaveCount(0)
+    await expect(hermesPanel).toContainText('Fake Hermes approved and completed: allow this permission once')
+
+    await page.getByTestId('hermes-composer').fill('allow this permission for the session')
+    await page.getByTestId('hermes-send').click()
+    await expect(page.getByTestId('hermes-permission-card')).toBeVisible()
+    await page.getByTestId('hermes-permission-allow-session').click()
+    await expect(page.getByTestId('hermes-permission-card')).toHaveCount(0)
+    await expect(hermesPanel).toContainText('Fake Hermes approved and completed: allow this permission for the session')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('dragging a panel header docks panels side by side and keeps both usable', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_CODEX: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByTestId('workspace-tool-knowledge').click()
+    await expect(page.getByTestId('workspace-panel-navigator')).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-knowledge')).toBeVisible()
+
+    const navHeader = await page.locator('.workspace-panel-head.panel-navigator').boundingBox()
+    const knowledgePanel = await page.getByTestId('workspace-panel-knowledge').boundingBox()
+    if (!navHeader || !knowledgePanel) throw new Error('Missing docking geometry')
+    await page.mouse.move(navHeader.x + navHeader.width / 2, navHeader.y + navHeader.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(
+      knowledgePanel.x + knowledgePanel.width - 50,
+      knowledgePanel.y + knowledgePanel.height / 2,
+      { steps: 14 }
+    )
+    await page.mouse.up()
+
+    await expect.poll(() => page.evaluate(() => {
+      const storageKey = Object.keys(localStorage).find((key) => key.startsWith('aiworkspace.layout3.'))
+      if (!storageKey) return null
+      return JSON.parse(localStorage.getItem(storageKey) || '{}')?.layout?.root?.type ?? null
+    })).toBe('split')
+    const docked = await page.evaluate(() => {
+      const rect = (selector: string) => {
+        const el = document.querySelector(selector)
+        if (!el) throw new Error(`Missing ${selector}`)
+        const r = el.getBoundingClientRect()
+        return { x: r.x, y: r.y, width: r.width, height: r.height }
+      }
+      const storageKey = Object.keys(localStorage).find((key) => key.startsWith('aiworkspace.layout3.'))
+      return {
+        navigator: rect('[data-testid="workspace-panel-navigator"]'),
+        knowledge: rect('[data-testid="workspace-panel-knowledge"]'),
+        layout: storageKey ? JSON.parse(localStorage.getItem(storageKey) || '{}') : null
+      }
+    }) as { navigator: Rect; knowledge: Rect; layout: { layout?: { root?: { type?: string; direction?: string } } } | null }
+    expect(Math.abs(docked.navigator.y - docked.knowledge.y)).toBeLessThan(8)
+    expect(Math.abs(docked.navigator.x - docked.knowledge.x)).toBeGreaterThan(100)
+    expect(docked.layout?.layout?.root?.type).toBe('split')
+    expect(docked.layout?.layout?.root?.direction).toBe('horizontal')
+
+    await expect(page.getByTestId('navigator-current-workspace')).toContainText('Global Workspace')
+    await page.getByTestId('workspace-panel-knowledge').getByPlaceholder(/Search memory/).fill('dock still works')
+    await expect(page.getByTestId('workspace-panel-knowledge').getByPlaceholder(/Search memory/)).toHaveValue('dock still works')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Codex message regenerate replaces the last response and edit-resend forks the turn', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CODEX: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Message Actions Project')
+    await page.getByTestId('workspace-tool-codex').click()
+    const codexPanel = page.getByTestId('workspace-panel-codex')
+    await expect(codexPanel).toBeVisible()
+
+    await page.getByTestId('codex-composer').fill('original codex prompt')
+    await page.getByTestId('codex-send').click()
+    await expect(codexPanel).toContainText('Fake Codex received: original codex prompt')
+    await expect(codexPanel).toContainText('Fake Codex run #')
+    const firstRun = await codexPanel.locator('.msg.assistant').last().textContent()
+
+    await page.getByTestId('regenerate-response').click()
+    await expect.poll(async () => {
+      const text = await codexPanel.locator('.msg.assistant').last().textContent()
+      return text !== firstRun && text?.includes('Fake Codex received: original codex prompt')
+    }).toBe(true)
+    await expect(codexPanel.locator('.msg.assistant')).toHaveCount(1)
+
+    await page.getByTestId('edit-message-btn').click()
+    await page.getByTestId('edit-message-textarea').fill('edited codex prompt')
+    await page.getByTestId('edit-message-save').click()
+    await expect(codexPanel).toContainText('Fake Codex received: edited codex prompt')
+    await expect(codexPanel).not.toContainText('Fake Codex received: original codex prompt')
+    await expect(codexPanel.locator('.msg.user')).toHaveCount(1)
+    await expect(codexPanel.locator('.msg.assistant')).toHaveCount(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
 })
 
 test('dark mode menus and topbar hover stay readable and calm', async ({}, testInfo) => {
@@ -786,9 +1256,10 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     // knowledge API path extraction uses, so this verifies Knowledge renders
     // extractor-sourced memory without a separate UI source.
     const extractedSmokeTitle = 'Extracted Smoke Memory'
+    const thinCandidateTitle = 'Thin Candidate'
     const extractedSmokeContent = 'Memory extracted during automated smoke verification. '.repeat(6) +
       'Full detail inspection text only appears after opening the knowledge item.'
-    await page.evaluate(async ({ title, content }) => {
+    await page.evaluate(async ({ title, content, thinTitle }) => {
       await (window as any).api.memory.save({
         projectId: null,
         type: 'decision',
@@ -797,11 +1268,21 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
         source: 'extractor',
         tags: ['extracted', 'smoke']
       })
-    }, { title: extractedSmokeTitle, content: extractedSmokeContent })
+      await (window as any).api.memory.save({
+        projectId: null,
+        type: 'note',
+        title: thinTitle,
+        content: 'Supercalifragilisticexpialidocious note',
+        source: 'chat',
+        tags: ['smoke']
+      })
+    }, { title: extractedSmokeTitle, content: extractedSmokeContent, thinTitle: thinCandidateTitle })
     await page.getByTestId('workspace-tool-knowledge').click()
     await expect(page.getByTestId('workspace-panel-knowledge')).toBeVisible()
     await expect(page.locator('.workspace-panel-head.panel-knowledge .workspace-panel-kind')).toContainText('Memory')
-    await expect(page.getByTestId('workspace-panel-knowledge').locator('.knowledge-panel-head .workspace-status-badge')).toContainText('1 item')
+    await expect(page.getByTestId('workspace-panel-knowledge').locator('.knowledge-panel-head .workspace-status-badge')).toContainText('2 items')
+    await expect(page.getByTestId('knowledge-diagnostics')).toContainText('Embedded')
+    await expect(page.getByTestId('knowledge-diagnostics')).toContainText('Review')
     await expect(page.getByText(extractedSmokeTitle)).toBeVisible()
     await page.getByPlaceholder(/Search memory/).fill('automated smoke verification')
     await page.getByTestId('workspace-panel-knowledge').getByRole('button', { name: 'Search' }).click()
@@ -812,8 +1293,18 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('knowledge-detail')).toContainText('extractor')
     await expect(page.getByTestId('knowledge-detail-content')).toContainText('Full detail inspection text only appears after opening the knowledge item.')
     await expect(page.getByTestId('knowledge-detail-copy')).toBeVisible()
+    await expect(page.getByTestId('knowledge-detail')).toContainText('Uses')
+    await page.getByTestId('knowledge-detail-stale').click()
+    await expect(page.getByTestId('knowledge-detail')).toContainText('Stale since')
     await page.getByTestId('knowledge-detail-close').click()
     await expect(page.getByTestId('knowledge-detail')).toHaveCount(0)
+    await page.getByTestId('knowledge-review-low-quality').click()
+    await expect(page.getByText(thinCandidateTitle)).toBeVisible()
+    await page.evaluate(() => { window.confirm = () => true })
+    await page.getByTestId('knowledge-item').filter({ hasText: thinCandidateTitle }).click()
+    await expect(page.getByTestId('knowledge-quality-note')).toContainText('thin-content')
+    await page.getByTestId('knowledge-detail-delete').click()
+    await expect(page.getByText(thinCandidateTitle)).toHaveCount(0)
     await page.getByTestId('workspace-panel-close-knowledge').click()
     await expect(page.getByTestId('workspace-panel-knowledge')).not.toBeVisible()
 
@@ -1488,6 +1979,9 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     expect(reportText).toContain('App:')
     expect(reportText).toContain('Runtime:')
     expect(reportText).toContain('Database:')
+    expect(reportText).toContain('Knowledge:')
+    expect(reportText).toContain('Knowledge by type:')
+    expect(reportText).toContain('Last consolidation:')
 
     // Secrets must not appear in plain text in the diagnostics report
     expect(reportText).not.toMatch(/Bearer\s+\S{10,}/)
@@ -1681,6 +2175,7 @@ test('setup wizard runs on first launch and stays dismissed after completion', a
     await expect(restarted.getByTestId('settings-show-setup-wizard')).toHaveAttribute('aria-checked', 'false')
     await restarted.getByTestId('settings-show-setup-wizard').click()
     await expect(restarted.getByTestId('settings-show-setup-wizard')).toHaveAttribute('aria-checked', 'true')
+    await expect.poll(() => restarted.evaluate(() => (window as any).api.setup.isComplete())).toBe(false)
     await restarted.waitForTimeout(700)
     await electronApp.close()
 

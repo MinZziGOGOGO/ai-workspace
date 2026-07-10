@@ -5,7 +5,7 @@ import { initDb, flushDb } from './db'
 import { stopAllWatchers } from './indexer'
 import { consolidateIfOverdue } from './extractor'
 import { initWebCompanionFromConfig, stopWebCompanion } from './webCompanion'
-import { readMcpServers, writeMcpServers } from './mcp'
+import { readMcpServers, writeMcpServers, knowledgeMcpLaunchConfig } from './mcp'
 
 // E2E smoke tests run the real Electron app against an isolated throwaway DB.
 // This keeps automated UI verification from mutating the user's normal workspace.
@@ -60,11 +60,9 @@ async function ensureKnowledgeMcp(): Promise<void> {
     }
     const serverCjsPath = join(app.getAppPath(), 'out', 'mcp', 'server.cjs')
     const dbDir = app.getPath('userData')
-    servers['ai-workspace-knowledge'] = {
-      command: 'node',
-      args: [serverCjsPath],
-      env: { AIWORKSPACE_DB_DIR: dbDir }
-    }
+    // Launch via the app's Electron binary in run-as-node mode so the server
+    // loads the Electron-ABI better-sqlite3 build (see knowledgeMcpLaunchConfig).
+    servers['ai-workspace-knowledge'] = knowledgeMcpLaunchConfig(serverCjsPath, dbDir)
     writeMcpServers(servers)
     console.log('[MCP] Added ai-workspace-knowledge to Claude Desktop config')
   } catch (err) {
@@ -123,18 +121,15 @@ app.on('window-all-closed', () => {
   process.platform !== 'darwin' && app.quit()
 })
 
-// Flush the debounced sql.js persist before teardown starts, so the last
-// write batch is never lost to the 500ms persist window.
-app.on('before-quit', () => {
-  flushDb()
-})
-
-// Stop watchers and kill PTYs cleanly before the app exits.
+// Stop watchers and kill PTYs cleanly before the app exits. In WAL mode every
+// write is already durable on disk the moment it returns — there is no
+// debounced buffer to lose — so the old before-quit flush is gone. The single
+// flushDb() here just checkpoints the WAL back into workspace.db to leave a
+// tidy file behind.
 app.on('will-quit', () => {
   stopAllWatchers()
   killAllPtys()
   void stopWebCompanion()
-  // Final flush: teardown above may have triggered one last debounced write.
   flushDb()
 })
 

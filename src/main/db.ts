@@ -1,6 +1,6 @@
-import initSqlJs, { Database as SqlJsDb } from 'sql.js'
+import Database from 'better-sqlite3'
 import { join } from 'path'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { existsSync, renameSync } from 'fs'
 
 // One SQLite file holds everything: projects, sessions, vector memory,
 // and the knowledge graph (nodes/edges). Local-first, zero servers.
@@ -8,76 +8,65 @@ import { readFileSync, writeFileSync, existsSync } from 'fs'
 // swap in sqlite-vec later if scale ever demands it (it won't for a while).
 //
 // This module must run in two hosts: the Electron main process AND the
-// standalone stdio MCP server (Milestone 2). So it takes the userData
-// directory as a parameter instead of importing electron's `app`, and logs
-// only to stderr — an stdio MCP server reserves stdout for the JSON-RPC
-// protocol, and a stray console.log there corrupts the message stream.
+// standalone MCP server (Milestone 2). So it takes the userData directory as a
+// parameter instead of importing electron's `app`, and logs only to stderr —
+// an stdio MCP server reserves stdout for the JSON-RPC protocol, and a stray
+// console.log there corrupts the message stream.
+//
+// Storage engine: better-sqlite3 (native, synchronous) in WAL mode. Unlike the
+// previous sql.js backend — which loaded the whole DB into memory and rewrote
+// the entire file on every debounced write batch — writes here go straight to
+// disk and are durable the moment the call returns. WAL also gives us real
+// single-writer/multi-reader concurrency, which is what lets the Electron app
+// and the standalone MCP server safely share one workspace.db (both hosts run
+// on the same Electron/Node ABI; see ensureKnowledgeMcp in index.ts).
 
-// Where workspace.db lives. Set by initDb(); used by persist().
+// Where workspace.db lives. Set by initDb(); read by getDbPath().
 let dbPath = ''
 
-interface PreparedStatement {
-  run(...params: any[]): void
-  all(...params: any[]): any[]
-  get(...params: any[]): any | undefined
+// Bind values better-sqlite3 accepts. (Bind params stay loosely typed at the
+// call sites — many are `string | null` etc. — so the wrapper keeps `any[]`
+// there; the win from real typing is on the RESULT side, below.)
+export interface PreparedStatement<Row = any> {
+  run(...params: any[]): Database.RunResult
+  all(...params: any[]): Row[]
+  get(...params: any[]): Row | undefined
 }
 
 class DbWrapper {
-  private persistTimeout: ReturnType<typeof setTimeout> | null = null
+  constructor(private sqlDb: Database.Database) {}
 
-  constructor(private sqlDb: SqlJsDb) {}
-
-  prepare(sql: string): PreparedStatement {
+  prepare<Row = any>(sql: string): PreparedStatement<Row> {
+    // better-sqlite3 compiles and caches prepared statements internally, so
+    // re-preparing the same SQL string is cheap. We prepare per-call to keep
+    // the exact same call shape the rest of the codebase already uses.
     const sqlDb = this.sqlDb
     return {
-      run: (...params: any[]) => {
-        const stmt = sqlDb.prepare(sql)
-        stmt.bind(params)
-        stmt.step()
-        stmt.free()
-        this.persist()
-      },
-      all: (...params: any[]) => {
-        const stmt = sqlDb.prepare(sql)
-        stmt.bind(params)
-        const results: any[] = []
-        while (stmt.step()) {
-          results.push(stmt.getAsObject())
-        }
-        stmt.free()
-        return results
-      },
-      get: (...params: any[]) => {
-        const stmt = sqlDb.prepare(sql)
-        stmt.bind(params)
-        const result = stmt.step() ? stmt.getAsObject() : undefined
-        stmt.free()
-        return result
-      }
+      run: (...params: any[]) => sqlDb.prepare(sql).run(...params),
+      all: (...params: any[]) => sqlDb.prepare(sql).all(...params) as Row[],
+      get: (...params: any[]) => sqlDb.prepare(sql).get(...params) as Row | undefined
     }
   }
 
   exec(sql: string): void {
-    this.sqlDb.run(sql)
-    this.persist()
+    this.sqlDb.exec(sql)
   }
 
-  private persist(): void {
-    if (this.persistTimeout) clearTimeout(this.persistTimeout)
-    this.persistTimeout = setTimeout(() => {
-      this.persistTimeout = null
-      const data = this.sqlDb.export()
-      writeFileSync(dbPath, Buffer.from(data))
-    }, 500)
-  }
-
+  /**
+   * Checkpoint the WAL into the main database file. Writes are already durable
+   * in WAL mode, so this is not required for correctness — it just folds the
+   * -wal sidecar back into workspace.db (called on quit to leave a tidy file).
+   */
   flushSync(): void {
-    if (this.persistTimeout) {
-      clearTimeout(this.persistTimeout)
-      this.persistTimeout = null
+    try {
+      this.sqlDb.pragma('wal_checkpoint(TRUNCATE)')
+    } catch {
+      // Best-effort: another connection may hold the checkpoint lock. Harmless.
     }
-    const data = this.sqlDb.export()
-    writeFileSync(dbPath, Buffer.from(data))
+  }
+
+  close(): void {
+    this.sqlDb.close()
   }
 }
 
@@ -90,28 +79,27 @@ let db: DbWrapper
  */
 export async function initDb(userDataDir: string): Promise<void> {
   try {
-    console.error('[DB] Loading sql.js WASM module...')
-    const SQL = await initSqlJs()
-    console.error('[DB] sql.js loaded successfully')
-
     dbPath = join(userDataDir, 'workspace.db')
     console.error('[DB] Database path:', dbPath)
 
-    let sqlDb: SqlJsDb
-    if (existsSync(dbPath)) {
-      console.error('[DB] Loading existing database from disk...')
-      const buffer = readFileSync(dbPath)
-      console.error('[DB] Read', buffer.length, 'bytes from disk')
-      sqlDb = new SQL.Database(new Uint8Array(buffer))
-      console.error('[DB] Database loaded from file')
-    } else {
-      console.error('[DB] Creating new database...')
-      sqlDb = new SQL.Database()
-      console.error('[DB] New database created')
-    }
+    const sqlDb = openOrRecover(dbPath)
+
+    // WAL: single-writer/multi-reader concurrency + no whole-file rewrites.
+    // synchronous=NORMAL is the recommended companion to WAL (durable across
+    // app crashes; only a power loss can lose the last transaction). A busy
+    // timeout lets the app and the MCP server wait briefly for each other's
+    // write lock instead of failing immediately with SQLITE_BUSY.
+    sqlDb.pragma('journal_mode = WAL')
+    sqlDb.pragma('synchronous = NORMAL')
+    sqlDb.pragma('busy_timeout = 5000')
+
+    // NOTE: foreign_keys is intentionally left OFF (better-sqlite3's default),
+    // matching the previous sql.js behavior. The schema declares REFERENCES
+    // for documentation, but enforcement was never on; turning it on now could
+    // reject existing rows or valid insert orders.
 
     db = new DbWrapper(sqlDb)
-    console.error('[DB] DbWrapper created')
+    console.error('[DB] DbWrapper created (better-sqlite3, WAL)')
 
     console.error('[DB] Running migrations...')
     migrate(db)
@@ -119,6 +107,34 @@ export async function initDb(userDataDir: string): Promise<void> {
   } catch (err) {
     console.error('[DB] Initialization failed:', err)
     throw err
+  }
+}
+
+// Open the existing workspace.db, or create a fresh one. better-sqlite3 reads
+// any standard SQLite file — including one written by sql.js — so the common
+// case is a clean open. If the file exists but is unreadable (corruption or a
+// non-SQLite blob), we don't want to hard-fail startup: back the bad file up to
+// workspace.db.sqljs-backup and start fresh, so the app still launches.
+function openOrRecover(path: string): Database.Database {
+  if (!existsSync(path)) {
+    console.error('[DB] No existing database; creating new file')
+    return new Database(path)
+  }
+  try {
+    const handle = new Database(path)
+    // Touch the schema catalog to force SQLite to actually parse the header
+    // and page structure — a lazy open alone won't surface corruption.
+    handle.prepare('SELECT count(*) FROM sqlite_master').get()
+    console.error('[DB] Opened existing database')
+    return handle
+  } catch (err) {
+    const backup = path + '.sqljs-backup'
+    console.error(
+      `[DB] Existing database could not be opened (${(err as Error).message}). ` +
+        `Backing it up to ${backup} and starting with a fresh database.`
+    )
+    renameSync(path, backup)
+    return new Database(path)
   }
 }
 
@@ -131,6 +147,12 @@ export function getDbPath(): string {
   return dbPath
 }
 
+/**
+ * Flush pending writes to the main DB file. With better-sqlite3 in WAL mode,
+ * every write is already durable on disk the moment it returns — there is no
+ * debounced in-memory buffer to lose. This now just checkpoints the WAL on
+ * quit, and is kept exported so callers (index.ts) need no changes.
+ */
 export function flushDb(): void {
   if (db) db.flushSync()
 }
@@ -290,5 +312,24 @@ function migrate(db: DbWrapper): void {
   )
   if (!messageCols.has('reaction')) {
     db.exec("ALTER TABLE messages ADD COLUMN reaction TEXT")
+  }
+
+  const memoryCols = new Set(
+    (db.prepare('PRAGMA table_info(memory_items)').all() as { name: string }[]).map((c) => c.name)
+  )
+  if (!memoryCols.has('last_accessed_at')) {
+    db.exec('ALTER TABLE memory_items ADD COLUMN last_accessed_at INTEGER')
+  }
+  if (!memoryCols.has('access_count')) {
+    db.exec('ALTER TABLE memory_items ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!memoryCols.has('stale_at')) {
+    db.exec('ALTER TABLE memory_items ADD COLUMN stale_at INTEGER')
+  }
+  if (!memoryCols.has('quality_flags')) {
+    db.exec("ALTER TABLE memory_items ADD COLUMN quality_flags TEXT NOT NULL DEFAULT '[]'")
+  }
+  if (!memoryCols.has('quality_reason')) {
+    db.exec('ALTER TABLE memory_items ADD COLUMN quality_reason TEXT')
   }
 }

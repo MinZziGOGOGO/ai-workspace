@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from 'child_process'
 import { existsSync, readdirSync } from 'fs'
 import { extname, join } from 'path'
+import { isE2EFakeEnabled } from './e2e'
 
 // Codex panel — drives the Codex CLI headless under the user's *ChatGPT*
 // subscription login (never API billing). Mirrors the Claude Code launcher
@@ -57,16 +58,17 @@ const CODEX_TRUST_ERROR =
   'Codex refused to run because this folder is not trusted or is not a Git repository.'
 const CODEX_AUTH_ERROR =
   'Codex CLI is installed but not logged in. Open a terminal and run `codex login`, then sign in with your ChatGPT subscription.'
+let fakeCodexRunCounter = 0
 
 // ---- E2E fakes -------------------------------------------------------------
 function isFakeCodex() {
-  return process.env.E2E_FAKE_CODEX === '1'
+  return isE2EFakeEnabled('E2E_FAKE_CODEX')
 }
 function isMissingCodexFake() {
-  return process.env.E2E_MISSING_CODEX === '1'
+  return isE2EFakeEnabled('E2E_MISSING_CODEX')
 }
 function isTrustErrorFake() {
-  return process.env.E2E_CODEX_TRUST_ERROR === '1'
+  return isE2EFakeEnabled('E2E_CODEX_TRUST_ERROR')
 }
 
 function isAuthError(text: string) {
@@ -247,7 +249,8 @@ export function runCodex(opts: {
     }
     const activity: CodexActivityEntry[] = [{ name: 'codex', summary: `sandbox: ${sandbox}`, ok: true }]
     opts.onEvent({ kind: 'tool', name: 'codex', summary: `sandbox: ${sandbox}` })
-    const text = `Fake Codex received: ${opts.prompt}\nsandbox=${sandbox} skipGitRepoCheck=${opts.skipGitRepoCheck === true}`
+    fakeCodexRunCounter += 1
+    const text = `Fake Codex received: ${opts.prompt}\nFake Codex run #${fakeCodexRunCounter}\nsandbox=${sandbox} skipGitRepoCheck=${opts.skipGitRepoCheck === true}`
     opts.onEvent({ kind: 'text', text })
     return Promise.resolve({ ok: true, result: text, activity })
   }

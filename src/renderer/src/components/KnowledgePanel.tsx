@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Project, MemoryItem } from '../types'
+import type { Project, MemoryItem, KnowledgeDiagnostics } from '../types'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceEmptyState } from './WorkspacePrimitives'
 import { useToast } from './ToastContext'
@@ -48,10 +48,15 @@ export default function KnowledgePanel(props: {
 }) {
   const [items, setItems] = useState<MemoryItem[]>([])
   const [selectedItem, setSelectedItem] = useState<MemoryItem | null>(null)
+  const [diagnostics, setDiagnostics] = useState<KnowledgeDiagnostics | null>(null)
   const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [query, setQuery] = useState('')
   const [scope, setScope] = useState<Scope>('project')
+  const [searching, setSearching] = useState(false)
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [staleUpdatingId, setStaleUpdatingId] = useState<string | null>(null)
   const [linkedProjects, setLinkedProjects] = useState<Project[]>([])
   const [showLinkModal, setShowLinkModal] = useState(false)
   const [availableProjects, setAvailableProjects] = useState<Project[]>([])
@@ -67,13 +72,33 @@ export default function KnowledgePanel(props: {
 
   // The unfiltered list only distinguishes project vs everything; the finer
   // "related" scope matters when searching (it widens the candidate set).
-  const refresh = (s: Scope = scope) =>
-    window.api.memory.list(s === 'global' ? null : scopedProjectId).then(setItems)
+  async function refreshDiagnostics(s: Scope = scope) {
+    setDiagnosticsLoading(true)
+    try {
+      setDiagnostics(await window.api.memory.diagnostics(s === 'global' ? null : scopedProjectId))
+    } catch (err) {
+      addToast(`Failed to refresh diagnostics: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setDiagnosticsLoading(false)
+    }
+  }
+
+  async function refresh(s: Scope = scope) {
+    try {
+      const [nextItems] = await Promise.all([
+        window.api.memory.list(s === 'global' ? null : scopedProjectId),
+        refreshDiagnostics(s)
+      ])
+      setItems(nextItems)
+    } catch (err) {
+      addToast(`Failed to refresh Knowledge: ${err instanceof Error ? err.message : 'unknown error'}`)
+    }
+  }
 
   useEffect(() => {
     setScope('project')
     setSelectedItem(null)
-    window.api.memory.list(scopedProjectId).then(setItems)
+    void refresh('project')
   }, [props.project.id, scopedProjectId])
 
   // Linked projects only exist for folder-backed projects, not the sentinel.
@@ -115,8 +140,19 @@ export default function KnowledgePanel(props: {
   }, [query, scope, scopedProjectId])
 
   async function search(s: Scope = scope) {
-    if (!query.trim()) return refresh(s)
-    setItems(await window.api.memory.search(query, s, scopedProjectId))
+    setSearching(true)
+    try {
+      if (!query.trim()) {
+        await refresh(s)
+        return
+      }
+      setItems(await window.api.memory.search(query, s, scopedProjectId))
+      await refreshDiagnostics(s)
+    } catch (err) {
+      addToast(`Knowledge search failed: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setSearching(false)
+    }
   }
 
   function changeScope(s: Scope) {
@@ -142,6 +178,99 @@ export default function KnowledgePanel(props: {
     await window.api.memory.delete(item.id)
     if (selectedItem?.id === item.id) setSelectedItem(null)
     refresh()
+  }
+
+  async function inspectItem(item: MemoryItem) {
+    const alreadyOpen = selectedItem?.id === item.id
+    setSelectedItem(item)
+    if (alreadyOpen) return
+    try {
+      await window.api.memory.touch(item.id)
+      setItems((prev) => prev.map((m) => m.id === item.id ? {
+        ...m,
+        last_accessed_at: Date.now(),
+        access_count: (m.access_count ?? 0) + 1
+      } : m))
+      setSelectedItem((prev) => prev?.id === item.id ? {
+        ...prev,
+        last_accessed_at: Date.now(),
+        access_count: (prev.access_count ?? 0) + 1
+      } : prev)
+      await refreshDiagnostics()
+    } catch {
+      // Telemetry should never block inspection.
+    }
+  }
+
+  async function deleteItem(item: MemoryItem) {
+    const ok = window.confirm(`Delete "${item.title}" from Knowledge? This cannot be undone.`)
+    if (!ok) return
+    setDeletingId(item.id)
+    try {
+      await window.api.memory.delete(item.id)
+      const row = itemRefs.current[item.id]
+      if (row) await collapseElement(row)
+      if (selectedItem?.id === item.id) setSelectedItem(null)
+      await refresh()
+      addToast('Memory deleted')
+    } catch (err) {
+      addToast(`Failed to delete memory: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  async function toggleStale(item: MemoryItem) {
+    const stale = !item.stale_at
+    setStaleUpdatingId(item.id)
+    try {
+      await window.api.memory.markStale(item.id, stale)
+      const patch = { stale_at: stale ? Date.now() : null }
+      setItems((prev) => prev.map((m) => m.id === item.id ? { ...m, ...patch } : m))
+      setSelectedItem((prev) => prev?.id === item.id ? { ...prev, ...patch } : prev)
+      await refreshDiagnostics()
+      addToast(stale ? 'Marked stale' : 'Stale mark removed')
+    } catch (err) {
+      addToast(`Failed to update stale state: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setStaleUpdatingId(null)
+    }
+  }
+
+  async function reviewLowQualityCandidates() {
+    setDiagnosticsLoading(true)
+    try {
+      const diag = diagnostics ?? await window.api.memory.diagnostics(scope === 'global' ? null : scopedProjectId)
+      setDiagnostics(diag)
+      setQuery('')
+      setSelectedItem(null)
+      setItems(diag.lowQualityCandidates)
+    } catch (err) {
+      addToast(`Failed to review candidates: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setDiagnosticsLoading(false)
+    }
+  }
+
+  async function deleteLowQualityCandidates() {
+    const count = diagnostics?.lowQualityCount ?? 0
+    if (count === 0) return
+    const phrase = 'DELETE LOW QUALITY'
+    const typed = window.prompt(
+      `Type "${phrase}" to bulk-delete low-quality Knowledge candidates. Decisions and user-created notes are skipped. This cannot be undone.`
+    )
+    if (typed !== phrase) return
+    setDiagnosticsLoading(true)
+    try {
+      const removed = await window.api.memory.deleteLowQualityCandidates(scope === 'global' ? null : scopedProjectId)
+      setSelectedItem(null)
+      await refresh()
+      addToast(`Deleted ${removed} candidate${removed === 1 ? '' : 's'}`)
+    } catch (err) {
+      addToast(`Failed to delete candidates: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setDiagnosticsLoading(false)
+    }
   }
 
   async function openLinkModal() {
@@ -205,10 +334,10 @@ export default function KnowledgePanel(props: {
           placeholder="Search memory..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && search()}
+          onKeyDown={(e) => e.key === 'Enter' && !searching && search()}
         />
-        <button className="ghost tiny" onClick={() => search()} disabled={!query.trim()}>
-          Search
+        <button className="ghost tiny" onClick={() => search()} disabled={!query.trim() || searching}>
+          {searching ? 'Searching...' : 'Search'}
         </button>
         {query.trim() && (
           <button className="ghost tiny" onClick={() => { setQuery(''); void refresh() }}>
@@ -234,6 +363,31 @@ export default function KnowledgePanel(props: {
           </button>
         ))}
       </div>
+      <section className="knowledge-diagnostics" data-testid="knowledge-diagnostics" aria-label="Knowledge diagnostics">
+        <div className="knowledge-diag-grid">
+          <div><span>Total</span><strong>{diagnostics?.total ?? items.length}</strong></div>
+          <div><span>Embedded</span><strong>{diagnostics ? `${diagnostics.embeddingsPresent}/${diagnostics.total}` : '...'}</strong></div>
+          <div><span>Unused</span><strong>{diagnostics?.unusedCount ?? '...'}</strong></div>
+          <div><span>Stale</span><strong>{diagnostics?.staleCount ?? '...'}</strong></div>
+          <div><span>Recent hits</span><strong>{diagnostics?.recentlyAccessedCount ?? '...'}</strong></div>
+          <div><span>Review</span><strong>{diagnostics?.lowQualityCount ?? '...'}</strong></div>
+        </div>
+        <div className="knowledge-diag-actions">
+          <button className="ghost tiny" onClick={() => refreshDiagnostics()} disabled={diagnosticsLoading}>{diagnosticsLoading ? 'Refreshing...' : 'Refresh diagnostics'}</button>
+          <button className="ghost tiny" onClick={reviewLowQualityCandidates} disabled={!diagnostics?.lowQualityCount || diagnosticsLoading} data-testid="knowledge-review-low-quality">
+            Review candidates
+          </button>
+          <button className="ghost tiny settings-danger-link" onClick={deleteLowQualityCandidates} disabled={!diagnostics?.lowQualityCount || diagnosticsLoading} data-testid="knowledge-delete-low-quality">
+            Delete candidates
+          </button>
+        </div>
+        {diagnostics && (
+          <p className="muted small">
+            Types: {Object.entries(diagnostics.byType).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}.
+            {' '}Sources: {Object.entries(diagnostics.bySource).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}.
+          </p>
+        )}
+      </section>
       {items.length === 0 && (
         <WorkspaceEmptyState
           compact
@@ -274,12 +428,13 @@ export default function KnowledgePanel(props: {
                 className="memory-open"
                 data-testid="knowledge-item"
                 aria-label={`Inspect knowledge item: ${m.title}`}
-                onClick={() => setSelectedItem(m)}
+                onClick={() => void inspectItem(m)}
               >
                 <div className="memory-head">
                   <span className={`pill pill-${m.type}`}>{m.type}</span>
                   <span className="muted small">
                     {m.source}{m.score !== undefined ? ` - ${(m.score * 100).toFixed(0)}%` : ''}
+                    {m.stale_at ? ' - stale' : ''}
                   </span>
                 </div>
                 <div className="memory-title">{m.title}</div>
@@ -298,15 +453,10 @@ export default function KnowledgePanel(props: {
               className="ghost tiny memory-delete"
               title="Delete memory"
               aria-label={`Delete memory: ${m.title}`}
-              onClick={async () => {
-                await window.api.memory.delete(m.id)
-                const row = itemRefs.current[m.id]
-                if (row) await collapseElement(row)
-                if (selectedItem?.id === m.id) setSelectedItem(null)
-                refresh()
-              }}
+              disabled={deletingId === m.id}
+              onClick={() => void deleteItem(m)}
             >
-              ×
+              {deletingId === m.id ? '...' : '×'}
             </button>
           </li>
         ))}
@@ -338,9 +488,18 @@ export default function KnowledgePanel(props: {
           <div className="knowledge-detail-meta" aria-label="Knowledge item metadata">
             <div><span>Created</span>{formatDate(selectedItem.created_at)}</div>
             <div><span>Updated</span>{formatDate(selectedItem.updated_at)}</div>
+            <div><span>Last used</span>{formatDate(selectedItem.last_accessed_at)}</div>
+            <div><span>Uses</span>{selectedItem.access_count ?? 0}</div>
+            <div><span>Status</span>{selectedItem.stale_at ? `Stale since ${formatDate(selectedItem.stale_at)}` : 'Active'}</div>
             <div><span>Tags</span>{selectedTags}</div>
             <div><span>ID</span>{selectedItem.id}</div>
           </div>
+          {(selectedItem.quality_reason || selectedItem.quality_flags?.length) && (
+            <div className="knowledge-quality-note" data-testid="knowledge-quality-note">
+              {selectedItem.quality_reason ?? 'Review suggested'}
+              {selectedItem.quality_flags?.length ? ` (${selectedItem.quality_flags.join(', ')})` : ''}
+            </div>
+          )}
           <div className="knowledge-detail-content" data-testid="knowledge-detail-content">
             {selectedItem.content?.trim() ? selectedItem.content : 'No content is stored for this knowledge item.'}
           </div>
@@ -353,6 +512,24 @@ export default function KnowledgePanel(props: {
               disabled={!selectedItem.content?.trim()}
             >
               {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
+            </button>
+            <button
+              type="button"
+              className="ghost tiny"
+              data-testid="knowledge-detail-stale"
+              disabled={staleUpdatingId === selectedItem.id}
+              onClick={() => void toggleStale(selectedItem)}
+            >
+              {staleUpdatingId === selectedItem.id ? 'Updating...' : selectedItem.stale_at ? 'Mark active' : 'Mark stale'}
+            </button>
+            <button
+              type="button"
+              className="ghost tiny settings-danger-link"
+              data-testid="knowledge-detail-delete"
+              disabled={deletingId === selectedItem.id}
+              onClick={() => void deleteItem(selectedItem)}
+            >
+              {deletingId === selectedItem.id ? 'Deleting...' : 'Delete'}
             </button>
           </div>
         </section>

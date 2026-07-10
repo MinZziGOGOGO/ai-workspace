@@ -1,6 +1,6 @@
 import { getDb } from './db'
 import { chat, defaultChatModel, embed, type ChatMessage } from './ollama'
-import { saveMemory, deleteMemory, type MemoryItem } from './knowledge'
+import { saveMemory, deleteMemory, MemoryQualityError, type MemoryItem } from './knowledge'
 
 // Milestone 4 — memory extraction agent.
 //
@@ -90,7 +90,16 @@ export async function extractFromSession(projectId: string | null, sessionId: st
     // the dedup comparison is in the identical vector space.
     const vec = await embed(`${title}\n${content}`)
     if (vec && seenVecs.some((v) => cosine(vec, v) >= EXTRACT_DEDUP_COSINE)) continue
-    const item = await saveMemory({ projectId, type, title, content, source: 'extractor', tags: ['extracted'] })
+    let item: MemoryItem
+    try {
+      item = await saveMemory({ projectId, type, title, content, source: 'extractor', tags: ['extracted'] })
+    } catch (err) {
+      if (err instanceof MemoryQualityError) {
+        console.error(`[extractor] skipped low-value memory candidate: ${err.reason}`)
+        continue
+      }
+      throw err
+    }
     seenText.add(norm(content))
     if (vec) seenVecs.push(vec)
     saved.push(item)

@@ -413,8 +413,20 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
     }
     const name = form.name.trim()
     try {
-      if (form.originalName && form.originalName !== name) await window.api.mcp.remove(form.originalName)
-      await window.api.mcp.add(name, configFromForm(form))
+      if (form.originalName && form.originalName !== name) {
+        const removeResult = await window.api.mcp.remove(form.originalName)
+        if (!removeResult.success) {
+          setForm({ ...form, error: `Failed to rename server: ${removeResult.error ?? 'unknown error'}` })
+          addToast(`Failed to save ${name}`)
+          return
+        }
+      }
+      const addResult = await window.api.mcp.add(name, configFromForm(form))
+      if (!addResult.success) {
+        setForm({ ...form, error: `Failed to save server: ${addResult.error ?? 'unknown error'}` })
+        addToast(`Failed to save ${name}`)
+        return
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       setForm({ ...form, error: `Failed to save server: ${message}` })
@@ -433,15 +445,20 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
     // instead of inserting a placeholder into the live config.
     if (item.builtin) {
       try {
-        const serverPath = await window.api.mcp.getKnowledgeServerPath()
-        config = { command: 'node', args: [serverPath] }
+        // Full launch config from main: Electron-as-Node so the server loads
+        // the matching-ABI better-sqlite3 (not a bare `node`).
+        config = await window.api.mcp.getKnowledgeServerConfig()
       } catch {
-        addToast('Could not resolve the knowledge server path')
+        addToast('Could not resolve the knowledge server config')
         return
       }
     }
     try {
-      await window.api.mcp.add(safeName, config)
+      const result = await window.api.mcp.add(safeName, config)
+      if (!result.success) {
+        addToast(`Failed to add ${item.name}: ${result.error ?? 'unknown error'}`)
+        return
+      }
     } catch (err) {
       addToast(`Failed to add ${item.name}: ${err instanceof Error ? err.message : String(err)}`)
       return
@@ -459,7 +476,11 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
   }
 
   async function toggleEnabled(server: McpServer, enabled: boolean) {
-    await window.api.mcp.setEnabled(server.name, enabled)
+    const result = await window.api.mcp.setEnabled(server.name, enabled)
+    if (!result.success) {
+      addToast(`Failed to ${enabled ? 'enable' : 'disable'} ${server.name}: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setServers((prev) => prev.map((s) => s.name === server.name ? { ...s, enabled } : s))
   }
 
@@ -471,7 +492,11 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
       deleteTimer.current = setTimeout(() => setPendingDelete(null), 3000)
       return
     }
-    await window.api.mcp.remove(name)
+    const result = await window.api.mcp.remove(name)
+    if (!result.success) {
+      addToast(`Failed to remove ${name}: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setPendingDelete(null)
     setExpanded((cur) => cur === name ? null : cur)
     await loadServers(false)

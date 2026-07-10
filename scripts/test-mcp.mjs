@@ -3,6 +3,11 @@
 // tool and prints the results. Usage: node scripts/test-mcp.mjs <projectId>
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+// In a plain-node context the electron module's default export is the path to
+// the Electron binary. The server loads the Electron-ABI better-sqlite3, so we
+// launch it through Electron in run-as-node mode (ELECTRON_RUN_AS_NODE=1) — the
+// same way the app registers it.
+import electronPath from 'electron'
 
 const projectId = process.argv[2]
 if (!projectId) {
@@ -11,9 +16,9 @@ if (!projectId) {
 }
 
 const transport = new StdioClientTransport({
-  command: 'node',
+  command: electronPath,
   args: ['out/mcp/server.cjs'],
-  env: { ...process.env }
+  env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
 })
 const client = new Client({ name: 'mcp-smoke-test', version: '1.0.0' }, { capabilities: {} })
 

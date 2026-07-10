@@ -32,7 +32,8 @@ const tools: Tool[] = [
     description:
       'Semantic + keyword search over the shared project knowledge base. Returns memory items ' +
       '(decisions, research, preferences, notes, files, tasks) ranked by relevance. Use this before ' +
-      'answering or acting, to ground yourself in what the workspace already knows.',
+      'answering or acting, to ground yourself in what the workspace already knows. Search is read-only: ' +
+      'returned scores are transient ranking metadata and do not increment access/use counters.',
     inputSchema: {
       type: 'object',
       properties: {

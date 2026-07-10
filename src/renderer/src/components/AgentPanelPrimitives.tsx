@@ -16,8 +16,14 @@ export function useAutoSessionSummary(
   model: string | undefined,
   onSummary: (sessionId: string, summary: string) => void
 ): void {
-  const latestRef = useRef({ session, messages, model })
-  latestRef.current = { session, messages, model }
+  // Per-session snapshot: updated on every render so the cleanup for a leaving
+  // session can find its own latest messages rather than the new session's.
+  // When the session changes, we SET the new session's (empty) entry but the
+  // old session's entry remains with its last known messages — the cleanup
+  // captures the old session.id and looks up by that key.
+  const sessionSnapshotRef = useRef<Map<string, { messages: Message[]; model: string | undefined }>>(new Map())
+  if (session) sessionSnapshotRef.current.set(session.id, { messages, model })
+
   const triggeredRef = useRef<Map<string, number>>(new Map())
   const onSummaryRef = useRef(onSummary)
   onSummaryRef.current = onSummary
@@ -41,9 +47,12 @@ export function useAutoSessionSummary(
   }, [messages, session, model, generate])
 
   useEffect(() => {
+    if (!session) return
+    const sessionId = session.id
     return () => {
-      const { session: s, messages: m, model: mo } = latestRef.current
-      if (s && exchangeCount(m) > 0) void generate(s.id, mo)
+      const snap = sessionSnapshotRef.current.get(sessionId)
+      if (snap && exchangeCount(snap.messages) > 0) void generate(sessionId, snap.model)
+      sessionSnapshotRef.current.delete(sessionId)
     }
   }, [session?.id, generate])
 }
@@ -130,6 +139,7 @@ export function SessionContextMenu({
   onRename,
   onToggleArchive,
   onDelete,
+  onClose,
 }: {
   x: number
   y: number
@@ -140,11 +150,24 @@ export function SessionContextMenu({
   onRename: () => void
   onToggleArchive?: () => void
   onDelete: () => void
+  onClose?: () => void
 }) {
   const [pendingDelete, setPendingDelete] = useState(false)
   const deleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => () => { if (deleteTimer.current) clearTimeout(deleteTimer.current) }, [])
+
+  useEffect(() => {
+    menuRef.current?.querySelector('button')?.focus()
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      onClose?.()
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
 
   function handleDeleteClick() {
     if (confirmDestructive && !pendingDelete) {
@@ -158,15 +181,17 @@ export function SessionContextMenu({
   }
 
   return createPortal(
-    <div className="session-context-menu" style={{ top: y, left: x }} onPointerDown={e => e.stopPropagation()}>
-      <button className="session-context-item" onClick={onTogglePin}>{pinned ? 'Unpin' : 'Pin'}</button>
-      <button className="session-context-item" onClick={onRename}>Rename</button>
+    <div ref={menuRef} className="session-context-menu" style={{ top: y, left: x }} role="menu" onPointerDown={e => e.stopPropagation()}>
+      <button className="session-context-item" role="menuitem" data-testid="session-menu-pin" onClick={onTogglePin}>{pinned ? 'Unpin' : 'Pin'}</button>
+      <button className="session-context-item" role="menuitem" data-testid="session-menu-rename" onClick={onRename}>Rename</button>
       {onToggleArchive && (
-        <button className="session-context-item" onClick={onToggleArchive}>{archived ? 'Unarchive' : 'Archive'}</button>
+        <button className="session-context-item" role="menuitem" data-testid="session-menu-archive" onClick={onToggleArchive}>{archived ? 'Unarchive' : 'Archive'}</button>
       )}
       <div className="session-context-divider" />
       <button
         className={`session-context-item danger session-menu-delete${pendingDelete ? ' pending-confirm' : ''}`}
+        role="menuitem"
+        data-testid="session-menu-delete"
         onClick={handleDeleteClick}
       >
         {pendingDelete ? 'Click again to confirm' : 'Delete'}
@@ -286,12 +311,14 @@ export function AgentSessionRail({
         )}
         <button
           className={`session-item${isActive ? ' active' : ''}`}
+          data-testid="session-item"
           onPointerDown={(e) => pressElement(e, sessionMotionRef.current)}
           onClick={() => { if (selectMode) { toggleSelected(s.id); return } if (!isRenaming) onSelect(s) }}
         >
           {isRenaming ? (
             <input
               className="session-rename-input"
+              data-testid="session-rename-input"
               value={renaming.value}
               onChange={e => onRenameChange(e.target.value)}
               onKeyDown={e => {
@@ -315,6 +342,7 @@ export function AgentSessionRail({
         {!selectMode && (
           <button
             className="session-dot-menu"
+            data-testid="session-options"
             title="Session options"
             aria-label={`Options for ${s.title || newLabel}`}
             onClick={e => onOptions(e, s)}

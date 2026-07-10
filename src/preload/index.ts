@@ -1,7 +1,41 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
+import type {
+  ActivityEntry,
+  ChatDoneEvent,
+  ChatErrorEvent,
+  ChatTokenEvent,
+  ChatUsageEvent,
+  CheckpointEvent,
+  ClaudeCodeDoneEvent,
+  ClaudeCodeIpcEvent,
+  ClaudeCodeSendRequest,
+  CodexDoneEvent,
+  CodexIpcEvent,
+  CodexSandboxMode,
+  CodexSendRequest,
+  HermesActionKind,
+  HermesDoneEvent,
+  HermesIpcEvent,
+  HermesRespondPermissionRequest,
+  HermesSendRequest,
+  HermesUsageEvent,
+  IndexUpdatedEvent,
+  IpcApi,
+  MemorySavedEvent,
+  ResearchProgress,
+  ResearchStartRequest,
+  TerminalDataEvent,
+  TerminalExitEvent,
+} from '../shared/ipcTypes'
+
+function onPayload<T>(channel: string, cb: (payload: T) => void): () => void {
+  const fn = (_: IpcRendererEvent, payload: T) => cb(payload)
+  ipcRenderer.on(channel, fn)
+  return () => ipcRenderer.removeListener(channel, fn)
+}
 
 // Typed bridge: the renderer never touches Node APIs directly.
-contextBridge.exposeInMainWorld('api', {
+const api: IpcApi = {
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
     global: () => ipcRenderer.invoke('projects:global'),
@@ -59,121 +93,50 @@ contextBridge.exposeInMainWorld('api', {
       ipcRenderer.invoke('chat:classifyHandoff', opts),
     generateHandoffPrompt: (opts: { model: string; agent: 'claudecode' | 'hermes' | 'codex'; conversationHistory: string }) =>
       ipcRenderer.invoke('chat:generateHandoffPrompt', opts),
-    onToken: (cb: (d: { sessionId: string; token: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('chat:token', fn)
-      return () => ipcRenderer.removeListener('chat:token', fn)
-    },
-    onDone: (cb: (d: { sessionId: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('chat:done', fn)
-      return () => ipcRenderer.removeListener('chat:done', fn)
-    },
-    onError: (cb: (d: { sessionId: string; error: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('chat:error', fn)
-      return () => ipcRenderer.removeListener('chat:error', fn)
-    },
-    onUsage: (cb: (d: { sessionId: string; used: number; max: number | null }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('chat:usage', fn)
-      return () => ipcRenderer.removeListener('chat:usage', fn)
-    }
+    onToken: (cb: (d: ChatTokenEvent) => void) => onPayload('chat:token', cb),
+    onDone: (cb: (d: ChatDoneEvent) => void) => onPayload('chat:done', cb),
+    onError: (cb: (d: ChatErrorEvent) => void) => onPayload('chat:error', cb),
+    onUsage: (cb: (d: ChatUsageEvent) => void) => onPayload('chat:usage', cb)
   },
   memory: {
     list: (projectId: string | null) => ipcRenderer.invoke('memory:list', projectId),
     save: (input: unknown) => ipcRenderer.invoke('memory:save', input),
     delete: (id: string) => ipcRenderer.invoke('memory:delete', id),
+    touch: (id: string) => ipcRenderer.invoke('memory:touch', id),
+    markStale: (id: string, stale: boolean) => ipcRenderer.invoke('memory:markStale', id, stale),
     count: (projectId: string) => ipcRenderer.invoke('memory:count', projectId),
     clearProject: (projectId: string) => ipcRenderer.invoke('memory:clearProject', projectId),
     search: (query: string, scope: string, projectId: string | null) =>
       ipcRenderer.invoke('memory:search', query, scope, projectId),
+    diagnostics: (projectId: string | null) => ipcRenderer.invoke('memory:diagnostics', projectId),
+    deleteLowQualityCandidates: (projectId: string | null) =>
+      ipcRenderer.invoke('memory:deleteLowQualityCandidates', projectId),
     // M4: extract memories from a chat session / run consolidation manually.
     extract: (projectId: string | null, sessionId: string) =>
       ipcRenderer.invoke('memory:extract', projectId, sessionId),
     consolidate: (projectId: string | null) => ipcRenderer.invoke('memory:consolidate', projectId),
     // Fired after a successful memory save (for toast notifications).
-    onSaved: (cb: (d: { title: string; type: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('memory:saved', fn)
-      return () => ipcRenderer.removeListener('memory:saved', fn)
-    },
+    onSaved: (cb: (d: MemorySavedEvent) => void) => onPayload('memory:saved', cb),
     // Fired by the background indexer when it writes/updates memory for a project.
-    onIndexed: (cb: (d: { projectIds: string[] }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('index:updated', fn)
-      return () => ipcRenderer.removeListener('index:updated', fn)
-    }
+    onIndexed: (cb: (d: IndexUpdatedEvent) => void) => onPayload('index:updated', cb)
   },
   // Codex — headless CLI under the user's ChatGPT subscription login.
   codex: {
     check: () => ipcRenderer.invoke('codex:check'),
     messages: (sessionId: string) => ipcRenderer.invoke('codex:messages', sessionId),
     abort: (sessionId: string) => ipcRenderer.invoke('codex:abort', sessionId),
-    send: (args: {
-      sessionId: string
-      projectId: string
-      prompt: string
-      sandbox?: 'read-only' | 'workspace-write'
-      skipGitRepoCheck?: boolean
-      model?: string
-      imagePaths?: string[]
-      regenerateMessageId?: string
-    }) => ipcRenderer.invoke('codex:send', args),
-    onEvent: (cb: (d: any) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('codex:event', fn)
-      return () => ipcRenderer.removeListener('codex:event', fn)
-    },
-    onDone: (cb: (d: any) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('codex:done', fn)
-      return () => ipcRenderer.removeListener('codex:done', fn)
-    }
+    send: (args: CodexSendRequest & { sandbox?: CodexSandboxMode }) => ipcRenderer.invoke('codex:send', args),
+    onEvent: (cb: (d: CodexIpcEvent) => void) => onPayload('codex:event', cb),
+    onDone: (cb: (d: CodexDoneEvent) => void) => onPayload('codex:done', cb)
   },
   claudeCode: {
     check: () => ipcRenderer.invoke('claudecode:check'),
     messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
-    send: (args: {
-      sessionId: string
-      projectId: string
-      prompt: string
-      injectMemory?: boolean
-      model?: string
-      effort?: 'normal' | 'high' | 'max'
-      thinking?: boolean
-      regenerateMessageId?: string
-    }) => ipcRenderer.invoke('claudecode:send', args),
+    send: (args: ClaudeCodeSendRequest) => ipcRenderer.invoke('claudecode:send', args),
     abort: (sessionId: string) => ipcRenderer.invoke('claudecode:abort', sessionId),
-    onEvent: (cb: (d: { sessionId: string; event: any }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('claudecode:event', fn)
-      return () => ipcRenderer.removeListener('claudecode:event', fn)
-    },
-    onDone: (cb: (d: {
-      sessionId: string
-      ok?: boolean
-      loginRequired?: boolean
-      memorySaved?: boolean
-      error?: string
-    }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('claudecode:done', fn)
-      return () => ipcRenderer.removeListener('claudecode:done', fn)
-    },
-    onCheckpoint: (cb: (d: {
-      sessionId: string
-      messageId: string
-      success: boolean
-      checkpointId?: string
-      commitHash?: string
-      reason?: 'not-git' | 'dirty' | 'error'
-      error?: string
-    }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('claudecode:checkpoint', fn)
-      return () => ipcRenderer.removeListener('claudecode:checkpoint', fn)
-    }
+    onEvent: (cb: (d: ClaudeCodeIpcEvent) => void) => onPayload('claudecode:event', cb),
+    onDone: (cb: (d: ClaudeCodeDoneEvent) => void) => onPayload('claudecode:done', cb),
+    onCheckpoint: (cb: (d: CheckpointEvent) => void) => onPayload('claudecode:checkpoint', cb)
   },
   checkpoints: {
     create: (sessionId: string, projectPath: string, description: string) =>
@@ -187,16 +150,8 @@ contextBridge.exposeInMainWorld('api', {
     write: (id: string, data: string) => ipcRenderer.invoke('terminal:write', id, data),
     resize: (id: string, cols: number, rows: number) => ipcRenderer.invoke('terminal:resize', id, cols, rows),
     close: (id: string) => ipcRenderer.invoke('terminal:close', id),
-    onData: (cb: (d: { id: string; data: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('terminal:data', fn)
-      return () => ipcRenderer.removeListener('terminal:data', fn)
-    },
-    onExit: (cb: (d: { id: string }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('terminal:exit', fn)
-      return () => ipcRenderer.removeListener('terminal:exit', fn)
-    }
+    onData: (cb: (d: TerminalDataEvent) => void) => onPayload('terminal:data', cb),
+    onExit: (cb: (d: TerminalExitEvent) => void) => onPayload('terminal:exit', cb)
   },
   // Git status for the Navigator file tree indicators.
   git: {
@@ -215,40 +170,18 @@ contextBridge.exposeInMainWorld('api', {
     connect: (distro?: string) => ipcRenderer.invoke('hermes:connect', distro),
     messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
     abort: (sessionId: string) => ipcRenderer.invoke('hermes:abort', sessionId),
-    send: (args: { sessionId: string; projectId: string; prompt: string; injectMemory?: boolean; regenerateMessageId?: string }) =>
+    send: (args: HermesSendRequest) =>
       ipcRenderer.invoke('hermes:send', args),
     getConfig: () => ipcRenderer.invoke('hermes:getConfig'),
     setConfig: (config: unknown) => ipcRenderer.invoke('hermes:setConfig', config),
     testConnection: (config?: unknown) => ipcRenderer.invoke('hermes:testConnection', config),
     getPermissionMode: () => ipcRenderer.invoke('hermes:getPermissionMode'),
     setPermissionMode: (mode: number) => ipcRenderer.invoke('hermes:setPermissionMode', mode),
-    respondPermission: (args: {
-      sessionId: string
-      requestId: string
-      approved: boolean
-      actionKind?: string
-      alwaysAllowSession?: boolean
-    }) => ipcRenderer.invoke('hermes:respondPermission', args),
-    onEvent: (cb: (d: { sessionId: string; event: any }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('hermes:event', fn)
-      return () => ipcRenderer.removeListener('hermes:event', fn)
-    },
-    onDone: (cb: (d: {
-      sessionId: string
-      ok?: boolean
-      memorySaved?: boolean
-      error?: string
-    }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('hermes:done', fn)
-      return () => ipcRenderer.removeListener('hermes:done', fn)
-    },
-    onUsage: (cb: (d: { used: number; max: number }) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('hermes:usage', fn)
-      return () => ipcRenderer.removeListener('hermes:usage', fn)
-    }
+    respondPermission: (args: HermesRespondPermissionRequest & { actionKind?: HermesActionKind }) =>
+      ipcRenderer.invoke('hermes:respondPermission', args),
+    onEvent: (cb: (d: HermesIpcEvent) => void) => onPayload('hermes:event', cb),
+    onDone: (cb: (d: HermesDoneEvent) => void) => onPayload('hermes:done', cb),
+    onUsage: (cb: (d: HermesUsageEvent) => void) => onPayload('hermes:usage', cb)
   },
   // Hermes dashboard skills API (Extensions panel Skills tab).
   hermesSkills: {
@@ -265,7 +198,8 @@ contextBridge.exposeInMainWorld('api', {
     check: (name: string) => ipcRenderer.invoke('mcp:check', name),
     checkAll: () => ipcRenderer.invoke('mcp:checkAll'),
     getConfigPath: () => ipcRenderer.invoke('mcp:getConfigPath'),
-    getKnowledgeServerPath: () => ipcRenderer.invoke('mcp:getKnowledgeServerPath')
+    getKnowledgeServerPath: () => ipcRenderer.invoke('mcp:getKnowledgeServerPath'),
+    getKnowledgeServerConfig: () => ipcRenderer.invoke('mcp:getKnowledgeServerConfig')
   },
   // First-run setup wizard: tool detection + completion flag.
   setup: {
@@ -291,27 +225,13 @@ contextBridge.exposeInMainWorld('api', {
   },
   // Activity log: real-time events from all AI sources (CHAT, HERMES, CODE, etc.).
   activity: {
-    onLog: (cb: (entry: any) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('activity:log', fn)
-      return () => ipcRenderer.removeListener('activity:log', fn)
-    }
+    onLog: (cb: (entry: ActivityEntry) => void) => onPayload('activity:log', cb)
   },
   // Research pipeline: multi-stage local Ollama + SearXNG research.
   research: {
-    start: (args: {
-      topic: string
-      scope: 'web' | 'local' | 'both'
-      projectId: string | null
-      saveToProject: boolean
-      quick?: boolean
-    }) => ipcRenderer.invoke('research:start', args),
+    start: (args: ResearchStartRequest) => ipcRenderer.invoke('research:start', args),
     cancel: () => ipcRenderer.invoke('research:cancel'),
-    onProgress: (cb: (d: any) => void) => {
-      const fn = (_: unknown, d: any) => cb(d)
-      ipcRenderer.on('research:progress', fn)
-      return () => ipcRenderer.removeListener('research:progress', fn)
-    }
+    onProgress: (cb: (d: ResearchProgress) => void) => onPayload('research:progress', cb)
   },
   presets: {
     list: () => ipcRenderer.invoke('presets:list'),
@@ -349,4 +269,6 @@ contextBridge.exposeInMainWorld('api', {
     dismiss: (tipId: string) => ipcRenderer.invoke('tips:dismiss', tipId),
     markHandoffUsed: () => ipcRenderer.invoke('tips:markHandoffUsed')
   }
-})
+}
+
+contextBridge.exposeInMainWorld('api', api)

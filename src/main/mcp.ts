@@ -73,6 +73,29 @@ export function writeMcpServers(servers: Record<string, McpServerConfig>): void 
 }
 
 /**
+ * Launch config for the bundled knowledge MCP server.
+ *
+ * better-sqlite3 is a native addon compiled for Electron's ABI, and the server
+ * loads it (through the shared db layer). So the server must run on that same
+ * ABI — we launch it through the app's own Electron binary with
+ * ELECTRON_RUN_AS_NODE=1, which turns Electron into a plain Node runtime. One
+ * native build then serves both the app and this standalone server. Every
+ * registration path (Claude Desktop config, the in-app registry, Hermes/WSL)
+ * must use this instead of a bare `node`, or the server would load a
+ * mismatched better-sqlite3 and fail to start.
+ */
+export function knowledgeMcpLaunchConfig(serverCjsPath: string, dbDir: string): McpServerConfig {
+  return {
+    command: process.execPath,
+    args: [serverCjsPath],
+    env: {
+      AIWORKSPACE_DB_DIR: dbDir,
+      ELECTRON_RUN_AS_NODE: '1'
+    }
+  }
+}
+
+/**
  * Servers from claude_desktop_config.json filtered by the app's local
  * enabled/disabled state (app_meta). This is what in-app consumers (e.g. the
  * Hermes session MCP list) must use, so the Extensions toggle actually gates

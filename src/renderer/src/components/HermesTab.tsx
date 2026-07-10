@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, HermesPlanEntry, HermesPermissionMode, HermesPermissionRequestInfo, RemoteHermesConfig, ComposerAttachment } from '../types'
-import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, HermesPlanEntry, HermesPermissionMode, HermesPermissionRequestInfo, RemoteHermesConfig } from '../types'
+import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
+import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
@@ -200,27 +201,6 @@ function SetupNotice(props: {
   )
 }
 
-function ProjectRequiredNotice() {
-  return (
-    <div className="chat-layout">
-      <aside className="session-list">
-        <div className="session-list-header">
-          <button className="session-new-btn" disabled title="Hermes needs a project folder">
-            <span className="session-new-icon">＋</span> New task
-          </button>
-        </div>
-      </aside>
-      <section className="chat-main">
-        <AiContextBar testId="context-bar-hermes" model={HERMES_MODEL} mode="Hermes" status="Project required" disabledReason="Open a project folder" />
-        <div className="empty center cc-setup" data-testid="hermes-global-unavailable">
-          <h2>Hermes needs a project folder.</h2>
-          <p className="muted">Open a project workspace to use Hermes. Global Workspace is available for general chat and shared memory, but this Hermes integration should not run without a real project path.</p>
-        </div>
-      </section>
-    </div>
-  )
-}
-
 interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function HermesTab(props: { project: Project; active?: boolean }) {
@@ -254,8 +234,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
   const confirmDestructive = useConfirmDestructive()
   const [renderOffset, setRenderOffset] = useState(0)
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [isDragOver, setIsDragOver] = useState(false)
+  const { attachments, setAttachments, isDragOver, setIsDragOver, handlePaste, pickFile, handleDrop } = useComposerAttachments()
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [instructionsOpen, setInstructionsOpen] = useState<{ agentId: string; agentLabel: string } | null>(null)
   const [agentMdExists, setAgentMdExists] = useState(false)
@@ -275,13 +254,16 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const checkRef = useRef<HermesCheck | null>(null)
+  const pendingPermissionsRef = useRef<Map<string, HermesPermissionRequestInfo>>(new Map())
   checkRef.current = check
 
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
   const connected = check?.connected ?? false
-  const contextText = [...messages.map((m) => m.content), streamText, thoughtText, input].filter(Boolean).join('\n')
-  const estimatedTokens = estimateTokensFromText(contextText)
+  const estimatedTokens = useMemo(
+    () => estimateTokensFromText([...messages.map((m) => m.content), streamText, thoughtText, input].filter(Boolean).join('\n')),
+    [messages, streamText, thoughtText, input]
+  )
   const contextStatus = running ? 'Running' : connected ? 'Ready' : 'Disconnected'
   const notifyCompletion = useCompletionNotifier(active)
   const lastActivity = activity[activity.length - 1]
@@ -373,7 +355,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     }
   }
 
-  useEffect(() => { window.api.models.list().then(setOllamaModels) }, [])
+  useEffect(() => { if (active) window.api.models.list().then(setOllamaModels) }, [active])
 
   useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
@@ -448,21 +430,31 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => { if (!isGlobalWorkspace && active) window.api.hermes.getPermissionMode().then(setPermissionMode) }, [isGlobalWorkspace, active])
 
   async function changePermissionMode(mode: HermesPermissionMode) {
+    const previous = permissionMode
     setPermissionMode(mode)
-    await window.api.hermes.setPermissionMode(mode)
+    const result = await window.api.hermes.setPermissionMode(mode)
+    if (!result.success) {
+      setPermissionMode(previous)
+      addToast(`Failed to change Hermes permission mode: ${result.error ?? 'unknown error'}`)
+    }
   }
 
   async function respondPermission(approved: boolean, alwaysAllowSession = false) {
     if (!pendingPermission || !session || respondingPermission) return
     setRespondingPermission(true)
     try {
-      await window.api.hermes.respondPermission({
+      const result = await window.api.hermes.respondPermission({
         sessionId: session.id,
         requestId: pendingPermission.requestId,
         approved,
         actionKind: pendingPermission.action,
         alwaysAllowSession
       })
+      if (!result.success) {
+        addToast(`Failed to respond to Hermes permission request: ${result.error ?? 'request is no longer active'}`)
+        return
+      }
+      pendingPermissionsRef.current.delete(session.id)
       setPendingPermission(null)
     } finally {
       setRespondingPermission(false)
@@ -485,7 +477,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     if (session) window.api.hermes.messages(session.id).then(setMessages)
     else setMessages([])
     setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setError('')
-    setPendingPermission(null)
+    setPendingPermission(session ? pendingPermissionsRef.current.get(session.id) ?? null : null)
     setRenderOffset(0)
   }, [session])
 
@@ -510,8 +502,9 @@ export default function HermesTab(props: { project: Project; active?: boolean })
 
   useEffect(() => {
     const offEvent = window.api.hermes.onEvent((d) => {
-      if (d.sessionId !== session?.id) return
       const e: HermesEvent = d.event
+      const isCurrentSession = d.sessionId === sessionRef.current?.id
+      if (!isCurrentSession && e.kind !== 'permissionRequest') return
       if (e.kind === 'text') setStreamText((t) => t + e.text)
       else if (e.kind === 'thought') setThoughtText((t) => t + e.text)
       else if (e.kind === 'activity') setActivity((a) => [...a, e.activity])
@@ -519,11 +512,17 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       else if (e.kind === 'model') setHermesModel(e.name)
       else if (e.kind === 'commands') setCommands(e.commands)
       else if (e.kind === 'plan') setPlanEntries(e.entries)
-      else if (e.kind === 'permissionRequest') setPendingPermission(e.request)
+      else if (e.kind === 'permissionRequest') {
+        pendingPermissionsRef.current.set(d.sessionId, e.request)
+        if (isCurrentSession) setPendingPermission(e.request)
+      }
     })
     const offDone = window.api.hermes.onDone(async (d) => {
-      if (d.sessionId !== session?.id) return
-      setRunning(false); setStreamText(''); setThoughtText('')
+      pendingPermissionsRef.current.delete(d.sessionId)
+      setRunning(false)
+      if (d.sessionId !== sessionRef.current?.id) return
+      setPendingPermission(null)
+      setStreamText(''); setThoughtText('')
       setMessages(await window.api.hermes.messages(d.sessionId)); setActivity([])
       notifyCompletion()
     })
@@ -546,8 +545,8 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => {
     if (!contextMenu) return
     function handleDown() { setContextMenu(null) }
-    document.addEventListener('pointerdown', handleDown, true)
-    return () => document.removeEventListener('pointerdown', handleDown, true)
+    document.addEventListener('pointerdown', handleDown)
+    return () => document.removeEventListener('pointerdown', handleDown)
   }, [contextMenu])
 
   async function newSession() {
@@ -557,8 +556,14 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   newSessionRef.current = () => { if (!isGlobalWorkspace && connected) void newSession() }
 
   async function deleteSession(target: Session) {
-    await window.api.sessions.delete(target.id)
+    const result = await window.api.sessions.delete(target.id)
+    if (!result.success) {
+      addToast(`Failed to delete session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
+    setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
+    pendingPermissionsRef.current.delete(target.id)
     if (session?.id === target.id) { setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('') }
     addToast('Session deleted')
   }
@@ -573,8 +578,13 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   async function commitRename(s: Session) {
     const title = renaming?.value.trim() || s.title; setRenaming(null)
     if (title === s.title) return
-    await window.api.sessions.rename(s.id, title)
+    const result = await window.api.sessions.rename(s.id, title)
+    if (!result.success) {
+      addToast(`Failed to rename session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
+    setArchivedSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
     if (session?.id === s.id) setSession(prev => prev ? { ...prev, title } : prev)
   }
 
@@ -586,7 +596,11 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   async function toggleArchive(target: Session) {
     setContextMenu(null)
     const archive = !target.archived
-    await window.api.sessions.archive(target.id, archive)
+    const result = await window.api.sessions.archive(target.id, archive)
+    if (!result.success) {
+      addToast(`Failed to ${archive ? 'archive' : 'unarchive'} session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     if (archive) {
       setSessions(prev => prev.filter(x => x.id !== target.id))
       setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
@@ -635,62 +649,21 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
 
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    for (const item of Array.from(e.clipboardData.items)) {
-      if (item.type.startsWith('image/')) {
-        e.preventDefault()
-        const att = await attachmentFromImageClipboardItem(item)
-        if (att) setAttachments(prev => [...prev, att])
-        return
-      }
-    }
-    const text = e.clipboardData.getData('text/plain')
-    if (text.length > 1500) {
-      e.preventDefault()
-      const att: ComposerAttachment = {
-        id: crypto.randomUUID(),
-        file: { type: 'text', name: 'Pasted text', size: text.length, content: text, ext: '.txt' }
-      }
-      setAttachments(prev => [...prev, att])
-    }
-  }
-
-  async function pickFile() {
-    try {
-      const path = await window.api.files.pick()
-      if (!path) return
-      const file = await window.api.files.read(path)
-      const att: ComposerAttachment = { id: crypto.randomUUID(), file }
-      setAttachments(prev => [...prev, att])
-    } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to read file')
-    }
-  }
-
-  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault()
-    setIsDragOver(false)
-    for (const file of Array.from(e.dataTransfer.files)) {
-      const path = electronFilePath(file)
-      if (!path) continue
-      try {
-        const fileAttachment = await window.api.files.read(path)
-        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
-      } catch (err) {
-        addToast(err instanceof Error ? err.message : 'Failed to read file')
-      }
-    }
-  }
-
   async function deleteManySessions(ids: string[]) {
-    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
-    const idSet = new Set(ids)
+    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
+    const failed = results.filter(({ result }) => !result.success)
+    if (failed.length > 0) {
+      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
+    }
+    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
+    if (idSet.size === 0) return
     setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    idSet.forEach((id) => pendingPermissionsRef.current.delete(id))
     if (session && idSet.has(session.id)) {
       setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('')
     }
-    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
+    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
   }
 
   async function run() {
@@ -756,15 +729,19 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   }
 
   async function saveOutputToKnowledge(m: Message) {
-    await window.api.memory.save({
-      projectId: props.project.id,
-      type: 'note',
-      title: m.content.slice(0, 60),
-      content: m.content,
-      source: 'hermes',
-    })
-    addToast('Saved to Knowledge')
-    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    try {
+      await window.api.memory.save({
+        projectId: props.project.id,
+        type: 'note',
+        title: m.content.slice(0, 60),
+        content: m.content,
+        source: 'hermes',
+      })
+      addToast('Saved to Knowledge')
+      window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    } catch (err) {
+      addToast(`Failed to save to Knowledge: ${err instanceof Error ? err.message : 'unknown error'}`)
+    }
   }
 
   // Regenerate / edit-resend / reactions — shared logic lives in the hook,
@@ -783,7 +760,8 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     setMessages,
     busy: running,
     fetchMessages: fetchHermesMessages,
-    resend: hermesResend
+    resend: hermesResend,
+    onError: addToast
   })
 
   const renderMessage = (m: Message) => {
@@ -1100,9 +1078,9 @@ export default function HermesTab(props: { project: Project; active?: boolean })
                   tone="warning"
                   action={
                     <div className="hermes-permission-actions">
-                      <button className="ghost" disabled={respondingPermission} onClick={() => void respondPermission(false)}>Deny</button>
-                      <button className="primary" disabled={respondingPermission} onClick={() => void respondPermission(true)}>Approve</button>
-                      <button className="ghost" disabled={respondingPermission} onClick={() => void respondPermission(true, true)}>Always allow this session</button>
+                      <button className="ghost" data-testid="hermes-permission-deny" disabled={respondingPermission} onClick={() => void respondPermission(false)}>Deny</button>
+                      <button className="primary" data-testid="hermes-permission-allow-once" disabled={respondingPermission} onClick={() => void respondPermission(true)}>Allow once</button>
+                      <button className="ghost" data-testid="hermes-permission-allow-session" disabled={respondingPermission} onClick={() => void respondPermission(true, true)}>Allow for session</button>
                     </div>
                   }
                 />
@@ -1126,6 +1104,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
           onRename={() => startRename(ctxSession)}
           onToggleArchive={() => void toggleArchive(ctxSession)}
           onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+          onClose={() => setContextMenu(null)}
         />
       )}
     </div>

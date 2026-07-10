@@ -1,17 +1,16 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import anime, {
   AnimatedScaleBar,
   animateScrollToBottom,
   cascadeItems,
-  collapseElement,
   prefersReducedMotion,
-  pressElement,
   stopMotion,
   usePressMotion,
   type MotionHandle,
 } from '../motion'
-import type { Project, Session, Message, MemoryItem, ComposerAttachment } from '../types'
-import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
+import type { Project, Session, Message, MemoryItem } from '../types'
+import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
+import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import Markdown from './Markdown'
 import ClarificationCard, {
   formatChoiceAnswer,
@@ -33,7 +32,7 @@ import { useToast } from './ToastContext'
 import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { cleanupGeneratedTitle, fallbackTitleFromText, firstExchange, isGenericSessionTitle } from '../../../shared/sessionTitles'
-import { AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
+import { AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
 import {
@@ -234,6 +233,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
   const { setActive: setAgentActive } = useAgentActivity()
   const [sessions, setSessions] = useState<Session[]>([])
+  const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [models, setModels] = useState<string[]>([])
@@ -248,6 +248,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const [suggestions, setSuggestions] = useState<string[]>([])
   const [chatUsage, setChatUsage] = useState<{ used: number; max: number | null } | null>(null)
   const [cloudModels, setCloudModels] = useState<{ id: string; name: string }[]>([])
+  const [cloudModelsError, setCloudModelsError] = useState('')
   const [cloudKeyConfigured, setCloudKeyConfigured] = useState(false)
   const [cloudKeyMasked, setCloudKeyMasked] = useState<string | null>(null)
   const [cloudKeyInput, setCloudKeyInput] = useState('')
@@ -257,14 +258,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
   const [tokPerSec, setTokPerSec] = useState(0)
   const [answeredClarifications, setAnsweredClarifications] = useState<Set<string>>(() => new Set())
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [isDragOver, setIsDragOver] = useState(false)
+  const { attachments, setAttachments, isDragOver, setIsDragOver, handlePaste, pickFile, handleDrop } = useComposerAttachments()
   const [renderOffset, setRenderOffset] = useState(0)
-  const [sessionFilter, setSessionFilter] = useState('')
-  const [selectMode, setSelectMode] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
-  const [pendingBulkDelete, setPendingBulkDelete] = useState(false)
-  const bulkDeleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const confirmDestructive = useConfirmDestructive()
   // Plan/Execute mode is per-session. New sessions default to Plan. Kept in an
   // in-memory map (doesn't need to survive restart) plus a state mirror.
@@ -283,8 +278,6 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const scrollAnimRef = useRef<MotionHandle>(null)
   const sessionSwitchAnimRef = useRef<MotionHandle>(null)
   const sessionRef = useRef<Session | null>(null)
-  const sessionRowRefs = useRef<Record<string, HTMLLIElement | null>>({})
-  const sessionMotionRef = useRef<MotionHandle[]>([])
   const sendRef = useRef<typeof send | null>(null)
   const newSessionRef = useRef<() => void>(() => {})
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -313,14 +306,12 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   useEffect(() => () => {
     stopMotion(scrollAnimRef.current)
     stopMotion(sessionSwitchAnimRef.current)
-    sessionMotionRef.current.forEach(stopMotion)
-    sessionMotionRef.current = []
     if (streamingFrameRef.current !== null) cancelAnimationFrame(streamingFrameRef.current)
-    if (bulkDeleteTimerRef.current) clearTimeout(bulkDeleteTimerRef.current)
   }, [])
 
   useEffect(() => {
     window.api.sessions.list(props.project.id, 'chat').then(setSessions)
+    window.api.sessions.listArchived(props.project.id, 'chat').then(setArchivedSessions)
   }, [props.project.id])
 
   useEffect(() => {
@@ -404,12 +395,24 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setSession((prev) => (prev && prev.id === sessionId ? { ...prev, summary } : prev))
   })
 
+  async function loadCloudModels(showFailureToast = false) {
+    const result = await window.api.models.listCloud()
+    if (!result.success) {
+      setCloudModels([])
+      setCloudModelsError(result.error)
+      if (showFailureToast) addToast(`Could not reach Ollama Cloud: ${result.error}`)
+      return
+    }
+    setCloudModels(result.models)
+    setCloudModelsError('')
+  }
+
   useEffect(() => {
     window.api.settings.summary().then((summary) => {
       const status = summary.secrets.ollama_cloud_key
       setCloudKeyConfigured(Boolean(status?.configured))
       setCloudKeyMasked(status?.masked ?? null)
-      if (status?.configured) void window.api.models.listCloud().then(setCloudModels)
+      if (status?.configured) void loadCloudModels()
     })
   }, [])
 
@@ -533,26 +536,23 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   useEffect(() => {
     if (!contextMenu) return
     function handleDown() { setContextMenu(null) }
-    document.addEventListener('pointerdown', handleDown, true)
-    return () => document.removeEventListener('pointerdown', handleDown, true)
+    document.addEventListener('pointerdown', handleDown)
+    return () => document.removeEventListener('pointerdown', handleDown)
   }, [contextMenu])
 
   async function newSession() {
     const s = await window.api.sessions.create(props.project.id, 'chat', 'New chat')
     setSessions((prev) => [s, ...prev]); setSession(s)
-    requestAnimationFrame(() => {
-      const row = sessionRowRefs.current[s.id]
-      if (!row) return
-      const anim = anime(row, { opacity: [0, 1], translateY: [-10, 0], duration: 180, ease: 'outExpo' })
-      if (anim) sessionMotionRef.current.push(anim)
-    })
   }
 
   async function deleteSession(target: Session) {
-    await window.api.sessions.delete(target.id)
-    const row = sessionRowRefs.current[target.id]
-    if (row) await collapseElement(row)
+    const result = await window.api.sessions.delete(target.id)
+    if (!result.success) {
+      addToast(`Failed to delete session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
+    setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
     if (session?.id === target.id) {
       setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
       setExtracted(null); setExtractError(''); setError('')
@@ -575,8 +575,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     const title = renaming?.value.trim() || s.title
     setRenaming(null)
     if (title === s.title) return
-    await window.api.sessions.rename(s.id, title)
+    const result = await window.api.sessions.rename(s.id, title)
+    if (!result.success) {
+      addToast(`Failed to rename session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
+    setArchivedSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
     if (session?.id === s.id) setSession(prev => prev ? { ...prev, title } : prev)
   }
 
@@ -590,6 +595,28 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     })
   }
 
+  async function toggleArchive(target: Session) {
+    setContextMenu(null)
+    const archive = !target.archived
+    const result = await window.api.sessions.archive(target.id, archive)
+    if (!result.success) {
+      addToast(`Failed to ${archive ? 'archive' : 'unarchive'} session: ${result.error ?? 'unknown error'}`)
+      return
+    }
+    if (archive) {
+      setSessions(prev => prev.filter(x => x.id !== target.id))
+      setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
+      if (session?.id === target.id) {
+        setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
+        setExtracted(null); setExtractError(''); setError('')
+      }
+    } else {
+      setArchivedSessions(prev => prev.filter(x => x.id !== target.id))
+      setSessions(prev => [{ ...target, archived: 0 }, ...prev])
+    }
+    addToast(archive ? 'Session archived' : 'Session unarchived')
+  }
+
   async function saveCloudKey() {
     const key = cloudKeyInput.trim()
     await window.api.settings.set('ollama_cloud_key', key)
@@ -597,96 +624,25 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setCloudKeyConfigured(Boolean(key))
     setCloudKeyMasked(key ? `•••• ${key.slice(-4)}` : null)
     setShowCloudSetup(false)
-    if (key) { const m = await window.api.models.listCloud(); setCloudModels(m) } else setCloudModels([])
-  }
-
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    for (const item of Array.from(e.clipboardData.items)) {
-      if (item.type.startsWith('image/')) {
-        e.preventDefault()
-        const att = await attachmentFromImageClipboardItem(item)
-        if (att) setAttachments(prev => [...prev, att])
-        return
-      }
-    }
-    const text = e.clipboardData.getData('text/plain')
-    if (text.length > 1500) {
-      e.preventDefault()
-      const att: ComposerAttachment = {
-        id: crypto.randomUUID(),
-        file: { type: 'text', name: 'Pasted text', size: text.length, content: text, ext: '.txt' }
-      }
-      setAttachments(prev => [...prev, att])
-    }
-  }
-
-  async function pickFile() {
-    try {
-      const path = await window.api.files.pick()
-      if (!path) return
-      const file = await window.api.files.read(path)
-      const att: ComposerAttachment = { id: crypto.randomUUID(), file }
-      setAttachments(prev => [...prev, att])
-    } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to read file')
-    }
-  }
-
-  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault()
-    setIsDragOver(false)
-    for (const file of Array.from(e.dataTransfer.files)) {
-      const path = electronFilePath(file)
-      if (!path) continue
-      try {
-        const fileAttachment = await window.api.files.read(path)
-        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
-      } catch (err) {
-        addToast(err instanceof Error ? err.message : 'Failed to read file')
-      }
-    }
-  }
-
-  function toggleSelectMode() {
-    setSelectMode((v) => !v)
-    setSelectedIds(new Set())
-    setPendingBulkDelete(false)
-    if (bulkDeleteTimerRef.current) clearTimeout(bulkDeleteTimerRef.current)
-  }
-
-  function toggleSelected(id: string) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id); else next.add(id)
-      return next
-    })
+    if (key) void loadCloudModels(true)
+    else { setCloudModels([]); setCloudModelsError('') }
   }
 
   async function deleteManySessions(ids: string[]) {
-    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
-    const idSet = new Set(ids)
+    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
+    const failed = results.filter(({ result }) => !result.success)
+    if (failed.length > 0) {
+      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
+    }
+    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
+    if (idSet.size === 0) return
     setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
+    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     if (session && idSet.has(session.id)) {
       setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
       setExtracted(null); setExtractError(''); setError('')
     }
-    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
-  }
-
-  function handleBulkDeleteClick() {
-    if (selectedIds.size === 0) return
-    if (!pendingBulkDelete) {
-      setPendingBulkDelete(true)
-      if (bulkDeleteTimerRef.current) clearTimeout(bulkDeleteTimerRef.current)
-      bulkDeleteTimerRef.current = setTimeout(() => setPendingBulkDelete(false), 3000)
-      return
-    }
-    if (bulkDeleteTimerRef.current) clearTimeout(bulkDeleteTimerRef.current)
-    setPendingBulkDelete(false)
-    const ids = [...selectedIds]
-    setSelectedIds(new Set())
-    setSelectMode(false)
-    void deleteManySessions(ids)
+    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
   }
 
   async function send(text?: string) {
@@ -894,15 +850,23 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     }
     title = title ?? fallbackTitleFromText(exchange.user.content)
     if (!title || !isGenericSessionTitle(currentTitle)) return
-    await window.api.sessions.rename(sessionId, title)
+    const result = await window.api.sessions.rename(sessionId, title)
+    if (!result.success) {
+      addToast(`Failed to rename session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSession((s) => s && s.id === sessionId && isGenericSessionTitle(s.title) ? { ...s, title } : s)
     setSessions((prev) => prev.map((s) => s.id === sessionId && isGenericSessionTitle(s.title) ? { ...s, title } : s))
   }
 
   const saveToMemory = useCallback(async (m: Message) => {
-    await window.api.memory.save({ projectId: memoryProjectId, type: 'note', title: m.content.slice(0, 60), content: m.content, source: 'chat' })
-    addToast('Saved to Knowledge')
-    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    try {
+      await window.api.memory.save({ projectId: memoryProjectId, type: 'note', title: m.content.slice(0, 60), content: m.content, source: 'chat' })
+      addToast('Saved to Knowledge')
+      window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Memory was skipped')
+    }
   }, [memoryProjectId, addToast])
 
   const copyOutput = useCallback(async (text: string) => {
@@ -932,7 +896,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setMessages,
     busy,
     fetchMessages: fetchChatMessages,
-    resend: chatResend
+    resend: chatResend,
+    onError: addToast
   })
 
   async function extractMemories() {
@@ -946,8 +911,10 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const canExtractMemories =
     messages.some((m) => m.role === 'user' && m.content.trim().length > 0) &&
     messages.some((m) => m.role === 'assistant' && m.content.trim().length > 0)
-  const contextText = [...messages.map((m) => m.content), streaming, input].filter(Boolean).join('\n')
-  const estimatedTokens = estimateTokensFromText(contextText)
+  const estimatedTokens = useMemo(
+    () => estimateTokensFromText([...messages.map((m) => m.content), streaming, input].filter(Boolean).join('\n')),
+    [messages, streaming, input]
+  )
   const contextStatus = busy ? 'Streaming' : session ? 'Ready' : 'No active chat'
 
   const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
@@ -1027,6 +994,9 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
                       {cloudModels.map((m) => <option key={m.id} value={`cloud:${m.id}`}>{m.name}</option>)}
                     </optgroup>
                   )}
+                  {cloudModels.length === 0 && cloudKeyConfigured && cloudModelsError && (
+                    <optgroup label="OLLAMA CLOUD"><option value="" disabled>Could not reach Ollama Cloud - check your API key</option></optgroup>
+                  )}
                   {cloudModels.length === 0 && !cloudKeyConfigured && (
                     <optgroup label="OLLAMA CLOUD"><option value="" disabled>Add API key to use cloud models</option></optgroup>
                   )}
@@ -1058,68 +1028,28 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     </>
   )
 
-  const sessionQuery = sessionFilter.trim().toLowerCase()
-  const filteredSessions = sessionQuery
-    ? sessions.filter(s => (s.title || '').toLowerCase().includes(sessionQuery))
-    : sessions
-  const pinnedSessions = filteredSessions.filter(s => pinnedIds.has(s.id))
-  const unpinnedSessions = filteredSessions.filter(s => !pinnedIds.has(s.id))
-  const ctxSession = contextMenu ? sessions.find(s => s.id === contextMenu.sessionId) : null
+  const ctxSession = contextMenu ? [...sessions, ...archivedSessions].find(s => s.id === contextMenu.sessionId) : null
 
   return (
     <div className="chat-layout">
       {/* ── Session sidebar ── */}
-      <aside className="session-list">
-        <div className="session-list-header">
-          <button className="session-new-btn" onClick={newSession}>
-            <span className="session-new-icon">＋</span>
-            New chat
-          </button>
-        </div>
-        {sessions.length > 0 && (
-          <div className="session-search">
-            {sessions.length > 8 && (
-              <input
-                placeholder="Search sessions..."
-                value={sessionFilter}
-                onChange={(e) => setSessionFilter(e.target.value)}
-                aria-label="Search sessions"
-              />
-            )}
-            <button
-              className={`session-select-toggle${selectMode ? ' on' : ''}`}
-              onClick={toggleSelectMode}
-              title={selectMode ? 'Exit select mode' : 'Select multiple sessions'}
-              aria-label="Toggle select mode"
-              aria-pressed={selectMode}
-            >
-              ☑
-            </button>
-          </div>
-        )}
-        <div className="session-list-body">
-              <ul className="motion-list motion-list-tight">
-            {pinnedSessions.length > 0 && (
-              <>
-                {pinnedSessions.map(s => renderSessionRow(s))}
-                {unpinnedSessions.length > 0 && <div className="session-pin-divider" />}
-              </>
-            )}
-            {unpinnedSessions.map(s => renderSessionRow(s))}
-          </ul>
-        </div>
-        {selectMode && selectedIds.size > 0 && (
-          <div className="session-bulk-bar">
-            <span>{selectedIds.size} selected</span>
-            <div className="session-bulk-bar-actions">
-              <button className="ghost tiny" onClick={toggleSelectMode}>Cancel</button>
-              <button className={`danger tiny${pendingBulkDelete ? ' pending-confirm' : ''}`} onClick={handleBulkDeleteClick}>
-                {pendingBulkDelete ? `Click again to delete ${selectedIds.size} session${selectedIds.size === 1 ? '' : 's'}` : 'Delete selected'}
-              </button>
-            </div>
-          </div>
-        )}
-      </aside>
+      <AgentSessionRail
+        sessions={sessions}
+        archivedSessions={archivedSessions}
+        activeSessionId={session?.id}
+        pinnedIds={pinnedIds}
+        renaming={renaming}
+        newLabel="New chat"
+        newTitle="Start a new chat"
+        emptyLabel="No chats yet"
+        onNew={newSession}
+        onSelect={selectSession}
+        onOptions={openContextMenu}
+        onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
+        onRenameCommit={(s) => void commitRename(s)}
+        onRenameCancel={() => setRenaming(null)}
+        onDeleteMany={deleteManySessions}
+      />
 
       {/* ── Main area ── */}
       <section className="chat-main">
@@ -1283,69 +1213,16 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
           x={contextMenu.x}
           y={contextMenu.y}
           pinned={pinnedIds.has(contextMenu.sessionId)}
+          archived={!!ctxSession.archived}
           confirmDestructive={confirmDestructive}
           onTogglePin={() => togglePin(contextMenu.sessionId)}
           onRename={() => startRename(ctxSession)}
+          onToggleArchive={() => void toggleArchive(ctxSession)}
           onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+          onClose={() => setContextMenu(null)}
         />
       )}
     </div>
   )
 
-  function renderSessionRow(s: Session) {
-    const isActive = session?.id === s.id
-    const isRenaming = renaming?.id === s.id
-    return (
-      <li key={s.id} ref={(el) => { sessionRowRefs.current[s.id] = el }} className="session-row" data-session-id={s.id}>
-        {selectMode && (
-          <input
-            type="checkbox"
-            className="session-row-checkbox"
-            checked={selectedIds.has(s.id)}
-            onChange={() => toggleSelected(s.id)}
-            onClick={(e) => e.stopPropagation()}
-            aria-label={`Select ${s.title}`}
-          />
-        )}
-        <button
-          className={`session-item${isActive ? ' active' : ''}`}
-          onPointerDown={(e) => pressElement(e, sessionMotionRef.current)}
-          onClick={() => { if (selectMode) { toggleSelected(s.id); return } if (!isRenaming) selectSession(s) }}
-        >
-          {isRenaming ? (
-            <input
-              className="session-rename-input"
-              value={renaming.value}
-              onChange={e => setRenaming({ id: s.id, value: e.target.value })}
-              onKeyDown={e => {
-                if (e.key === 'Enter') { e.preventDefault(); void commitRename(s) }
-                if (e.key === 'Escape') setRenaming(null)
-              }}
-              onBlur={() => void commitRename(s)}
-              autoFocus
-              onClick={e => e.stopPropagation()}
-            />
-          ) : (
-            <span className="session-item-body">
-              <span className="session-item-row1">
-                <span className="session-item-title">{s.title}</span>
-                {typeof s.updated_at === 'number' && <RelativeTime ts={s.updated_at} compact />}
-              </span>
-              {s.summary && <span className="session-item-summary">{s.summary}</span>}
-            </span>
-          )}
-        </button>
-        {!selectMode && (
-          <button
-            className="session-dot-menu"
-            title="Session options"
-            aria-label={`Options for ${s.title}`}
-            onClick={e => openContextMenu(e, s)}
-          >
-            ⋯
-          </button>
-        )}
-      </li>
-    )
-  }
 }

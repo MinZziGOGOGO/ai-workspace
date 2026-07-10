@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import { existsSync, readFileSync } from 'fs'
 import { resolve, relative, isAbsolute } from 'path'
 import { getDb } from './db'
+import { isE2EFakeEnabled } from './e2e'
 
 // Hermes ACP (Agent Client Protocol) integration — Milestone 6.
 //
@@ -23,6 +24,10 @@ import { getDb } from './db'
 
 const IS_WIN = process.platform === 'win32'
 const SSH_EXE = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe'
+
+function isFakeHermes(): boolean {
+  return isE2EFakeEnabled('E2E_FAKE_HERMES')
+}
 
 // ---- Public types -----------------------------------------------------------
 
@@ -348,6 +353,9 @@ function pickDistro(distros: string[]): string | undefined {
 // or after disconnection (needs to probe WSL + binary + config presence).
 
 export async function checkHermes(): Promise<HermesCheck> {
+  if (isFakeHermes()) {
+    return { wsl2: true, installed: true, connected: true, version: 'fake-hermes', distro: 'Ubuntu' }
+  }
   const config = getHermesConfig()
 
   console.error('[checkHermes] called, IS_WIN=%s mode=%s connected=%s', IS_WIN, config.mode, _client?.connected ?? false)
@@ -624,6 +632,7 @@ class HermesAcpClient {
     this.updateListeners.clear()
     this.eventListeners.clear()
     this.ourSessionByAcp.clear()
+    this.projectPathByAcp.clear()
     this.pendingPermissions.clear()
     this.buf = ''
   }
@@ -697,21 +706,58 @@ class HermesAcpClient {
     }
   }
 
+  // Returns the resolved absolute Windows path when requestedPath is inside
+  // projectPath, or null if it would escape the root (same algorithm as
+  // normalizeWorkspacePath in ipc.ts — kept separate to avoid a circular import).
+  // Handles WSL /mnt/X/ paths by converting them to Windows drive paths first.
+  private static confineToProject(projectPath: string, requestedPath: string): string | null {
+    if (!projectPath || !requestedPath) return null
+    const p = IS_WIN && requestedPath.startsWith('/mnt/')
+      ? (() => {
+          const m = requestedPath.match(/^\/mnt\/([a-z])(?:\/(.*))?$/i)
+          return m ? `${m[1].toUpperCase()}:\\${(m[2] ?? '').replace(/\//g, '\\')}` : requestedPath
+        })()
+      : requestedPath
+    const root = resolve(projectPath)
+    const target = isAbsolute(p) ? resolve(p) : resolve(root, p)
+    const rel = relative(root, target)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null
+    return target
+  }
+
   private handleAgentRequest(msg: any): void {
     const { id, method, params } = msg
     if (method === 'session/request_permission') {
       this.handlePermissionRequest(id, params)
     } else if (method === 'fs/read_text_file') {
-      // Serve file content for in-project paths; empty string for anything else
       const filePath: string = params?.path ?? params?.uri ?? ''
+      const acpSessionId: string = params?.sessionId ?? ''
+      const projectPath =
+        this.projectPathByAcp.get(acpSessionId) ??
+        (this.projectPathByAcp.size === 1 ? [...this.projectPathByAcp.values()][0] : undefined)
+      const safePath = projectPath ? HermesAcpClient.confineToProject(projectPath, filePath) : undefined
+      if (!safePath) {
+        console.error('[hermes] fs/read_text_file denied – path outside project root:', filePath)
+        this.sendLine({ jsonrpc: '2.0', id, error: { code: -32600, message: 'Path outside project root' } })
+        return
+      }
       let content = ''
-      try {
-        const { readFileSync } = require('fs') as typeof import('fs')
-        content = readFileSync(filePath.startsWith('/mnt/') ? filePath : filePath, 'utf8')
-      } catch {}
+      try { content = readFileSync(safePath, 'utf8') } catch {}
       this.sendLine({ jsonrpc: '2.0', id, result: { content } })
     } else if (method === 'fs/write_text_file') {
-      // The OS-level write already happened; this just acknowledges the RPC
+      // The OS-level write is performed by Hermes in WSL; this handler only vets
+      // the path and acknowledges. Still confine to project root for consistency.
+      const filePath: string = params?.path ?? params?.uri ?? ''
+      const acpSessionId: string = params?.sessionId ?? ''
+      const projectPath =
+        this.projectPathByAcp.get(acpSessionId) ??
+        (this.projectPathByAcp.size === 1 ? [...this.projectPathByAcp.values()][0] : undefined)
+      const safePath = projectPath ? HermesAcpClient.confineToProject(projectPath, filePath) : undefined
+      if (!safePath) {
+        console.error('[hermes] fs/write_text_file denied – path outside project root:', filePath)
+        this.sendLine({ jsonrpc: '2.0', id, error: { code: -32600, message: 'Path outside project root' } })
+        return
+      }
       this.sendLine({ jsonrpc: '2.0', id, result: {} })
     } else if (method?.startsWith('terminal/')) {
       this.sendLine({ jsonrpc: '2.0', id, result: null })
@@ -744,8 +790,10 @@ class HermesAcpClient {
 // ---- Singleton + exported API ----------------------------------------------
 
 let _client: HermesAcpClient | null = null
+const fakePermissionRequests = new Map<string, (approved: boolean) => void>()
 
 export async function connectHermes(distro = 'Ubuntu'): Promise<{ connected: boolean; version?: string; error?: string }> {
+  if (isFakeHermes()) return { connected: true, version: 'fake-hermes' }
   const config = getHermesConfig()
   try {
     if (_client?.connected) return { connected: true, version: _client.version }
@@ -766,6 +814,7 @@ export function disconnectHermes(): void {
 }
 
 export function hermesConnected(): boolean {
+  if (isFakeHermes()) return true
   return _client?.connected ?? false
 }
 
@@ -785,6 +834,33 @@ export async function runHermesPrompt(opts: {
   signal?: AbortSignal
   distro?: string
 }): Promise<AcpRunResult> {
+  if (isFakeHermes()) {
+    const requestId = randomUUID()
+    opts.onEvent({
+      kind: 'permissionRequest',
+      request: { requestId, action: 'execute', title: 'Run command `npm test`' }
+    })
+    const approved = await new Promise<boolean>((resolve) => {
+      fakePermissionRequests.set(requestId, resolve)
+      const timeout = setTimeout(() => {
+        fakePermissionRequests.delete(requestId)
+        resolve(false)
+      }, 30_000)
+      fakePermissionRequests.set(requestId, (value) => {
+        clearTimeout(timeout)
+        resolve(value)
+      })
+    })
+    fakePermissionRequests.delete(requestId)
+    if (!approved) {
+      opts.onEvent({ kind: 'error', message: 'Fake Hermes permission denied' })
+      return { ok: false, text: '', error: 'Fake Hermes permission denied' }
+    }
+    const text = `Fake Hermes approved and completed: ${opts.prompt}`
+    opts.onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'tool', message: 'npm test' } })
+    opts.onEvent({ kind: 'text', text })
+    return { ok: true, text, stopReason: 'end_turn' }
+  }
   // Ensure connected
   if (!_client?.connected) {
     const r = await connectHermes(opts.distro ?? 'Ubuntu')
@@ -822,6 +898,11 @@ export async function runHermesPrompt(opts: {
 // any). Returns false if the request is unknown — e.g. the client reconnected
 // since the request was raised, or the renderer double-fired the response.
 export function respondHermesPermission(requestId: string, approved: boolean): boolean {
+  const fake = fakePermissionRequests.get(requestId)
+  if (fake) {
+    fake(approved)
+    return true
+  }
   return _client?.respondPermission(requestId, approved) ?? false
 }
 

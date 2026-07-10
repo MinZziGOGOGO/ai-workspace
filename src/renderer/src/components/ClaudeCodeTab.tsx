@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import { diffLines } from 'diff'
-import type { Project, Session, Message, CCActivityEntry, CCFileDiff, CCEvent, ComposerAttachment, Checkpoint } from '../types'
-import { AttachmentChips, attachmentFromImageClipboardItem, electronFilePath, resolveAttachments } from './ComposerAttachments'
+import type { Project, Session, Message, CCActivityEntry, CCFileDiff, CCEvent, Checkpoint } from '../types'
+import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
@@ -296,14 +297,15 @@ function CheckpointBadge(props: { info: CheckpointInfo; onRollback: () => Promis
   }
 
   return (
-    <span className="cc-checkpoint">
-      <button type="button" className="cc-checkpoint-btn" onClick={() => setOpen((o) => !o)}>🔖 Checkpoint</button>
+    <span className="cc-checkpoint" data-testid="claude-code-checkpoint">
+      <button type="button" className="cc-checkpoint-btn" data-testid="claude-code-checkpoint-open" onClick={() => setOpen((o) => !o)}>🔖 Checkpoint</button>
       {open && (
-        <div className="cc-checkpoint-panel">
+        <div className="cc-checkpoint-panel" data-testid="claude-code-checkpoint-panel">
           <div className="muted small">Checkpoint created before this task</div>
           <button
             type="button"
             className={`danger cc-checkpoint-rollback${confirming ? ' pending-confirm' : ''}`}
+            data-testid="claude-code-checkpoint-rollback"
             disabled={rollingBack}
             onClick={() => void handleRollbackClick()}
           >
@@ -327,28 +329,6 @@ function SetupNotice(props: { check: Check; onRecheck: () => void }) {
       </ol>
       {props.check.error && <p className="muted small cc-setup-err">{props.check.error}</p>}
       <button className="primary" onClick={props.onRecheck}>Re-check</button>
-    </div>
-  )
-}
-
-function ProjectRequiredNotice() {
-  return (
-    <div className="chat-layout">
-      <aside className="session-list">
-        <div className="session-list-header">
-          <button className="session-new-btn" disabled title="Claude Code needs a project folder">
-            <span className="session-new-icon">＋</span> New task
-          </button>
-        </div>
-      </aside>
-      <section className="chat-main">
-        <AiContextBar testId="context-bar-claude-code" model={labelForModel(DEFAULT_MODEL)} mode="Claude Code" status="Project required" disabledReason="Open a project folder" />
-        <div className="empty center cc-setup" data-testid="claude-global-unavailable">
-          <h2>Claude Code needs a project folder.</h2>
-          <p className="muted">Claude Code needs a project folder. Open a project workspace to use it.</p>
-          <VoiceInputButton testId="voice-input-claude-code" value="" onChange={() => undefined} disabled label="Voice input for Claude Code" />
-        </div>
-      </section>
     </div>
   )
 }
@@ -383,8 +363,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const confirmDestructive = useConfirmDestructive()
   const [tokPerSec, setTokPerSec] = useState(0)
   const [renderOffset, setRenderOffset] = useState(0)
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [isDragOver, setIsDragOver] = useState(false)
+  const { attachments, setAttachments, isDragOver, setIsDragOver, handlePaste, pickFile, handleDrop } = useComposerAttachments()
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [instructionsOpen, setInstructionsOpen] = useState<{ agentId: string; agentLabel: string } | null>(null)
   const [agentMdExists, setAgentMdExists] = useState(false)
@@ -404,8 +383,10 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const tokenTimestamps = useRef<number[]>([])
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
-  const contextText = [...messages.map((m) => m.content), output, input].filter(Boolean).join('\n')
-  const estimatedTokens = estimateTokensFromText(contextText)
+  const estimatedTokens = useMemo(
+    () => estimateTokensFromText([...messages.map((m) => m.content), output, input].filter(Boolean).join('\n')),
+    [messages, output, input]
+  )
   const notifyCompletion = useCompletionNotifier(active)
   const pendingToolEntry = activity.find((e) => e.ok === undefined)
   const ccStatusPhrase = useStatusPhrase({
@@ -460,7 +441,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     } catch { /* use fallback */ }
   }
 
-  useEffect(() => { window.api.models.list().then(setOllamaModels) }, [])
+  useEffect(() => { if (active) window.api.models.list().then(setOllamaModels) }, [active])
 
   useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
@@ -645,8 +626,8 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   useEffect(() => {
     if (!contextMenu) return
     function handleDown() { setContextMenu(null) }
-    document.addEventListener('pointerdown', handleDown, true)
-    return () => document.removeEventListener('pointerdown', handleDown, true)
+    document.addEventListener('pointerdown', handleDown)
+    return () => document.removeEventListener('pointerdown', handleDown)
   }, [contextMenu])
 
   async function newSession() {
@@ -656,8 +637,13 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   newSessionRef.current = () => { if (!isGlobalWorkspace && check?.installed) void newSession() }
 
   async function deleteSession(target: Session) {
-    await window.api.sessions.delete(target.id)
+    const result = await window.api.sessions.delete(target.id)
+    if (!result.success) {
+      addToast(`Failed to delete session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
+    setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
     if (session?.id === target.id) { setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError(''); setLoginRequired(false) }
     addToast('Session deleted')
   }
@@ -672,8 +658,13 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   async function commitRename(s: Session) {
     const title = renaming?.value.trim() || s.title; setRenaming(null)
     if (title === s.title) return
-    await window.api.sessions.rename(s.id, title)
+    const result = await window.api.sessions.rename(s.id, title)
+    if (!result.success) {
+      addToast(`Failed to rename session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     setSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
+    setArchivedSessions(prev => prev.map(x => x.id === s.id ? { ...x, title } : x))
     if (session?.id === s.id) setSession(prev => prev ? { ...prev, title } : prev)
   }
 
@@ -685,7 +676,11 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   async function toggleArchive(target: Session) {
     setContextMenu(null)
     const archive = !target.archived
-    await window.api.sessions.archive(target.id, archive)
+    const result = await window.api.sessions.archive(target.id, archive)
+    if (!result.success) {
+      addToast(`Failed to ${archive ? 'archive' : 'unarchive'} session: ${result.error ?? 'unknown error'}`)
+      return
+    }
     if (archive) {
       setSessions(prev => prev.filter(x => x.id !== target.id))
       setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
@@ -727,62 +722,20 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
 
-  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    for (const item of Array.from(e.clipboardData.items)) {
-      if (item.type.startsWith('image/')) {
-        e.preventDefault()
-        const att = await attachmentFromImageClipboardItem(item)
-        if (att) setAttachments(prev => [...prev, att])
-        return
-      }
-    }
-    const text = e.clipboardData.getData('text/plain')
-    if (text.length > 1500) {
-      e.preventDefault()
-      const att: ComposerAttachment = {
-        id: crypto.randomUUID(),
-        file: { type: 'text', name: 'Pasted text', size: text.length, content: text, ext: '.txt' }
-      }
-      setAttachments(prev => [...prev, att])
-    }
-  }
-
-  async function pickFile() {
-    try {
-      const path = await window.api.files.pick()
-      if (!path) return
-      const file = await window.api.files.read(path)
-      const att: ComposerAttachment = { id: crypto.randomUUID(), file }
-      setAttachments(prev => [...prev, att])
-    } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to read file')
-    }
-  }
-
-  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault()
-    setIsDragOver(false)
-    for (const file of Array.from(e.dataTransfer.files)) {
-      const path = electronFilePath(file)
-      if (!path) continue
-      try {
-        const fileAttachment = await window.api.files.read(path)
-        setAttachments(prev => [...prev, { id: crypto.randomUUID(), file: fileAttachment }])
-      } catch (err) {
-        addToast(err instanceof Error ? err.message : 'Failed to read file')
-      }
-    }
-  }
-
   async function deleteManySessions(ids: string[]) {
-    await Promise.all(ids.map((id) => window.api.sessions.delete(id)))
-    const idSet = new Set(ids)
+    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
+    const failed = results.filter(({ result }) => !result.success)
+    if (failed.length > 0) {
+      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
+    }
+    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
+    if (idSet.size === 0) return
     setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
     if (session && idSet.has(session.id)) {
       setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError(''); setLoginRequired(false)
     }
-    addToast(`${ids.length} session${ids.length === 1 ? '' : 's'} deleted`)
+    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
   }
 
   async function run() {
@@ -864,15 +817,19 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   }
 
   async function saveOutputToKnowledge(m: Message) {
-    await window.api.memory.save({
-      projectId: props.project.id,
-      type: 'note',
-      title: m.content.slice(0, 60),
-      content: m.content,
-      source: 'claudecode',
-    })
-    addToast('Saved to Knowledge')
-    window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    try {
+      await window.api.memory.save({
+        projectId: props.project.id,
+        type: 'note',
+        title: m.content.slice(0, 60),
+        content: m.content,
+        source: 'claudecode',
+      })
+      addToast('Saved to Knowledge')
+      window.dispatchEvent(new CustomEvent('knowledge:pulse'))
+    } catch (err) {
+      addToast(`Failed to save to Knowledge: ${err instanceof Error ? err.message : 'unknown error'}`)
+    }
   }
 
   // Regenerate / edit-resend / reactions — shared logic lives in the hook,
@@ -891,7 +848,8 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     setMessages,
     busy: running,
     fetchMessages: fetchCcMessages,
-    resend: ccResend
+    resend: ccResend,
+    onError: addToast
   })
 
   async function rollbackToCheckpoint(checkpointId: string) {
@@ -1232,6 +1190,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
           onRename={() => startRename(ctxSession)}
           onToggleArchive={() => void toggleArchive(ctxSession)}
           onDelete={() => { setContextMenu(null); void deleteSession(ctxSession) }}
+          onClose={() => setContextMenu(null)}
         />
       )}
     </div>
