@@ -251,6 +251,7 @@ function AnimatedDropdown(props: {
     <div
       ref={ref}
       className={props.className}
+      role="menu"
       style={{ ...props.style, transformOrigin: 'top center' }}
       onMouseDown={props.onMouseDown}
       onPointerEnter={props.onPointerEnter}
@@ -625,6 +626,20 @@ function WorkspaceShellInner(props: {
   function cancelCloseLayoutPicker() {
     if (layoutPickerTimer.current) clearTimeout(layoutPickerTimer.current)
   }
+
+  useEffect(() => {
+    if (!groupDropdown && !presetsDropdown && !layoutPickerState) return
+    function handleMenuEscape(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setGroupDropdown(null)
+      setPresetsDropdown(null)
+      setLayoutPickerState(null)
+      setSavingPreset(false)
+    }
+    document.addEventListener('keydown', handleMenuEscape)
+    return () => document.removeEventListener('keydown', handleMenuEscape)
+  }, [groupDropdown, presetsDropdown, layoutPickerState])
 
   function applyZone(panelId: DockPanel, zone: LayoutZone) {
     setLayoutPickerState(null)
@@ -1112,6 +1127,7 @@ function WorkspaceShellInner(props: {
         return (
           <ProjectPicker
             variant="panel"
+            active={openIds.includes('navigator')}
             currentProject={props.project}
             projects={props.projects}
             onRefresh={props.onRefresh}
@@ -1398,6 +1414,8 @@ function WorkspaceShellInner(props: {
                 <button
                   ref={group.label === 'Knowledge' ? knowledgeButtonRef : undefined}
                   className={`topbar-group-btn${hasOpen ? ' has-open' : ''}`}
+                  aria-haspopup="menu"
+                  aria-expanded={isDropOpen}
                   onClick={(e) => {
                     e.stopPropagation()
                     if (isDropOpen) { setGroupDropdown(null); return }
@@ -1618,13 +1636,15 @@ function WorkspaceShellInner(props: {
           }}
           onMouseDown={e => e.stopPropagation()}
         >
-          {(TOPBAR_GROUPS.find(g => g.label === groupDropdown.label)?.panels ?? []).map(item => {
+          {(TOPBAR_GROUPS.find(g => g.label === groupDropdown.label)?.panels ?? []).map((item, index) => {
             const panel = item.id
             const isOpen = openIds.includes(panel)
             return (
               <button
                 key={panel}
                 className={`topbar-dropdown-item${isOpen ? ' is-open' : ''}`}
+                role="menuitem"
+                autoFocus={index === 0}
                 onClick={() => {
                   handleRackClick(panel)
                   setGroupDropdown(null)
@@ -1678,6 +1698,8 @@ function WorkspaceShellInner(props: {
           ) : (
             <button
               className="topbar-dropdown-item"
+              role="menuitem"
+              autoFocus
               onClick={() => setSavingPreset(true)}
             >
               <span className="topbar-dropdown-item-label">Save current layout...</span>

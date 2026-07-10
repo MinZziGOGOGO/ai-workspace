@@ -31,10 +31,12 @@ function FileIcon() {
 
 export default function NavigatorFileTree({
   projectPath,
+  active = true,
   selectedFile,
   onFileSelect
 }: {
   projectPath: string
+  active?: boolean
   selectedFile?: string | null
   onFileSelect?: (path: string) => void
 }) {
@@ -56,7 +58,10 @@ export default function NavigatorFileTree({
 
   // Git status indicators: load on mount and refresh every 10 seconds.
   // A non-repo project simply shows no indicators (gitFiles stays null).
+  // Only poll while the Navigator panel is actually open — otherwise a hidden
+  // panel keeps hammering git in the main process for nothing.
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     setGitFiles(null)
     const load = () => {
@@ -67,7 +72,7 @@ export default function NavigatorFileTree({
     load()
     const timer = setInterval(load, 10000)
     return () => { cancelled = true; clearInterval(timer) }
-  }, [projectPath])
+  }, [projectPath, active])
 
   // Map an absolute entry path to its git status dot class, if any.
   function gitDotFor(absPath: string): string | null {

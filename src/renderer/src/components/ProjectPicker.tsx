@@ -16,6 +16,7 @@ export default function ProjectPicker(props: {
   currentProject?: Project
   onClose?: () => void
   variant?: 'picker' | 'navigator' | 'panel'
+  active?: boolean
   selectedFile?: string | null
   onFileSelect?: (path: string) => void
 }) {
@@ -190,6 +191,7 @@ export default function ProjectPicker(props: {
         {isPanel && !isGlobal && props.currentProject?.path && (
           <NavigatorFileTree
             projectPath={props.currentProject.path}
+            active={props.active !== false}
             selectedFile={props.selectedFile}
             onFileSelect={props.onFileSelect}
           />

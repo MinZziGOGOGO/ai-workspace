@@ -1,7 +1,11 @@
 import { ipcMain, dialog, BrowserWindow, app, shell } from 'electron'
 import { randomUUID } from 'crypto'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { readdirSync, readFileSync, writeFileSync, statSync, existsSync, mkdirSync, copyFileSync } from 'fs'
 import { join, extname, basename, dirname, resolve, relative, isAbsolute } from 'path'
+
+const execFileAsync = promisify(execFile)
 import type { IPty } from 'node-pty'
 import { getDb, getDbPath } from './db'
 import * as projects from './projects'
@@ -14,20 +18,19 @@ import {
   runClaudeCode,
   summarizeRun,
   tryCreateCheckpoint,
-  gitResetHard,
-  type CCEvent
+  gitResetHard
 } from './claudecode'
-import { checkCodex, runCodex, summarizeCodexRun, type CodexEvent, type CodexSandboxMode } from './codex'
+import { checkCodex, runCodex, summarizeCodexRun } from './codex'
 import { buildKimiPtyCommand, checkKimi, fakeKimiSessionLines, resolveKimiBin } from './kimi'
 import {
   checkMcpServer,
   getActiveMcpServers,
   getClaudeConfigPath,
   getEnabledState,
+  knowledgeMcpLaunchConfig,
   readMcpServers,
   setEnabledState,
-  writeMcpServers,
-  type McpServerConfig
+  writeMcpServers
 } from './mcp'
 import {
   checkHermes,
@@ -41,11 +44,7 @@ import {
   getHermesPermissionMode,
   setHermesPermissionMode,
   respondHermesPermission,
-  bumpHermesSessionOverride,
-  type HermesEvent,
-  type RemoteHermesConfig,
-  type HermesPermissionMode,
-  type HermesActionKind
+  bumpHermesSessionOverride
 } from './hermes'
 import { installSkillFromHub, listSkills, searchSkillsHub, toggleSkill } from './hermesSkills'
 import { getTodayUsage, recordUsage } from './usage'
@@ -58,6 +57,83 @@ import {
   type WebCompanionConfig
 } from './webCompanion'
 import { detectCliTools, markSetupWizardComplete, setupWizardComplete } from './setup'
+import type {
+  ChatClassifyHandoffRequest,
+  ActivityEntry,
+  ChatDoneEvent,
+  ChatErrorEvent,
+  ChatGenerateHandoffPromptRequest,
+  ChatModelMessage,
+  ChatSendRequest,
+  ChatTokenEvent,
+  ChatUsageEvent,
+  Checkpoint,
+  CheckpointEvent,
+  CheckpointResult,
+  ClaudeCodeCheck,
+  ClaudeCodeDoneEvent,
+  ClaudeCodeIpcEvent,
+  ClaudeCodeSendRequest,
+  CodexCheck,
+  CodexDoneEvent,
+  CodexIpcEvent,
+  CodexSandboxMode,
+  CodexSendRequest,
+  DeleteAfterResponse,
+  DockPanel,
+  FileAttachment,
+  FileCopyResponse,
+  FsEntry,
+  FsReadFileResponse,
+  FsWriteFileResponse,
+  GitStatusResponse,
+  HermesDoneEvent,
+  HermesCheck,
+  HermesIpcEvent,
+  HermesPermissionMode,
+  HermesRespondPermissionRequest,
+  HermesSendRequest,
+  HermesUsageEvent,
+  HandoffClassification,
+  HermesSkillsInstallResponse,
+  HermesSkillsListResponse,
+  HermesSkillsSearchResponse,
+  HermesSkillsToggleResponse,
+  IndexUpdatedEvent,
+  InstructionsReadResponse,
+  InstructionsWriteResponse,
+  LayoutNode,
+  LayoutPreset,
+  McpCheckResult,
+  McpServer,
+  McpServerConfig,
+  MemoryItem,
+  MemorySaveRequest,
+  MemorySavedEvent,
+  CloudModelsResponse,
+  Message,
+  MutationResponse,
+  OllamaStatus,
+  Project,
+  RegistrySearchResponse,
+  RemoteHermesConfig,
+  RemovedCount,
+  ResearchProgress,
+  ResearchStartRequest,
+  Session,
+  SettingsDiagnostics,
+  SettingsImportResponse,
+  SettingsSummary,
+  TerminalCreateResponse,
+  TerminalDataEvent,
+  TerminalExitEvent,
+  TipStats,
+  ToolDetection,
+  UsageSummaryRow,
+  WebCompanionConfigureRequest,
+  WebCompanionRegenerateResponse,
+  WebCompanionStatus
+} from '../shared/ipcTypes'
 
 // ---- PTY lifecycle (Phase F) ----
 interface PtyEntry { pty: IPty; win: BrowserWindow | null }
@@ -119,8 +195,8 @@ function listWorkspaceDir(projectPath: string, inputPath: string): ChatFileToolR
         path: `${normalized.rel}/${entry.name}`.replace(/^\.\//, '')
       }))
     return { ok: true, tool: 'list_dir', path: normalized.rel, entries }
-  } catch (err: any) {
-    return { ok: false, tool: 'list_dir', path: normalized.rel, error: String(err?.message ?? err) }
+  } catch (err: unknown) {
+    return { ok: false, tool: 'list_dir', path: normalized.rel, error: errorMessage(err) }
   }
 }
 
@@ -134,8 +210,8 @@ function readWorkspaceFile(projectPath: string, inputPath: string): ChatFileTool
     const buf = readFileSync(normalized.target)
     if (isBinaryBuffer(buf)) return { ok: false, tool: 'read_file', path: normalized.rel, error: 'Binary files are not readable in chat.' }
     return { ok: true, tool: 'read_file', path: normalized.rel, content: buf.toString('utf-8'), size: stat.size }
-  } catch (err: any) {
-    return { ok: false, tool: 'read_file', path: normalized.rel, error: String(err?.message ?? err) }
+  } catch (err: unknown) {
+    return { ok: false, tool: 'read_file', path: normalized.rel, error: errorMessage(err) }
   }
 }
 
@@ -149,8 +225,8 @@ function writeWorkspaceFile(projectPath: string, inputPath: string, content: str
     mkdirSync(dirname(normalized.target), { recursive: true })
     writeFileSync(normalized.target, content, 'utf-8')
     return { ok: true, tool: 'write_file', path: normalized.rel, size: Buffer.byteLength(content, 'utf-8') }
-  } catch (err: any) {
-    return { ok: false, tool: 'write_file', path: normalized.rel, error: String(err?.message ?? err) }
+  } catch (err: unknown) {
+    return { ok: false, tool: 'write_file', path: normalized.rel, error: errorMessage(err) }
   }
 }
 
@@ -287,7 +363,8 @@ function emitActivity(
   source: 'CHAT' | 'HERMES' | 'CODE' | 'INDEXER' | 'MEMORY' | 'RESEARCH',
   message: string
 ) {
-  win?.webContents.send('activity:log', { source, message, timestamp: Date.now() })
+  const payload: ActivityEntry = { source, message, timestamp: Date.now() }
+  win?.webContents.send('activity:log', payload)
 }
 
 type SettingKind = 'string' | 'number' | 'boolean' | 'select' | 'secret'
@@ -340,6 +417,24 @@ function deleteMeta(key: string): void {
   getDb().prepare('DELETE FROM app_meta WHERE key = ?').run(key)
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+// Per-project "is this a git repo?" cache. The Navigator polls git status on a
+// timer, so without this a non-git project spawns a failing `git` subprocess on
+// every tick — spamming "fatal: not a git repository" and blocking on execSync.
+// A cheap fs.existsSync(.git) check gates the spawn; the result is memoized for
+// the app session (re-checked only when a project path is first seen).
+const gitRepoCache = new Map<string, boolean>()
+function isGitRepo(projectPath: string): boolean {
+  const cached = gitRepoCache.get(projectPath)
+  if (cached !== undefined) return cached
+  const result = Boolean(projectPath) && existsSync(join(projectPath, '.git'))
+  gitRepoCache.set(projectPath, result)
+  return result
+}
+
 function validateSetting(def: SettingDefinition, rawValue: string): string {
   const value = String(rawValue ?? '')
   if (def.kind === 'boolean') return value === 'true' ? 'true' : 'false'
@@ -377,7 +472,7 @@ function secretStatus(key: string): { configured: boolean; masked: string | null
   return { configured: true, masked: `•••• ${tail}` }
 }
 
-function buildSettingsSnapshot() {
+function buildSettingsSnapshot(): SettingsSummary {
   const values: Record<string, string | null> = {}
   const secrets: Record<string, { configured: boolean; masked: string | null }> = {}
   for (const def of Object.values(SETTING_DEFINITIONS)) {
@@ -387,17 +482,18 @@ function buildSettingsSnapshot() {
   return { values, secrets }
 }
 
-async function buildDiagnosticsReport() {
+async function buildDiagnosticsReport(): Promise<SettingsDiagnostics> {
   const db = getDb()
   const projectCount = (db.prepare('SELECT COUNT(*) AS n FROM projects').get() as { n: number } | undefined)?.n ?? 0
   const sessionCount = (db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number } | undefined)?.n ?? 0
   const memoryCount = (db.prepare('SELECT COUNT(*) AS n FROM memory_items').get() as { n: number } | undefined)?.n ?? 0
+  const knowledgeDiagnostics = knowledge.getKnowledgeDiagnostics(null)
   const [ollama, codex, claude, kimi, hermes] = await Promise.all([
-    ollamaStatus().catch((e: any) => ({ connected: false, defaultModel: null, error: String(e?.message ?? e) })),
-    checkCodex().catch((e: any) => ({ installed: false, error: String(e?.message ?? e) })),
-    checkClaudeCode().catch((e: any) => ({ installed: false, error: String(e?.message ?? e) })),
-    checkKimi().catch((e: any) => ({ installed: false, error: String(e?.message ?? e) })),
-    checkHermes().catch((e: any) => ({ wsl2: false, installed: false, connected: false, error: String(e?.message ?? e) })),
+    ollamaStatus().catch((e: unknown) => ({ connected: false, defaultModel: null, error: errorMessage(e) })),
+    checkCodex().catch((e: unknown) => ({ installed: false, error: errorMessage(e) })),
+    checkClaudeCode().catch((e: unknown) => ({ installed: false, error: errorMessage(e) })),
+    checkKimi().catch((e: unknown) => ({ installed: false, error: errorMessage(e) })),
+    checkHermes().catch((e: unknown) => ({ wsl2: false, installed: false, connected: false, error: errorMessage(e) })),
   ])
   return {
     app: {
@@ -411,6 +507,7 @@ async function buildDiagnosticsReport() {
       databasePath: getDbPath(),
     },
     counts: { projects: projectCount, sessions: sessionCount, memories: memoryCount },
+    knowledge: knowledgeDiagnostics,
     providers: { ollama, codex, claudeCode: claude, kimi, hermes },
     webCompanion: (() => {
       const status = getWebCompanionStatus()
@@ -432,7 +529,7 @@ async function buildDiagnosticsReport() {
 
 export function registerIpc(): void {
   // ---- filesystem (Phase D: Navigator file tree) ----
-  ipcMain.handle('fs:readDir', (_e, dirPath: string) => {
+  ipcMain.handle('fs:readDir', (_e, dirPath: string): FsEntry[] => {
     try {
       return readdirSync(dirPath, { withFileTypes: true })
         .filter(e => !FS_IGNORE.has(e.name) && !e.name.endsWith('.map'))
@@ -447,7 +544,7 @@ export function registerIpc(): void {
   })
 
   // Phase E: read/write files for the Editor panel
-  ipcMain.handle('fs:readFile', (_e, filePath: string) => {
+  ipcMain.handle('fs:readFile', (_e, filePath: string): FsReadFileResponse => {
     try {
       const stat = statSync(filePath)
       if (stat.size > 500 * 1024) return { error: 'File too large (>500KB)' }
@@ -457,22 +554,22 @@ export function registerIpc(): void {
         if (buf[i] === 0) return { error: 'Binary file' }
       }
       return { content: buf.toString('utf-8'), size: stat.size }
-    } catch (e: any) {
-      return { error: String(e?.message ?? e) }
+    } catch (e: unknown) {
+      return { error: errorMessage(e) }
     }
   })
 
-  ipcMain.handle('fs:writeFile', (_e, filePath: string, content: string) => {
+  ipcMain.handle('fs:writeFile', (_e, filePath: string, content: string): FsWriteFileResponse => {
     try {
       writeFileSync(filePath, content, 'utf-8')
       return { success: true }
-    } catch (e: any) {
-      return { error: String(e?.message ?? e) }
+    } catch (e: unknown) {
+      return { error: errorMessage(e) }
     }
   })
 
   // ---- file picker & reader ----
-  ipcMain.handle('files:pick', async () => {
+  ipcMain.handle('files:pick', async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],
       filters: [{ name: 'All Files', extensions: ['*'] }]
@@ -480,7 +577,7 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0]
   })
 
-  ipcMain.handle('files:read', async (_e, filePath: string) => {
+  ipcMain.handle('files:read', async (_e, filePath: string): Promise<FileAttachment> => {
     const stats = statSync(filePath)
     if (stats.size > 10 * 1024 * 1024) throw new Error('File too large (max 10MB)')
     const ext = extname(filePath).toLowerCase()
@@ -504,7 +601,7 @@ export function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('files:copyToProject', async (_e, sourcePath: string, projectPath: string) => {
+  ipcMain.handle('files:copyToProject', async (_e, sourcePath: string, projectPath: string): Promise<FileCopyResponse> => {
     try {
       const tmpDir = join(projectPath, '.ai-workspace-tmp')
       mkdirSync(tmpDir, { recursive: true })
@@ -518,32 +615,32 @@ export function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('ollama:analyzeImage', (_e, model: string, base64: string, mimeType: string, prompt: string) =>
+  ipcMain.handle('ollama:analyzeImage', (_e, model: string, base64: string, mimeType: string, prompt: string): Promise<string | null> =>
     analyzeImage(model, base64, mimeType, prompt)
   )
 
   // ---- projects ----
-  ipcMain.handle('projects:list', () => projects.listProjects())
-  ipcMain.handle('projects:global', () => projects.openProject(GLOBAL_PROJECT_ID))
-  ipcMain.handle('projects:create', (_e, name: string, parentDir: string) =>
+  ipcMain.handle('projects:list', (): Project[] => projects.listProjects())
+  ipcMain.handle('projects:global', (): Project => projects.openProject(GLOBAL_PROJECT_ID))
+  ipcMain.handle('projects:create', (_e, name: string, parentDir: string): Project =>
     projects.createProject(name, parentDir)
   )
-  ipcMain.handle('projects:import', async () => {
+  ipcMain.handle('projects:import', async (): Promise<Project | null> => {
     const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
     if (result.canceled || result.filePaths.length === 0) return null
     return projects.importFolder(result.filePaths[0])
   })
-  ipcMain.handle('projects:open', (_e, id: string) => {
+  ipcMain.handle('projects:open', (_e, id: string): Project => {
     const project = projects.openProject(id)
     // The global workspace is a DB sentinel, not a folder-backed project.
     // Never start the file watcher/indexer for it.
     if (!isGlobalProjectId(project.id)) startWatcher(project.id, project.path)
     return project
   })
-  ipcMain.handle('projects:archive', (_e, id: string, archived: boolean) =>
+  ipcMain.handle('projects:archive', (_e, id: string, archived: boolean): void =>
     projects.setArchived(id, archived)
   )
-  ipcMain.handle('projects:pickFolder', async () => {
+  ipcMain.handle('projects:pickFolder', async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
     return result.canceled ? null : result.filePaths[0]
   })
@@ -551,7 +648,7 @@ export function registerIpc(): void {
   // ---- project links (cross-project knowledge web) ----
   // Directed edges in project_links; the "related" memory search scope and the
   // Knowledge panel's Related Projects section both read from this table.
-  ipcMain.handle('projects:getLinks', (_e, projectId: string) =>
+  ipcMain.handle('projects:getLinks', (_e, projectId: string): Project[] =>
     getDb()
       .prepare(
         `SELECT p.* FROM project_links l
@@ -559,10 +656,10 @@ export function registerIpc(): void {
          WHERE l.src_project_id = ?
          ORDER BY p.name COLLATE NOCASE`
       )
-      .all(projectId)
+      .all(projectId) as Project[]
   )
 
-  ipcMain.handle('projects:addLink', (_e, srcId: string, dstId: string) => {
+  ipcMain.handle('projects:addLink', (_e, srcId: string, dstId: string): MutationResponse => {
     try {
       if (srcId === dstId) return { success: false, error: 'Cannot link a project to itself' }
       getDb()
@@ -575,7 +672,7 @@ export function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('projects:removeLink', (_e, srcId: string, dstId: string) => {
+  ipcMain.handle('projects:removeLink', (_e, srcId: string, dstId: string): MutationResponse => {
     try {
       getDb()
         .prepare(`DELETE FROM project_links WHERE src_project_id = ? AND dst_project_id = ?`)
@@ -587,7 +684,7 @@ export function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('projects:getAvailableLinkTargets', (_e, projectId: string) =>
+  ipcMain.handle('projects:getAvailableLinkTargets', (_e, projectId: string): Project[] =>
     getDb()
       .prepare(
         `SELECT * FROM projects
@@ -595,63 +692,64 @@ export function registerIpc(): void {
          AND id NOT IN (SELECT dst_project_id FROM project_links WHERE src_project_id = ?)
          ORDER BY name COLLATE NOCASE`
       )
-      .all(projectId, GLOBAL_PROJECT_ID, projectId)
+      .all(projectId, GLOBAL_PROJECT_ID, projectId) as Project[]
   )
 
   // ---- models ----
-  ipcMain.handle('models:list', () => listModels())
-  ipcMain.handle('models:listCloud', async () => {
+  ipcMain.handle('models:list', (): Promise<string[]> => listModels())
+  ipcMain.handle('models:listCloud', async (): Promise<CloudModelsResponse> => {
     try {
       const row = getDb().prepare('SELECT value FROM app_meta WHERE key = ?').get('ollama_cloud_key') as { value: string } | undefined
       const apiKey = row?.value
-      if (!apiKey) return []
+      if (!apiKey) return { success: true, models: [] }
       const res = await fetch('https://ollama.com/v1/models', {
         headers: { Authorization: `Bearer ${apiKey}` },
         signal: AbortSignal.timeout(10000)
       })
-      if (!res.ok) return []
+      if (!res.ok) return { success: false, error: `Ollama Cloud returned HTTP ${res.status}` }
       const data = await res.json() as { data?: { id: string }[] }
-      return (data.data ?? [])
+      const models = (data.data ?? [])
         .map((m) => ({ id: m.id, name: m.id }))
         .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
-    } catch {
-      return []
+      return { success: true, models }
+    } catch (err: unknown) {
+      return { success: false, error: errorMessage(err) }
     }
   })
-  ipcMain.handle('ollama:status', () => ollamaStatus())
+  ipcMain.handle('ollama:status', (): Promise<OllamaStatus> => ollamaStatus())
   // One-shot, non-streaming completion (offline-tolerant; returns null if the
   // host/model is unavailable). Routed through ollama.ts like all model access —
   // used for side calls such as the Chat tab's follow-up suggestions. Read-only:
   // it never touches sessions or the DB.
-  ipcMain.handle('ollama:complete', (_e, model: string, messages: ChatMessage[], timeoutMs?: number) =>
+  ipcMain.handle('ollama:complete', (_e, model: string, messages: ChatModelMessage[], timeoutMs?: number): Promise<string | null> =>
     chat(model, messages, timeoutMs)
   )
 
   // ---- MCP server registry ----------------------------------------------------
   // Claude Desktop's config remains the source of truth. This app only tracks
   // local UI enabled/disabled state in app_meta.
-  ipcMain.handle('mcp:list', async () => {
+  ipcMain.handle('mcp:list', async (): Promise<McpServer[]> => {
     const servers = readMcpServers()
     const enabled = getEnabledState()
     return Object.entries(servers).map(([name, config]) => ({
       name,
       config,
       enabled: enabled[name] !== false,
-      transport: config.url ? (config.type || 'sse') : 'stdio',
+      transport: config.url ? (config.type === 'http' ? 'http' : 'sse') : 'stdio',
       status: 'unknown',
       statusMessage: undefined,
       lastChecked: undefined
     }))
   })
 
-  ipcMain.handle('mcp:add', async (_e, name: string, config: McpServerConfig) => {
+  ipcMain.handle('mcp:add', async (_e, name: string, config: McpServerConfig): Promise<MutationResponse> => {
     const servers = readMcpServers()
     servers[name] = config
     writeMcpServers(servers)
     return { success: true }
   })
 
-  ipcMain.handle('mcp:remove', async (_e, name: string) => {
+  ipcMain.handle('mcp:remove', async (_e, name: string): Promise<MutationResponse> => {
     const servers = readMcpServers()
     delete servers[name]
     writeMcpServers(servers)
@@ -662,22 +760,22 @@ export function registerIpc(): void {
     return { success: true }
   })
 
-  ipcMain.handle('mcp:setEnabled', async (_e, name: string, enabled: boolean) => {
+  ipcMain.handle('mcp:setEnabled', async (_e, name: string, enabled: boolean): Promise<MutationResponse> => {
     const state = getEnabledState()
     state[name] = enabled
     setEnabledState(state)
     return { success: true }
   })
 
-  ipcMain.handle('mcp:check', async (_e, name: string) => {
+  ipcMain.handle('mcp:check', async (_e, name: string): Promise<McpCheckResult> => {
     const servers = readMcpServers()
     if (!servers[name]) return { status: 'error', message: 'Server not found' }
     return checkMcpServer(name, servers[name])
   })
 
-  ipcMain.handle('mcp:checkAll', async () => {
+  ipcMain.handle('mcp:checkAll', async (): Promise<Record<string, McpCheckResult>> => {
     const servers = readMcpServers()
-    const results: Record<string, { status: string; message: string }> = {}
+    const results: Record<string, McpCheckResult> = {}
     await Promise.all(
       Object.entries(servers).map(async ([name, config]) => {
         results[name] = await checkMcpServer(name, config)
@@ -686,26 +784,33 @@ export function registerIpc(): void {
     return results
   })
 
-  ipcMain.handle('mcp:getConfigPath', () => getClaudeConfigPath())
+  ipcMain.handle('mcp:getConfigPath', (): string => getClaudeConfigPath())
 
   // Real on-disk path of the bundled knowledge MCP server, so the Extensions
   // quick-add never inserts a placeholder into the live config.
-  ipcMain.handle('mcp:getKnowledgeServerPath', () =>
+  ipcMain.handle('mcp:getKnowledgeServerPath', (): string =>
     join(app.getAppPath(), 'out', 'mcp', 'server.cjs')
   )
 
+  // Full launch config for the bundled knowledge server (Electron-as-Node so it
+  // loads the Electron-ABI better-sqlite3). The Extensions quick-add uses this
+  // instead of hardcoding `node`, which would load a mismatched native binary.
+  ipcMain.handle('mcp:getKnowledgeServerConfig', (): McpServerConfig =>
+    knowledgeMcpLaunchConfig(join(app.getAppPath(), 'out', 'mcp', 'server.cjs'), app.getPath('userData'))
+  )
+
   // ---- sessions / chat ----
-  ipcMain.handle('sessions:list', (_e, projectId: string, mode: string) =>
+  ipcMain.handle('sessions:list', (_e, projectId: string, mode: string): Session[] =>
     getDb()
       .prepare(`SELECT * FROM sessions WHERE project_id = ? AND mode = ? AND archived = 0 ORDER BY created_at DESC`)
-      .all(projectId, mode)
+      .all(projectId, mode) as Session[]
   )
-  ipcMain.handle('sessions:listArchived', (_e, projectId: string, mode: string) =>
+  ipcMain.handle('sessions:listArchived', (_e, projectId: string, mode: string): Session[] =>
     getDb()
       .prepare(`SELECT * FROM sessions WHERE project_id = ? AND mode = ? AND archived = 1 ORDER BY created_at DESC`)
-      .all(projectId, mode)
+      .all(projectId, mode) as Session[]
   )
-  ipcMain.handle('sessions:create', (_e, projectId: string, mode: string, title: string) => {
+  ipcMain.handle('sessions:create', (_e, projectId: string, mode: string, title: string): Session => {
     // Callers destructure the returned Session, so keep that contract; on DB
     // failure, reject with a readable message instead of a cryptic SQL error.
     try {
@@ -724,7 +829,7 @@ export function registerIpc(): void {
   // Regenerate the one-line session summary from its last ~10 messages via a
   // local Ollama model. Best-effort and silent: any failure returns null so the
   // renderer keeps showing whatever summary (or none) it already has.
-  ipcMain.handle('sessions:generateSummary', async (_e, sessionId: string, model: string) => {
+  ipcMain.handle('sessions:generateSummary', async (_e, sessionId: string, model: string): Promise<string | null> => {
     try {
       const db = getDb()
       const rows = db
@@ -749,7 +854,7 @@ export function registerIpc(): void {
       return null
     }
   })
-  ipcMain.handle('sessions:rename', (_e, id: string, title: string) => {
+  ipcMain.handle('sessions:rename', (_e, id: string, title: string): MutationResponse => {
     try {
       getDb().prepare(`UPDATE sessions SET title = ? WHERE id = ?`).run(title, id)
       return { success: true }
@@ -758,7 +863,7 @@ export function registerIpc(): void {
       return { success: false, error: String(err) }
     }
   })
-  ipcMain.handle('sessions:archive', (_e, id: string, archived: boolean) => {
+  ipcMain.handle('sessions:archive', (_e, id: string, archived: boolean): MutationResponse => {
     try {
       getDb().prepare(`UPDATE sessions SET archived = ? WHERE id = ?`).run(archived ? 1 : 0, id)
       return { success: true }
@@ -767,7 +872,7 @@ export function registerIpc(): void {
       return { success: false, error: String(err) }
     }
   })
-  ipcMain.handle('sessions:delete', (_e, id: string) => {
+  ipcMain.handle('sessions:delete', (_e, id: string): MutationResponse => {
     try {
       const db = getDb()
       db.prepare(`DELETE FROM messages WHERE session_id = ?`).run(id)
@@ -778,13 +883,13 @@ export function registerIpc(): void {
       return { success: false, error: String(err) }
     }
   })
-  ipcMain.handle('messages:list', (_e, sessionId: string) =>
-    getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId)
+  ipcMain.handle('messages:list', (_e, sessionId: string): Message[] =>
+    getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId) as Message[]
   )
 
   // ---- Message-level interactions (edit-resend, regenerate, reactions) ----
   // Shared across all four agent tabs — they all read/write the same messages table.
-  ipcMain.handle('messages:update', (_e, id: string, content: string) => {
+  ipcMain.handle('messages:update', (_e, id: string, content: string): MutationResponse => {
     try {
       getDb().prepare(`UPDATE messages SET content = ? WHERE id = ?`).run(content, id)
       return { success: true }
@@ -797,7 +902,7 @@ export function registerIpc(): void {
   // Used by edit-resend (fork the conversation after an edited message) and by
   // regenerate (drop the last assistant turn, keeping the user message that
   // triggered it, so a resend doesn't insert a duplicate user message).
-  ipcMain.handle('messages:deleteAfter', (_e, sessionId: string, messageId: string) => {
+  ipcMain.handle('messages:deleteAfter', (_e, sessionId: string, messageId: string): DeleteAfterResponse => {
     try {
       const db = getDb()
       const anchor = db.prepare(`SELECT created_at FROM messages WHERE id = ?`).get(messageId) as
@@ -815,7 +920,7 @@ export function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('messages:setReaction', (_e, id: string, reaction: 'up' | 'down' | null) => {
+  ipcMain.handle('messages:setReaction', (_e, id: string, reaction: 'up' | 'down' | null): MutationResponse => {
     try {
       getDb().prepare(`UPDATE messages SET reaction = ? WHERE id = ?`).run(reaction, id)
       return { success: true }
@@ -827,7 +932,7 @@ export function registerIpc(): void {
 
   // Track in-flight chat streams so a Stop can cancel them.
   const chatAborts = new Map<string, AbortController>()
-  ipcMain.handle('chat:abort', (_e, sessionId: string) => {
+  ipcMain.handle('chat:abort', (_e, sessionId: string): void => {
     chatAborts.get(sessionId)?.abort()
   })
 
@@ -835,7 +940,7 @@ export function registerIpc(): void {
   // streams model output to the renderer, persists the assistant message.
   ipcMain.handle(
     'chat:send',
-    async (event, args: { sessionId: string; projectId: string; model: string; content: string; images?: string[]; systemPrefix?: string; regenerateMessageId?: string }) => {
+    async (event, args: ChatSendRequest): Promise<string | null> => {
       const db = getDb()
       const win = BrowserWindow.fromWebContents(event.sender)
       const now = Date.now()
@@ -935,20 +1040,23 @@ export function registerIpc(): void {
           const apiKey = keyRow?.value ?? ''
           for await (const token of streamCloudChat(cloudModel, messages, apiKey, controller.signal)) {
             full += token
-            win?.webContents.send('chat:token', { sessionId: args.sessionId, token })
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token }
+            win?.webContents.send('chat:token', payload)
           }
         } else {
           for await (const token of streamChat(args.model, messages, controller.signal)) {
             full += token
-            win?.webContents.send('chat:token', { sessionId: args.sessionId, token })
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token }
+            win?.webContents.send('chat:token', payload)
           }
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         // A user-initiated Stop arrives as an abort: keep the partial text
         // (persisted below) and finish cleanly instead of reporting an error.
         if (!controller.signal.aborted) {
           chatAborts.delete(args.sessionId)
-          win?.webContents.send('chat:error', { sessionId: args.sessionId, error: String(err?.message ?? err) })
+          const payload: ChatErrorEvent = { sessionId: args.sessionId, error: errorMessage(err) }
+          win?.webContents.send('chat:error', payload)
           return null
         }
       } finally {
@@ -965,8 +1073,10 @@ export function registerIpc(): void {
       // Estimate total context tokens from all persisted messages in this session.
       const allMsgs = db.prepare('SELECT content FROM messages WHERE session_id = ?').all(args.sessionId) as { content: string }[]
       const estimatedTokens = allMsgs.reduce((sum, m) => sum + Math.ceil(m.content.length / 4), 0)
-      win?.webContents.send('chat:usage', { sessionId: args.sessionId, used: estimatedTokens, max: null })
-      win?.webContents.send('chat:done', { sessionId: args.sessionId })
+      const usagePayload: ChatUsageEvent = { sessionId: args.sessionId, used: estimatedTokens, max: null }
+      const donePayload: ChatDoneEvent = { sessionId: args.sessionId }
+      win?.webContents.send('chat:usage', usagePayload)
+      win?.webContents.send('chat:done', donePayload)
       if (full.trim()) emitActivity(win, 'CHAT', `Response complete (${Math.ceil(full.length / 5)} tokens est.)`)
       return full
     }
@@ -979,8 +1089,8 @@ export function registerIpc(): void {
   // reply degrades to "not a handoff" / empty prompt so the UI never wedges.
   ipcMain.handle(
     'chat:classifyHandoff',
-    async (_e, opts: { model: string; conversationContext: string; userMessage: string }) => {
-      const fallback = { handoff: false, agent: null as string | null, newSession: false }
+    async (_e, opts: ChatClassifyHandoffRequest): Promise<HandoffClassification> => {
+      const fallback: HandoffClassification = { handoff: false, agent: null, newSession: false }
       const classifyPrompt = `Does this message request handing off the
 current plan/conversation to a coding agent as a new prompt?
 
@@ -1007,7 +1117,7 @@ Rules:
           agent?: unknown
           newSession?: unknown
         }
-        const agent = typeof parsed.agent === 'string' && ['claudecode', 'hermes', 'codex'].includes(parsed.agent)
+        const agent = parsed.agent === 'claudecode' || parsed.agent === 'hermes' || parsed.agent === 'codex'
           ? parsed.agent
           : null
         return {
@@ -1023,7 +1133,7 @@ Rules:
 
   ipcMain.handle(
     'chat:generateHandoffPrompt',
-    async (_e, opts: { model: string; agent: 'claudecode' | 'hermes' | 'codex'; conversationHistory: string }) => {
+    async (_e, opts: ChatGenerateHandoffPromptRequest): Promise<string> => {
       const agentContext = {
         claudecode: 'Claude Code, an AI coding agent that works directly in a project folder using tools to read/write files and run commands.',
         hermes: 'Hermes, an autonomous local AI agent that works on tasks with configurable permission levels.',
@@ -1051,36 +1161,56 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   )
 
   // ---- knowledge ----
-  ipcMain.handle('memory:list', (_e, projectId: string | null) => knowledge.listMemory(projectId))
-  ipcMain.handle('memory:save', async (event, input: Parameters<typeof knowledge.saveMemory>[0]) => {
-    const item = await knowledge.saveMemory(input)
+  ipcMain.handle('memory:list', (_e, projectId: string | null): MemoryItem[] => knowledge.listMemory(projectId))
+  ipcMain.handle('memory:save', async (event, input: MemorySaveRequest): Promise<MemoryItem> => {
     const win = BrowserWindow.fromWebContents(event.sender)
+    let item: MemoryItem
+    try {
+      item = await knowledge.saveMemory(input)
+    } catch (err) {
+      if (err instanceof knowledge.MemoryQualityError) {
+        emitActivity(win, 'MEMORY', `Memory skipped: ${err.reason}`)
+      }
+      throw err
+    }
     emitActivity(win, 'MEMORY', `Memory written (${item.type})`)
-    win?.webContents.send('memory:saved', { title: item.title, type: item.type })
+    const payload: MemorySavedEvent = { title: item.title, type: item.type }
+    win?.webContents.send('memory:saved', payload)
     return item
   })
-  ipcMain.handle('memory:delete', (_e, id: string) => knowledge.deleteMemory(id))
-  ipcMain.handle('memory:count', (_e, projectId: string) => knowledge.countMemory(projectId))
-  ipcMain.handle('memory:clearProject', (_e, projectId: string) =>
+  ipcMain.handle('memory:delete', (_e, id: string): Promise<void> => knowledge.deleteMemory(id))
+  ipcMain.handle('memory:touch', (_e, id: string): Promise<void> => knowledge.touchMemory(id))
+  ipcMain.handle('memory:markStale', (_e, id: string, stale: boolean): Promise<void> =>
+    knowledge.markMemoryStale(id, stale)
+  )
+  ipcMain.handle('memory:count', (_e, projectId: string): number => knowledge.countMemory(projectId))
+  ipcMain.handle('memory:clearProject', (_e, projectId: string): Promise<number> =>
     knowledge.clearProjectMemory(projectId)
   )
   ipcMain.handle(
     'memory:search',
-    (_e, query: string, scope: knowledge.SearchScope, projectId: string | null) =>
+    (_e, query: string, scope: knowledge.SearchScope, projectId: string | null): Promise<MemoryItem[]> =>
       knowledge.searchMemory(query, scope, projectId)
+  )
+  ipcMain.handle('memory:diagnostics', (_e, projectId: string | null): knowledge.KnowledgeDiagnostics =>
+    knowledge.getKnowledgeDiagnostics(projectId)
+  )
+  ipcMain.handle('memory:deleteLowQualityCandidates', (_e, projectId: string | null): Promise<number> =>
+    knowledge.deleteLowQualityCandidates(projectId)
   )
 
   // M4: extract durable knowledge from a finished chat session. On success,
   // nudge the Knowledge panel to refresh via the same channel the indexer uses.
-  ipcMain.handle('memory:extract', async (event, projectId: string | null, sessionId: string) => {
+  ipcMain.handle('memory:extract', async (event, projectId: string | null, sessionId: string): Promise<MemoryItem[]> => {
     const items = await extractFromSession(projectId, sessionId)
     if (items.length > 0) {
       const win = BrowserWindow.fromWebContents(event.sender)
-      win?.webContents.send('index:updated', { projectIds: [projectId ?? GLOBAL_PROJECT_ID] })
+      const payload: IndexUpdatedEvent = { projectIds: [projectId ?? GLOBAL_PROJECT_ID] }
+      win?.webContents.send('index:updated', payload)
     }
     return items
   })
-  ipcMain.handle('memory:consolidate', (_e, projectId: string | null) => consolidateMemories(projectId))
+  ipcMain.handle('memory:consolidate', (_e, projectId: string | null): Promise<RemovedCount> => consolidateMemories(projectId))
 
   // ---- Codex panel ----
   // Drives the Codex CLI headless under the user's ChatGPT subscription login.
@@ -1088,15 +1218,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // streamed as structured events and persisted as session messages so past
   // work is reviewable. Command selection and cwd ownership stay in the main
   // process; the renderer provides only project identity, prompt, and sandbox.
-  ipcMain.handle('codex:check', () => checkCodex())
+  ipcMain.handle('codex:check', (): Promise<CodexCheck> => checkCodex())
 
-  ipcMain.handle('codex:messages', (_e, sessionId: string) =>
-    getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId)
+  ipcMain.handle('codex:messages', (_e, sessionId: string): Message[] =>
+    getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId) as Message[]
   )
 
   // Track in-flight Codex runs so a Stop can kill the child process.
   const codexAborts = new Map<string, AbortController>()
-  ipcMain.handle('codex:abort', (_e, sessionId: string) => {
+  ipcMain.handle('codex:abort', (_e, sessionId: string): void => {
     codexAborts.get(sessionId)?.abort()
   })
 
@@ -1104,25 +1234,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'codex:send',
     async (
       event,
-      args: {
-        sessionId: string
-        projectId: string
-        prompt: string
-        sandbox?: CodexSandboxMode
-        skipGitRepoCheck?: boolean
-        model?: string
-        imagePaths?: string[]
-        regenerateMessageId?: string
-      }
-    ) => {
+      args: CodexSendRequest
+    ): Promise<string | null> => {
       const db = getDb()
       const win = BrowserWindow.fromWebContents(event.sender)
       if (isGlobalProjectId(args.projectId)) {
-        win?.webContents.send('codex:done', {
+        const payload: CodexDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Open a project to use Codex.'
-        })
+        }
+        win?.webContents.send('codex:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1157,7 +1279,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         | { path: string }
         | undefined
       if (!project?.path || !existsSync(project.path)) {
-        win?.webContents.send('codex:done', { sessionId: args.sessionId, error: 'Project folder not found.' })
+        const payload: CodexDoneEvent = { sessionId: args.sessionId, error: 'Project folder not found.' }
+        win?.webContents.send('codex:done', payload)
         return null
       }
 
@@ -1178,8 +1301,9 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         imagePaths: args.imagePaths,
         signal: controller.signal,
         threadId: sessionRow?.codex_thread_id ?? undefined,
-        onEvent: (e: CodexEvent) => {
-          win?.webContents.send('codex:event', { sessionId: args.sessionId, event: e })
+        onEvent: (e) => {
+          const payload: CodexIpcEvent = { sessionId: args.sessionId, event: e }
+          win?.webContents.send('codex:event', payload)
           if (e.kind === 'tool') emitActivity(win, 'CODE', `Codex ${e.name}: ${e.summary.slice(0, 80)}`)
           else if (e.kind === 'system') emitActivity(win, 'CODE', `Codex: ${e.summary}`)
           else if (e.kind === 'error') emitActivity(win, 'CODE', `Codex error: ${e.message.slice(0, 80)}`)
@@ -1195,12 +1319,13 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       // the user can enable the trust toggle and resend without cluttered history.
       if (run.trustRequired) {
         if (!args.regenerateMessageId) db.prepare(`DELETE FROM messages WHERE id = ?`).run(userMsgId)
-        win?.webContents.send('codex:done', {
+        const payload: CodexDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           trustRequired: true,
           error: run.error
-        })
+        }
+        win?.webContents.send('codex:done', payload)
         return null
       }
 
@@ -1222,30 +1347,32 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
           tags: ['codex']
         })
         memorySaved = true
-        win?.webContents.send('index:updated', { projectIds: [args.projectId] })
+        const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
+        win?.webContents.send('index:updated', payload)
       }
 
       recordUsage('codex', (args.prompt.length + (run.result || '').length) / 4)
       emitActivity(win, 'CODE', run.ok ? `Codex task complete: ${args.prompt.slice(0, 60)}` : 'Codex task failed')
-      win?.webContents.send('codex:done', {
+      const donePayload: CodexDoneEvent = {
         sessionId: args.sessionId,
         ok: run.ok,
         loginRequired: run.loginRequired ?? false,
         trustRequired: run.trustRequired ?? false,
         memorySaved,
         error: run.ok ? undefined : run.error
-      })
+      }
+      win?.webContents.send('codex:done', donePayload)
       return run.result
     }
   )
 
   // ---- Claude Code (M5) ----
   // Is the CLI installed/usable? (Login state is only knowable from a real run.)
-  ipcMain.handle('claudecode:check', () => checkClaudeCode())
+  ipcMain.handle('claudecode:check', (): Promise<ClaudeCodeCheck> => checkClaudeCode())
 
   // Track in-flight Claude Code runs so a Stop can kill the child process.
   const ccAborts = new Map<string, AbortController>()
-  ipcMain.handle('claudecode:abort', (_e, sessionId: string) => {
+  ipcMain.handle('claudecode:abort', (_e, sessionId: string): void => {
     ccAborts.get(sessionId)?.abort()
   })
 
@@ -1257,25 +1384,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'claudecode:send',
     async (
       event,
-      args: {
-        sessionId: string
-        projectId: string
-        prompt: string
-        injectMemory?: boolean
-        model?: string
-        effort?: 'normal' | 'high' | 'max'
-        thinking?: boolean
-        regenerateMessageId?: string
-      }
-    ) => {
+      args: ClaudeCodeSendRequest
+    ): Promise<string | null> => {
       const db = getDb()
       const win = BrowserWindow.fromWebContents(event.sender)
       if (isGlobalProjectId(args.projectId)) {
-        win?.webContents.send('claudecode:done', {
+        const payload: ClaudeCodeDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Claude Code needs a project folder. Open a project workspace to use it.'
-        })
+        }
+        win?.webContents.send('claudecode:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1312,7 +1431,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         | { path: string }
         | undefined
       if (!project) {
-        win?.webContents.send('claudecode:done', { sessionId: args.sessionId, error: 'Project not found.' })
+        const payload: ClaudeCodeDoneEvent = { sessionId: args.sessionId, error: 'Project not found.' }
+        win?.webContents.send('claudecode:done', payload)
         return null
       }
 
@@ -1332,15 +1452,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       // clean git tree — never against the user's own uncommitted work — and
       // never blocks the task from running either way.
       const checkpointAttempt = await tryCreateCheckpoint(project.path)
-      let checkpointPayload: {
-        sessionId: string
-        messageId: string
-        success: boolean
-        checkpointId?: string
-        commitHash?: string
-        reason?: 'not-git' | 'dirty' | 'error'
-        error?: string
-      }
+      let checkpointPayload: CheckpointEvent
       if (checkpointAttempt.ok) {
         const checkpointId = randomUUID()
         db
@@ -1363,8 +1475,9 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         effort,
         thinking: args.thinking,
         signal: controller.signal,
-        onEvent: (e: CCEvent) => {
-          win?.webContents.send('claudecode:event', { sessionId: args.sessionId, event: e })
+        onEvent: (e) => {
+          const payload: ClaudeCodeIpcEvent = { sessionId: args.sessionId, event: e }
+          win?.webContents.send('claudecode:event', payload)
           if (e.kind === 'tool') emitActivity(win, 'CODE', `${e.name}: ${e.summary.slice(0, 80)}`)
           else if (e.kind === 'system') emitActivity(win, 'CODE', e.summary.slice(0, 80))
           else if (e.kind === 'error') emitActivity(win, 'CODE', `Error: ${e.message.slice(0, 80)}`)
@@ -1391,18 +1504,20 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
           tags: ['claudecode']
         })
         memorySaved = true
-        win?.webContents.send('index:updated', { projectIds: [args.projectId] })
+        const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
+        win?.webContents.send('index:updated', payload)
       }
 
       recordUsage('claudecode', (args.prompt.length + (run.result || '').length) / 4)
       emitActivity(win, 'CODE', run.ok ? `Task complete: ${args.prompt.slice(0, 60)}` : `Task failed`)
-      win?.webContents.send('claudecode:done', {
+      const donePayload: ClaudeCodeDoneEvent = {
         sessionId: args.sessionId,
         ok: run.ok,
         loginRequired: run.loginRequired ?? false,
         memorySaved,
         error: run.ok ? undefined : run.error
-      })
+      }
+      win?.webContents.send('claudecode:done', donePayload)
       return run.result
     }
   )
@@ -1410,7 +1525,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // ---- Claude Code checkpoints (git-based rollback) ----
   // checkpoints:create is also exposed directly for completeness/manual use;
   // the normal path is automatic, inside claudecode:send above.
-  ipcMain.handle('checkpoints:create', async (_e, sessionId: string, projectPath: string, description: string) => {
+  ipcMain.handle('checkpoints:create', async (_e, sessionId: string, projectPath: string, description: string): Promise<CheckpointResult> => {
     const attempt = await tryCreateCheckpoint(projectPath)
     if (!attempt.ok) return { success: false, reason: attempt.reason, error: attempt.error }
     const id = randomUUID()
@@ -1422,13 +1537,13 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     return { success: true, commitHash: attempt.commitHash }
   })
 
-  ipcMain.handle('checkpoints:list', (_e, sessionId: string) =>
+  ipcMain.handle('checkpoints:list', (_e, sessionId: string): Checkpoint[] =>
     getDb()
       .prepare(`SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC`)
-      .all(sessionId)
+      .all(sessionId) as Checkpoint[]
   )
 
-  ipcMain.handle('checkpoints:rollback', async (_e, checkpointId: string) => {
+  ipcMain.handle('checkpoints:rollback', async (_e, checkpointId: string): Promise<MutationResponse> => {
     const row = getDb().prepare(`SELECT * FROM checkpoints WHERE id = ?`).get(checkpointId) as
       | { project_path: string; commit_hash: string }
       | undefined
@@ -1440,14 +1555,14 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // Hermes runs in WSL2 via `hermes acp --accept-hooks` (stdin/stdout JSON-RPC).
   // No HTTP server or polling; one long-lived process shared across sessions.
 
-  ipcMain.handle('hermes:check', () => checkHermes())
+  ipcMain.handle('hermes:check', (): Promise<HermesCheck> => checkHermes())
 
   // Cheap connected-state query for the poll loop — returns immediately without
   // spawning wsl.exe when the ACP process is already alive.
-  ipcMain.handle('hermes:health', () => ({ ok: hermesConnected() }))
+  ipcMain.handle('hermes:health', (): { ok: boolean } => ({ ok: hermesConnected() }))
 
   // Explicit connect (called by the "Connect" button in the UI).
-  ipcMain.handle('hermes:connect', async (_e, distro?: string) => {
+  ipcMain.handle('hermes:connect', async (_e, distro?: string): Promise<{ connected: boolean; version?: string; error?: string }> => {
     const check = await checkHermes()
     return connectHermes(distro ?? check.distro ?? 'Ubuntu')
   })
@@ -1456,7 +1571,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   ipcMain.handle('hermes:getConfig', (): RemoteHermesConfig => getHermesConfig())
 
   // Write all hermes_* config keys to app_meta; disconnect any active connection.
-  ipcMain.handle('hermes:setConfig', (_e, config: RemoteHermesConfig) => {
+  ipcMain.handle('hermes:setConfig', (_e, config: RemoteHermesConfig): void => {
     const db = getDb()
     const set = (key: string, value: string) =>
       db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run(key, value)
@@ -1469,7 +1584,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   // Test SSH reachability using the provided (or stored) config.
-  ipcMain.handle('hermes:testConnection', async (_e, config?: RemoteHermesConfig) =>
+  ipcMain.handle('hermes:testConnection', async (_e, config?: RemoteHermesConfig): Promise<{ success: boolean; error?: string }> =>
     testHermesConnection(config)
   )
 
@@ -1478,7 +1593,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // live in-memory inside hermes.ts, scoped to our own session id.
   ipcMain.handle('hermes:getPermissionMode', (): HermesPermissionMode => getHermesPermissionMode())
 
-  ipcMain.handle('hermes:setPermissionMode', (_e, mode: HermesPermissionMode) => {
+  ipcMain.handle('hermes:setPermissionMode', (_e, mode: HermesPermissionMode): MutationResponse => {
     setHermesPermissionMode(mode)
     return { success: true }
   })
@@ -1487,8 +1602,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'hermes:respondPermission',
     (
       _e,
-      args: { sessionId: string; requestId: string; approved: boolean; actionKind?: HermesActionKind; alwaysAllowSession?: boolean }
-    ) => {
+      args: HermesRespondPermissionRequest
+    ): MutationResponse => {
       if (args.approved && args.alwaysAllowSession && args.actionKind) {
         bumpHermesSessionOverride(args.sessionId, args.actionKind)
       }
@@ -1499,7 +1614,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
   // Track in-flight runs by our session id so abort can cancel them.
   const hermesAborts = new Map<string, AbortController>()
-  ipcMain.handle('hermes:abort', (_e, sessionId: string) => {
+  ipcMain.handle('hermes:abort', (_e, sessionId: string): void => {
     hermesAborts.get(sessionId)?.abort()
   })
 
@@ -1508,16 +1623,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'hermes:send',
     async (
       event,
-      args: { sessionId: string; projectId: string; prompt: string; injectMemory?: boolean; regenerateMessageId?: string }
-    ) => {
+      args: HermesSendRequest
+    ): Promise<string | null> => {
       const db = getDb()
       const win = BrowserWindow.fromWebContents(event.sender)
       if (isGlobalProjectId(args.projectId)) {
-        win?.webContents.send('hermes:done', {
+        const payload: HermesDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Hermes needs a project folder. Open a project workspace to use it.'
-        })
+        }
+        win?.webContents.send('hermes:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1564,9 +1680,13 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         prompt,
         mcpServers,
         signal: controller.signal,
-        onEvent: (e: HermesEvent) => {
-          win?.webContents.send('hermes:event', { sessionId: args.sessionId, event: e })
-          if (e.kind === 'usage') win?.webContents.send('hermes:usage', { used: e.used, max: e.size })
+        onEvent: (e) => {
+          const payload: HermesIpcEvent = { sessionId: args.sessionId, event: e }
+          win?.webContents.send('hermes:event', payload)
+          if (e.kind === 'usage') {
+            const usagePayload: HermesUsageEvent = { used: e.used, max: e.size }
+            win?.webContents.send('hermes:usage', usagePayload)
+          }
           else if (e.kind === 'activity') emitActivity(win, 'HERMES', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
           else if (e.kind === 'error') emitActivity(win, 'HERMES', `Error: ${e.message.slice(0, 80)}`)
           else if (e.kind === 'model') emitActivity(win, 'HERMES', `Model: ${e.name}`)
@@ -1589,16 +1709,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
           tags: ['hermes']
         })
         memorySaved = true
-        win?.webContents.send('index:updated', { projectIds: [args.projectId] })
+        const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
+        win?.webContents.send('index:updated', payload)
       }
 
       recordUsage('hermes', (args.prompt.length + (run.text || '').length) / 4)
-      win?.webContents.send('hermes:done', {
+      const donePayload: HermesDoneEvent = {
         sessionId: args.sessionId,
         ok: run.ok,
         memorySaved,
         error: run.ok ? undefined : run.error
-      })
+      }
+      win?.webContents.send('hermes:done', donePayload)
       return run.text || null
     }
   )
@@ -1606,7 +1728,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // ---- Hermes skills (Extensions panel Skills tab) ----
   // Talks to the Hermes dashboard HTTP API (port 9119) from the main process;
   // the renderer's CSP blocks direct fetches, same as the MCP registry proxy.
-  ipcMain.handle('hermesSkills:list', async () => {
+  ipcMain.handle('hermesSkills:list', async (): Promise<HermesSkillsListResponse> => {
     try {
       const skills = await listSkills()
       return { success: true, skills }
@@ -1615,7 +1737,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('hermesSkills:toggle', async (_e, name: string, enabled: boolean) => {
+  ipcMain.handle('hermesSkills:toggle', async (_e, name: string, enabled: boolean): Promise<HermesSkillsToggleResponse> => {
     try {
       await toggleSkill(name, enabled)
       return { success: true }
@@ -1624,7 +1746,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('hermesSkills:search', async (_e, query: string) => {
+  ipcMain.handle('hermesSkills:search', async (_e, query: string): Promise<HermesSkillsSearchResponse> => {
     try {
       const results = await searchSkillsHub(query)
       return { success: true, results }
@@ -1633,7 +1755,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('hermesSkills:install', async (_e, identifier: string) => {
+  ipcMain.handle('hermesSkills:install', async (_e, identifier: string): Promise<HermesSkillsInstallResponse> => {
     try {
       const result = await installSkillFromHub(identifier)
       return { success: true, ...result }
@@ -1645,7 +1767,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // ---- Terminal (Phase F) ----
   // node-pty is a native module — use require() so Electron-vite doesn't try to
   // bundle it. It must only be loaded in the main process.
-  ipcMain.handle('terminal:create', (event, projectPath: string | null) => {
+  ipcMain.handle('terminal:create', (event, projectPath: string | null): TerminalCreateResponse => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const nodePty = require('node-pty') as typeof import('node-pty')
     const id = randomUUID()
@@ -1660,28 +1782,30 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       env: process.env as Record<string, string>
     })
     pty.onData((data: string) => {
-      win?.webContents.send('terminal:data', { id, data })
+      const payload: TerminalDataEvent = { id, data }
+      win?.webContents.send('terminal:data', payload)
     })
     pty.onExit(() => {
       ptyMap.delete(id)
-      win?.webContents.send('terminal:exit', { id })
+      const payload: TerminalExitEvent = { id }
+      win?.webContents.send('terminal:exit', payload)
     })
     ptyMap.set(id, { pty, win })
     return { id }
   })
 
-  ipcMain.handle('terminal:write', (_e, id: string, data: string) => {
+  ipcMain.handle('terminal:write', (_e, id: string, data: string): void => {
     ptyMap.get(id)?.pty.write(data)
   })
 
-  ipcMain.handle('terminal:resize', (_e, id: string, cols: number, rows: number) => {
+  ipcMain.handle('terminal:resize', (_e, id: string, cols: number, rows: number): void => {
     const entry = ptyMap.get(id)
     if (entry) {
       try { entry.pty.resize(Math.max(1, cols), Math.max(1, rows)) } catch {}
     }
   })
 
-  ipcMain.handle('terminal:close', (_e, id: string) => {
+  ipcMain.handle('terminal:close', (_e, id: string): void => {
     const entry = ptyMap.get(id)
     if (entry) {
       try { entry.pty.kill() } catch {}
@@ -1690,10 +1814,10 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   // ---- Usage (informational message/task counts, no cost estimates) ----
-  ipcMain.handle('usage:today', () => getTodayUsage())
+  ipcMain.handle('usage:today', (): UsageSummaryRow[] => getTodayUsage())
 
   // ---- Contextual tips (see src/renderer/src/tips.ts for the trigger rules) ----
-  ipcMain.handle('tips:stats', () => {
+  ipcMain.handle('tips:stats', (): TipStats => {
     const db = getDb()
     const byMode = db.prepare('SELECT mode, COUNT(*) as cnt FROM sessions GROUP BY mode').all() as { mode: string; cnt: number }[]
     const chatSessions = byMode.find((r) => r.mode === 'chat')?.cnt ?? 0
@@ -1703,32 +1827,32 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     return { chatSessions, hermesSessions, totalSessions, usedHandoff }
   })
 
-  ipcMain.handle('tips:shownIds', () =>
+  ipcMain.handle('tips:shownIds', (): string[] =>
     (getDb().prepare('SELECT tip_id FROM shown_tips').all() as { tip_id: string }[]).map((r) => r.tip_id)
   )
 
-  ipcMain.handle('tips:markShown', (_e, tipId: string) => {
+  ipcMain.handle('tips:markShown', (_e, tipId: string): void => {
     getDb().prepare('INSERT OR IGNORE INTO shown_tips (tip_id, shown_at, dismissed) VALUES (?, ?, 0)').run(tipId, Date.now())
   })
 
-  ipcMain.handle('tips:dismiss', (_e, tipId: string) => {
+  ipcMain.handle('tips:dismiss', (_e, tipId: string): void => {
     const db = getDb()
     db.prepare('INSERT OR IGNORE INTO shown_tips (tip_id, shown_at, dismissed) VALUES (?, ?, 0)').run(tipId, Date.now())
     db.prepare('UPDATE shown_tips SET dismissed = 1 WHERE tip_id = ?').run(tipId)
   })
 
-  ipcMain.handle('tips:markHandoffUsed', () => writeMeta('used_handoff', 'true'))
+  ipcMain.handle('tips:markHandoffUsed', (): void => writeMeta('used_handoff', 'true'))
 
   // ---- Settings (typed app_meta wrapper; secrets are write-only to renderer) ---
-  ipcMain.handle('settings:get', (_e, key: string) => publicSettingValue(key))
+  ipcMain.handle('settings:get', (_e, key: string): string | null => publicSettingValue(key))
 
-  ipcMain.handle('settings:getMany', (_e, keys: string[]) => {
+  ipcMain.handle('settings:getMany', (_e, keys: string[]): Record<string, string | null> => {
     const out: Record<string, string | null> = {}
     for (const key of keys) out[key] = publicSettingValue(key)
     return out
   })
 
-  ipcMain.handle('settings:set', (_e, key: string, value: string) => {
+  ipcMain.handle('settings:set', (_e, key: string, value: string): void => {
     const def = SETTING_DEFINITIONS[key]
     if (!def) throw new Error(`Unsupported setting: ${key}`)
     const clean = validateSetting(def, value)
@@ -1736,7 +1860,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     else writeMeta(key, clean)
   })
 
-  ipcMain.handle('settings:setMany', (_e, values: Record<string, string>) => {
+  ipcMain.handle('settings:setMany', (_e, values: Record<string, string>): void => {
     for (const [key, value] of Object.entries(values)) {
       const def = SETTING_DEFINITIONS[key]
       if (!def) throw new Error(`Unsupported setting: ${key}`)
@@ -1746,18 +1870,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('settings:delete', (_e, key: string) => {
+  ipcMain.handle('settings:delete', (_e, key: string): void => {
     if (!SETTING_DEFINITIONS[key]) throw new Error(`Unsupported setting: ${key}`)
     deleteMeta(key)
   })
 
-  ipcMain.handle('settings:summary', () => buildSettingsSnapshot())
-  ipcMain.handle('settings:diagnostics', () => buildDiagnosticsReport())
+  ipcMain.handle('settings:summary', (): SettingsSummary => buildSettingsSnapshot())
+  ipcMain.handle('settings:diagnostics', (): Promise<SettingsDiagnostics> => buildDiagnosticsReport())
 
   // Import settings from an exported JSON file. Only known, non-secret setting
   // keys are accepted, and every value passes through the same validation as
   // settings:set. Secrets (keys/tokens/passwords) are never imported.
-  ipcMain.handle('settings:import', (_e, jsonString: string) => {
+  ipcMain.handle('settings:import', (_e, jsonString: string): SettingsImportResponse => {
     try {
       const data = JSON.parse(jsonString)
       if (!data || typeof data !== 'object' || !data.settings || typeof data.settings !== 'object') {
@@ -1788,16 +1912,19 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // ---- Git status (Navigator file tree indicators) -----------------------------
   // Returns porcelain status keyed by repo-relative path (forward slashes).
   // Not a git repo / git missing is a normal state, not an error.
-  ipcMain.handle('git:status', (_e, projectPath: string) => {
+  ipcMain.handle('git:status', async (_e, projectPath: string): Promise<GitStatusResponse> => {
+    // Short-circuit non-repos so we never spawn git for a folder without .git.
+    if (!isGitRepo(projectPath)) return { isGitRepo: false, files: {} }
     try {
-      const { execSync } = require('child_process') as typeof import('child_process')
-      const output = execSync('git status --porcelain', {
+      // Async (execFile, not execSync) so a slow git never blocks the main
+      // process event loop / other IPC while it runs.
+      const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
         cwd: projectPath,
         timeout: 5000,
         windowsHide: true
-      }).toString()
+      })
       const files: Record<string, string> = {}
-      for (const line of output.split('\n')) {
+      for (const line of stdout.split('\n')) {
         if (!line.trim()) continue
         const status = line.substring(0, 2).trim()
         let filePath = line.substring(3).trim()
@@ -1815,15 +1942,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   // ---- Setup wizard (first-run experience) ------------------------------------
-  ipcMain.handle('setup:detectTools', async () => {
+  ipcMain.handle('setup:detectTools', async (): Promise<ToolDetection> => {
     return await detectCliTools()
   })
 
-  ipcMain.handle('setup:isComplete', async () => {
+  ipcMain.handle('setup:isComplete', async (): Promise<boolean> => {
     return await setupWizardComplete()
   })
 
-  ipcMain.handle('setup:markComplete', async (_e, complete?: boolean) => {
+  ipcMain.handle('setup:markComplete', async (_e, complete?: boolean): Promise<void> => {
     return await markSetupWizardComplete(complete !== false)
   })
 
@@ -1831,16 +1958,16 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // Optional mobile Chat surface. This intentionally exposes only its own
   // lifecycle/config controls to the desktop renderer; browser clients get a
   // separate, authenticated, narrow HTTP API in webCompanion.ts.
-  ipcMain.handle('webCompanion:status', () => getWebCompanionStatus())
-  ipcMain.handle('webCompanion:configure', (_e, config: Partial<WebCompanionConfig>) =>
+  ipcMain.handle('webCompanion:status', (): WebCompanionStatus => getWebCompanionStatus())
+  ipcMain.handle('webCompanion:configure', (_e, config: WebCompanionConfigureRequest): Promise<WebCompanionStatus> =>
     configureWebCompanion(config)
   )
-  ipcMain.handle('webCompanion:regenerateToken', () => regenerateWebCompanionToken())
+  ipcMain.handle('webCompanion:regenerateToken', (): WebCompanionRegenerateResponse => regenerateWebCompanionToken())
 
   // ---- Research pipeline ------------------------------------------------------
   let researchController: AbortController | null = null
 
-  ipcMain.handle('research:cancel', () => {
+  ipcMain.handle('research:cancel', (): void => {
     researchController?.abort()
     researchController = null
   })
@@ -1849,22 +1976,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'research:start',
     async (
       event,
-      args: {
-        topic: string
-        scope: 'web' | 'local' | 'both'
-        projectId: string | null
-        saveToProject: boolean
-        quick?: boolean
-      }
-    ) => {
+      args: ResearchStartRequest
+    ): Promise<void> => {
       researchController?.abort()
       researchController = new AbortController()
       const signal = researchController.signal
       const researchWin = BrowserWindow.fromWebContents(event.sender)
 
-      const emit = (stage: string, status: 'running' | 'done' | 'error', detail: string) => {
+      const emit = (stage: ResearchProgress['stage'], status: ResearchProgress['status'], detail: string) => {
         if (event.sender.isDestroyed()) return
-        event.sender.send('research:progress', { stage, status, detail })
+        const payload: ResearchProgress = { stage, status, detail }
+        event.sender.send('research:progress', payload)
         // Mirror stage transitions into the Activity feed (skip 'done'/'error'
         // meta-stages whose detail is the full report / error body).
         if (status === 'running') emitActivity(researchWin, 'RESEARCH', `Stage: ${stage}`)
@@ -1949,13 +2071,13 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
                 seenUrls.add(rUrl)
                 allResults.push({ title: r.title ?? rUrl, url: rUrl, content: r.content ?? '' })
               }
-            } catch (e: any) {
+            } catch (e: unknown) {
               if (signal.aborted) return
               webOk = false
               emit(
                 'search',
                 'error',
-                `SearXNG unreachable: ${e?.message ?? String(e)}. Falling back to local knowledge.`
+                `SearXNG unreachable: ${errorMessage(e)}. Falling back to local knowledge.`
               )
               break
             }
@@ -2148,15 +2270,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
             })
             savedCount++
           }
-        } catch (e: any) {
-          emit('save', 'error', `Save failed: ${e?.message ?? String(e)}`)
+        } catch (e: unknown) {
+          emit('save', 'error', `Save failed: ${errorMessage(e)}`)
         }
 
         if (signal.aborted) return
         emit('save', 'done', `Saved ${savedCount} items to knowledge base`)
         emit('done', 'done', fullReport)
-      } catch (e: any) {
-        if (!signal.aborted) emit('error', 'error', e?.message ?? String(e))
+      } catch (e: unknown) {
+        if (!signal.aborted) emit('error', 'error', errorMessage(e))
       } finally {
         researchController = null
       }
@@ -2164,7 +2286,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   )
 
   // ---- Layout presets ----
-  type StoredPreset = { id: string; name: string; created_at: number; layout: unknown; openIds: string[]; workspaceId: string }
+  type StoredPreset = LayoutPreset
 
   function getStoredPresets(): StoredPreset[] {
     try {
@@ -2176,9 +2298,9 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   }
 
-  ipcMain.handle('presets:list', () => getStoredPresets())
+  ipcMain.handle('presets:list', (): LayoutPreset[] => getStoredPresets())
 
-  ipcMain.handle('presets:save', (_e, name: string, layout: unknown, openIds: string[], workspaceId: string) => {
+  ipcMain.handle('presets:save', (_e, name: string, layout: LayoutNode | null, openIds: DockPanel[], workspaceId: string): LayoutPreset => {
     const all = getStoredPresets()
     const preset: StoredPreset = { id: randomUUID(), name, created_at: Date.now(), layout, openIds, workspaceId }
     all.push(preset)
@@ -2186,21 +2308,21 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     return preset
   })
 
-  ipcMain.handle('presets:load', (_e, id: string) => {
+  ipcMain.handle('presets:load', (_e, id: string): LayoutPreset | null => {
     return getStoredPresets().find(p => p.id === id) ?? null
   })
 
-  ipcMain.handle('presets:delete', (_e, id: string) => {
+  ipcMain.handle('presets:delete', (_e, id: string): void => {
     const filtered = getStoredPresets().filter(p => p.id !== id)
     writeMeta('layout_presets', JSON.stringify(filtered))
   })
 
-  ipcMain.handle('shell:openExternal', async (_e, url: string) => {
+  ipcMain.handle('shell:openExternal', async (_e, url: string): Promise<void> => {
     if (/^https?:\/\//i.test(url)) await shell.openExternal(url)
   })
 
   // ---- Instruction file editor ----
-  ipcMain.handle('instructions:read', async (_e, filePath: string) => {
+  ipcMain.handle('instructions:read', async (_e, filePath: string): Promise<InstructionsReadResponse> => {
     try {
       if (!existsSync(filePath)) return { exists: false, content: '' }
       const content = readFileSync(filePath, 'utf-8')
@@ -2210,7 +2332,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('instructions:write', async (_e, filePath: string, content: string) => {
+  ipcMain.handle('instructions:write', async (_e, filePath: string, content: string): Promise<InstructionsWriteResponse> => {
     try {
       mkdirSync(dirname(filePath), { recursive: true })
       writeFileSync(filePath, content, 'utf-8')
@@ -2220,7 +2342,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   })
 
-  ipcMain.handle('instructions:getPath', async (_e, agentId: string, projectPath: string) => {
+  ipcMain.handle('instructions:getPath', async (_e, agentId: string, projectPath: string): Promise<string | null> => {
     // The app's own CLAUDE.md lives next to the app, wherever it runs from —
     // never a hardcoded absolute path.
     if (agentId === 'app') return join(app.getAppPath(), 'CLAUDE.md')
@@ -2236,7 +2358,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   // ---- MCP Registry proxy (renderer cannot fetch external URLs due to CSP) ----
-  ipcMain.handle('registry:search', async (_e, query: string, cursor: string) => {
+  ipcMain.handle('registry:search', async (_e, query: string, cursor: string): Promise<RegistrySearchResponse> => {
     const base = 'https://registry.modelcontextprotocol.io/v0'
     const cleanQuery = String(query ?? '').trim()
     const cleanCursor = String(cursor ?? '').trim()
@@ -2246,7 +2368,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
     if (process.env.E2E_FAKE_REGISTRY === '1') {
       const fakeQuery = cleanQuery || 'github'
-      return {
+      const fakeResponse: RegistrySearchResponse = {
         servers: [{
           server: {
             id: `mock-${fakeQuery}-${cleanCursor || 'first'}`,
@@ -2260,6 +2382,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         }],
         metadata: { nextCursor: cleanCursor ? null : 'cursor-2' }
       }
+      return fakeResponse
     }
 
     let res: Response
@@ -2268,11 +2391,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         headers: { 'Accept': 'application/json' },
         signal: AbortSignal.timeout(10000)
       })
-    } catch (err: any) {
-      if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+    } catch (err: unknown) {
+      if (err instanceof DOMException && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
         throw new Error('Registry request timed out. Try again in a moment.')
       }
-      throw new Error(`Registry network failure: ${err?.message ?? String(err)}`)
+      throw new Error(`Registry network failure: ${errorMessage(err)}`)
     }
 
     if (!res.ok) throw new Error(`Registry returned HTTP ${res.status}`)
@@ -2284,21 +2407,24 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       throw new Error('Registry returned invalid JSON.')
     }
 
-    if (!data || typeof data !== 'object' || !Array.isArray((data as any).servers)) {
+    if (!data || typeof data !== 'object') {
       throw new Error('Registry returned an unexpected response shape.')
     }
-    const metadata = (data as any).metadata
-    if (metadata !== undefined && (metadata === null || typeof metadata !== 'object')) {
+    const response = data as { servers?: unknown; metadata?: unknown }
+    if (!Array.isArray(response.servers)) {
+      throw new Error('Registry returned an unexpected response shape.')
+    }
+    if (response.metadata !== undefined && (response.metadata === null || typeof response.metadata !== 'object')) {
       throw new Error('Registry returned invalid pagination metadata.')
     }
-    return data
+    return data as RegistrySearchResponse
   })
 
   // A background agent finished while the window wasn't focused — surface a
   // taskbar attention cue. No-op if the window is already focused (the
   // renderer only calls this for background completions, but re-check here
   // in case focus changed between the check and the IPC round-trip).
-  ipcMain.handle('window:notifyActivity', (event) => {
+  ipcMain.handle('window:notifyActivity', (event): void => {
     const win = BrowserWindow.fromWebContents(event.sender)
     if (!win || win.isFocused()) return
     if (process.platform === 'win32') win.flashFrame(true)
@@ -2325,23 +2451,31 @@ async function resolveHermesMcpServers(): Promise<object[]> {
     const { app } = require('electron') as typeof import('electron')
     const path = require('path') as typeof import('path')
 
-    const nodeExe = execSync('where node', { encoding: 'utf8' }).trim().split(/\r?\n/)[0].trim()
-    if (!nodeExe) throw new Error('node not found on PATH')
+    // The server loads the Electron-ABI better-sqlite3 build, so it must run on
+    // Electron's ABI — launch the app's own Electron binary in run-as-node mode
+    // (ELECTRON_RUN_AS_NODE=1) rather than a bare Windows node.exe (whose ABI
+    // would not match the native build). WSL interop execs the Windows exe by
+    // its /mnt path; the server, script path, and db dir stay Windows-side.
+    const electronExe = process.execPath
+    if (!electronExe) throw new Error('electron executable path unavailable')
 
     // checkHermes() is already statically imported; use it to find the active distro.
     const check = await checkHermes()
     const distro = check.distro ?? 'Ubuntu'
 
-    const nodeWsl = execSync(`wsl.exe -d ${distro} wslpath -a "${nodeExe}"`, { encoding: 'utf8' }).trim()
+    const electronWsl = execSync(`wsl.exe -d ${distro} wslpath -a "${electronExe}"`, { encoding: 'utf8' }).trim()
     const serverCjs = path.join(__dirname, '../mcp/server.cjs')
     const serverWin = serverCjs.replace(/\\/g, '/')
     const dbDir = app.getPath('userData').replace(/\\/g, '/')
 
     return [{
       name: 'ai-workspace-knowledge',
-      command: nodeWsl,
+      command: electronWsl,
       args: [serverWin],
-      env: [{ name: 'AIWORKSPACE_DB_DIR', value: dbDir }]
+      env: [
+        { name: 'AIWORKSPACE_DB_DIR', value: dbDir },
+        { name: 'ELECTRON_RUN_AS_NODE', value: '1' }
+      ]
     }]
   } catch (e) {
     console.warn('[hermes] resolveHermesMcpServers failed:', e)
