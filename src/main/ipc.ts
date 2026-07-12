@@ -12,7 +12,7 @@ import * as projects from './projects'
 import * as knowledge from './knowledge'
 import { startWatcher } from './indexer'
 import { extractFromSession, consolidateMemories } from './extractor'
-import { listModels, streamChat, streamCloudChat, cloudChat, chat, defaultChatModel, ollamaStatus, analyzeImage, ChatMessage } from './ollama'
+import { listModels, streamChatParts, streamCloudChatParts, cloudChat, chat, defaultChatModel, ollamaStatus, analyzeImage, ChatMessage } from './ollama'
 import {
   checkClaudeCode,
   runClaudeCode,
@@ -28,10 +28,12 @@ import {
   getClaudeConfigPath,
   getEnabledState,
   knowledgeMcpLaunchConfig,
+  browserMcpLaunchConfig,
   readMcpServers,
   setEnabledState,
   writeMcpServers
 } from './mcp'
+import { browserControlPort, browserControlIdentityToken } from './browserControlServer'
 import {
   checkHermes,
   connectHermes,
@@ -49,6 +51,7 @@ import {
 import { installSkillFromHub, listSkills, searchSkillsHub, toggleSkill } from './hermesSkills'
 import { getTodayUsage, recordUsage } from './usage'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../shared/globalWorkspace'
+import { APP_FONT_VALUES } from '../shared/appFonts'
 import { fallbackTitleFromText, isGenericSessionTitle } from '../shared/sessionTitles'
 import {
   configureWebCompanion,
@@ -57,7 +60,29 @@ import {
   type WebCompanionConfig
 } from './webCompanion'
 import { detectCliTools, markSetupWizardComplete, setupWizardComplete } from './setup'
+import {
+  createBrowserTab,
+  closeBrowserTab,
+  setActiveTab as setActiveBrowserTab,
+  navigateTab as navigateBrowserTab,
+  goBack as browserGoBack,
+  goForward as browserGoForward,
+  reloadTab as reloadBrowserTab,
+  stopTab as stopBrowserTab,
+  setBrowserViewBounds,
+  hideAllBrowserViews,
+  listBrowserTabs,
+  agentGetDownloads,
+  reloadBrowserSessions
+} from './browserPanel'
+import { browserApprovals } from './browserApproval'
 import type {
+  BrowserBounds,
+  BrowserTabListResponse,
+  BrowserDownloadStatus,
+  BrowserApprovalDecision,
+  BrowserApprovalRequest,
+  BrowserApprovalResult,
   ChatClassifyHandoffRequest,
   ActivityEntry,
   ChatDoneEvent,
@@ -87,8 +112,10 @@ import type {
   FsReadFileResponse,
   FsWriteFileResponse,
   GitStatusResponse,
+  HermesActivity,
   HermesDoneEvent,
   HermesCheck,
+  HermesEvent,
   HermesIpcEvent,
   HermesPermissionMode,
   HermesRespondPermissionRequest,
@@ -381,6 +408,7 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   ui_theme: { key: 'ui_theme', kind: 'select', defaultValue: 'system', options: ['system', 'dark', 'light'] },
   ui_density: { key: 'ui_density', kind: 'select', defaultValue: 'comfortable', options: ['comfortable', 'compact'] },
   ui_font_scale: { key: 'ui_font_scale', kind: 'select', defaultValue: '100', options: ['95', '100', '110', '120'] },
+  ui_font_family: { key: 'ui_font_family', kind: 'select', defaultValue: 'default', options: APP_FONT_VALUES },
   ui_motion_mode: { key: 'ui_motion_mode', kind: 'select', defaultValue: 'full', options: ['full', 'reduced', 'off'] },
   ui_reduced_motion: { key: 'ui_reduced_motion', kind: 'boolean', defaultValue: 'false' },
   workspace_startup: { key: 'workspace_startup', kind: 'select', defaultValue: 'last', options: ['last', 'global'] },
@@ -396,6 +424,7 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   editor_tab_size: { key: 'editor_tab_size', kind: 'number', defaultValue: '2' },
   editor_word_wrap: { key: 'editor_word_wrap', kind: 'boolean', defaultValue: 'true' },
   terminal_start_dir: { key: 'terminal_start_dir', kind: 'select', defaultValue: 'project', options: ['project', 'app'] },
+  browser_persist_session: { key: 'browser_persist_session', kind: 'boolean', defaultValue: 'false' },
   keyboard_shortcuts: { key: 'keyboard_shortcuts', kind: 'string', defaultValue: '' },
   ollama_cloud_key: { key: 'ollama_cloud_key', kind: 'secret', defaultValue: '', secret: true },
 }
@@ -799,6 +828,18 @@ export function registerIpc(): void {
     knowledgeMcpLaunchConfig(join(app.getAppPath(), 'out', 'mcp', 'server.cjs'), app.getPath('userData'))
   )
 
+  // On-disk path of the bundled browser-control MCP server (Extensions quick-add).
+  ipcMain.handle('mcp:getBrowserServerPath', (): string =>
+    join(app.getAppPath(), 'out', 'mcp', 'browser-server.cjs')
+  )
+
+  // Full launch config for the bundled browser-control server (plain node; the
+  // control server's loopback port baked into the env). The Extensions quick-add
+  // uses this instead of hardcoding a config.
+  ipcMain.handle('mcp:getBrowserServerConfig', (): McpServerConfig =>
+    browserMcpLaunchConfig(join(app.getAppPath(), 'out', 'mcp', 'browser-server.cjs'), browserControlPort(), browserControlIdentityToken)
+  )
+
   // ---- sessions / chat ----
   ipcMain.handle('sessions:list', (_e, projectId: string, mode: string): Session[] =>
     getDb()
@@ -1038,15 +1079,15 @@ export function registerIpc(): void {
           const cloudModel = args.model.slice(6)
           const keyRow = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('ollama_cloud_key') as { value: string } | undefined
           const apiKey = keyRow?.value ?? ''
-          for await (const token of streamCloudChat(cloudModel, messages, apiKey, controller.signal)) {
-            full += token
-            const payload: ChatTokenEvent = { sessionId: args.sessionId, token }
+          for await (const part of streamCloudChatParts(cloudModel, messages, apiKey, controller.signal)) {
+            if (part.kind === 'answer') full += part.text
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind }
             win?.webContents.send('chat:token', payload)
           }
         } else {
-          for await (const token of streamChat(args.model, messages, controller.signal)) {
-            full += token
-            const payload: ChatTokenEvent = { sessionId: args.sessionId, token }
+          for await (const part of streamChatParts(args.model, messages, controller.signal)) {
+            if (part.kind === 'answer') full += part.text
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind }
             win?.webContents.send('chat:token', payload)
           }
         }
@@ -1673,6 +1714,16 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
       const controller = new AbortController()
       hermesAborts.set(args.sessionId, controller)
+      const transcript: Array<{ kind: 'text'; text: string } | { kind: 'activity'; activity: HermesActivity }> = []
+      const appendTranscriptEvent = (e: HermesEvent) => {
+        if (e.kind === 'text') {
+          const last = transcript[transcript.length - 1]
+          if (last?.kind === 'text') last.text += e.text
+          else transcript.push({ kind: 'text', text: e.text })
+        } else if (e.kind === 'activity') {
+          transcript.push({ kind: 'activity', activity: e.activity })
+        }
+      }
 
       const run = await runHermesPrompt({
         sessionId: args.sessionId,
@@ -1681,6 +1732,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         mcpServers,
         signal: controller.signal,
         onEvent: (e) => {
+          appendTranscriptEvent(e)
           const payload: HermesIpcEvent = { sessionId: args.sessionId, event: e }
           win?.webContents.send('hermes:event', payload)
           if (e.kind === 'usage') {
@@ -1694,8 +1746,25 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       })
       hermesAborts.delete(args.sessionId)
 
-      // Persist the result. `run.text` is the assembled streaming response.
-      insertMsg('assistant', run.text || run.error || '(no output)', 'hermes')
+      // Persist the result in the order Hermes produced it: text, tool cards,
+      // more text. Older sessions still render via the legacy single-message path.
+      let persistedTranscript = false
+      for (const segment of transcript) {
+        if (segment.kind === 'text') {
+          if (segment.text.trim()) {
+            insertMsg('assistant', segment.text, 'hermes')
+            persistedTranscript = true
+          }
+        } else {
+          insertMsg('tool', JSON.stringify([segment.activity]), 'hermes')
+          persistedTranscript = true
+        }
+      }
+      if (!run.ok && run.error && !run.text) {
+        insertMsg('assistant', run.error, 'hermes')
+        persistedTranscript = true
+      }
+      if (!persistedTranscript) insertMsg('assistant', run.text || run.error || '(no output)', 'hermes')
 
       let memorySaved = false
       if (run.ok || run.text) {
@@ -1908,6 +1977,40 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       return { success: false, error: String(err instanceof Error ? err.message : err) }
     }
   })
+
+  // ---- Browser panel (manual WebContentsView browsing) -------------------------
+  // Native Chromium views managed in browserPanel.ts, positioned over a renderer
+  // placeholder via browser:setBounds. Phase 1 is manual browsing only.
+  ipcMain.handle('browser:createTab', (e, url?: string): string => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (!win) throw new Error('No host window for browser panel')
+    return createBrowserTab(win, url)
+  })
+  ipcMain.handle('browser:closeTab', (_e, tabId: string): void => closeBrowserTab(tabId))
+  ipcMain.handle('browser:setActiveTab', (_e, tabId: string): void => setActiveBrowserTab(tabId))
+  ipcMain.handle('browser:navigate', (_e, tabId: string, url: string): void => navigateBrowserTab(tabId, url))
+  ipcMain.handle('browser:goBack', (_e, tabId: string): void => browserGoBack(tabId))
+  ipcMain.handle('browser:goForward', (_e, tabId: string): void => browserGoForward(tabId))
+  ipcMain.handle('browser:reload', (_e, tabId: string): void => reloadBrowserTab(tabId))
+  ipcMain.handle('browser:stop', (_e, tabId: string): void => stopBrowserTab(tabId))
+  ipcMain.handle('browser:setBounds', (_e, tabId: string, bounds: BrowserBounds): void =>
+    setBrowserViewBounds(tabId, bounds)
+  )
+  ipcMain.handle('browser:hideAll', (): void => hideAllBrowserViews())
+  ipcMain.handle('browser:listTabs', (): BrowserTabListResponse => listBrowserTabs())
+  ipcMain.handle('browser:getDownloads', (): BrowserDownloadStatus[] => agentGetDownloads())
+  ipcMain.handle('browser:reloadSessions', (e): void => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (win) reloadBrowserSessions(win)
+  })
+
+  // Application-level approval queue. This is deliberately outside Hermes so
+  // Browser requests from every MCP client share one renderer surface.
+  ipcMain.handle('approvals:list', (): BrowserApprovalRequest[] => browserApprovals.listPending())
+  ipcMain.handle(
+    'approvals:respond',
+    (_e, decision: BrowserApprovalDecision): Promise<BrowserApprovalResult> => browserApprovals.respond(decision)
+  )
 
   // ---- Git status (Navigator file tree indicators) -----------------------------
   // Returns porcelain status keyed by repo-relative path (forward slashes).
@@ -2443,19 +2546,23 @@ async function resolveHermesMcpServers(): Promise<object[]> {
   // is unavailable on remote machines. The renderer handles memory injection
   // client-side instead (fetch + prepend context as a system message).
   if (getHermesConfig().mode === 'remote') return []
-  // Honor the Extensions panel's enable/disable state: if the knowledge server
-  // was disabled (or removed), do not wire it into new Hermes sessions.
-  if (!getActiveMcpServers()['ai-workspace-knowledge']) return []
+  // Honor the Extensions panel's enable/disable state per server.
+  const active = getActiveMcpServers()
+  const knowledgeActive = Boolean(active['ai-workspace-knowledge'])
+  const browserActive = Boolean(active['ai-workspace-browser'])
+  if (!knowledgeActive && !browserActive) return []
   try {
     const { execSync } = require('child_process') as typeof import('child_process')
     const { app } = require('electron') as typeof import('electron')
     const path = require('path') as typeof import('path')
 
-    // The server loads the Electron-ABI better-sqlite3 build, so it must run on
-    // Electron's ABI — launch the app's own Electron binary in run-as-node mode
-    // (ELECTRON_RUN_AS_NODE=1) rather than a bare Windows node.exe (whose ABI
-    // would not match the native build). WSL interop execs the Windows exe by
-    // its /mnt path; the server, script path, and db dir stay Windows-side.
+    // Both bundled servers run on the Windows side, launched through the app's
+    // own Electron binary in run-as-node mode (ELECTRON_RUN_AS_NODE=1) via WSL
+    // interop. For the knowledge server this is required for the Electron-ABI
+    // better-sqlite3 build. For the browser server it is required for a
+    // different reason: its HTTP calls target 127.0.0.1, which from *inside* a
+    // WSL Linux process would hit the WSL VM, not the Windows host running the
+    // control server — running Windows-side keeps loopback pointing at the app.
     const electronExe = process.execPath
     if (!electronExe) throw new Error('electron executable path unavailable')
 
@@ -2464,19 +2571,37 @@ async function resolveHermesMcpServers(): Promise<object[]> {
     const distro = check.distro ?? 'Ubuntu'
 
     const electronWsl = execSync(`wsl.exe -d ${distro} wslpath -a "${electronExe}"`, { encoding: 'utf8' }).trim()
-    const serverCjs = path.join(__dirname, '../mcp/server.cjs')
-    const serverWin = serverCjs.replace(/\\/g, '/')
     const dbDir = app.getPath('userData').replace(/\\/g, '/')
+    const toWin = (p: string) => p.replace(/\\/g, '/')
 
-    return [{
-      name: 'ai-workspace-knowledge',
-      command: electronWsl,
-      args: [serverWin],
-      env: [
-        { name: 'AIWORKSPACE_DB_DIR', value: dbDir },
-        { name: 'ELECTRON_RUN_AS_NODE', value: '1' }
-      ]
-    }]
+    const servers: object[] = []
+    if (knowledgeActive) {
+      servers.push({
+        name: 'ai-workspace-knowledge',
+        command: electronWsl,
+        args: [toWin(path.join(__dirname, '../mcp/server.cjs'))],
+        env: [
+          { name: 'AIWORKSPACE_DB_DIR', value: dbDir },
+          { name: 'ELECTRON_RUN_AS_NODE', value: '1' }
+        ]
+      })
+    }
+    if (browserActive) {
+      servers.push({
+        name: 'ai-workspace-browser',
+        command: electronWsl,
+        args: [toWin(path.join(__dirname, '../mcp/browser-server.cjs'))],
+        env: [
+          { name: 'AIWORKSPACE_BROWSER_PORT', value: String(browserControlPort()) },
+          { name: 'AIWORKSPACE_BROWSER_AGENT_ID', value: 'hermes' },
+          { name: 'AIWORKSPACE_BROWSER_AGENT_NAME', value: 'Hermes' },
+          { name: 'AIWORKSPACE_BROWSER_IDENTITY_SOURCE', value: 'app-launch' },
+          { name: 'AIWORKSPACE_BROWSER_CONTROL_TOKEN', value: browserControlIdentityToken },
+          { name: 'ELECTRON_RUN_AS_NODE', value: '1' }
+        ]
+      })
+    }
+    return servers
   } catch (e) {
     console.warn('[hermes] resolveHermesMcpServers failed:', e)
     return []

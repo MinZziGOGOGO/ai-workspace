@@ -18,5 +18,6 @@ if errorlevel 1 (
 )
 
 echo [start] Building and launching AI Workspace...
-set ELECTRON_DISABLE_GPU=1
+if "%AIWORKSPACE_DISABLE_GPU%"=="1" echo [start] GPU acceleration disabled by environment override.
+if "%ELECTRON_DISABLE_GPU%"=="1" echo [start] GPU acceleration disabled by environment override.
 npm run dev

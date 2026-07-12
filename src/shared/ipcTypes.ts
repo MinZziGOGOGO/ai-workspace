@@ -66,7 +66,7 @@ export interface ChatGenerateHandoffPromptRequest {
   conversationHistory: string
 }
 
-export interface ChatTokenEvent { sessionId: string; token: string }
+export interface ChatTokenEvent { sessionId: string; token: string; kind?: 'answer' | 'thinking' }
 export interface ChatDoneEvent { sessionId: string }
 export interface ChatErrorEvent { sessionId: string; error: string }
 export interface ChatUsageEvent { sessionId: string; used: number; max: number | null }
@@ -198,6 +198,113 @@ export type DockPanel =
   | 'research'
   | 'activity'
   | 'extensions'
+  | 'browser'
+
+// ── Browser panel (manual WebContentsView browsing) ──────────────────────────
+export interface BrowserBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface BrowserTabState {
+  id: string
+  url: string
+  title: string
+  isLoading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+  navigationError?: string | null
+}
+
+export interface BrowserTabListResponse {
+  tabs: BrowserTabState[]
+  activeTabId: string | null
+}
+
+export interface BrowserTabCreatedEvent {
+  tabId: string
+}
+
+export interface BrowserTabClosedEvent {
+  tabId: string
+}
+
+export interface BrowserDownloadStatus {
+  downloadId: string
+  filename: string
+  origin: string
+  state: 'pending' | 'progressing' | 'completed' | 'cancelled' | 'interrupted'
+  receivedBytes: number
+  totalBytes: number
+  startedAt: number
+  completedAt?: number
+  cancelled: boolean
+  failureReason?: string
+  destinationType: 'managed'
+  displayLocation: string
+  tabId: string
+}
+
+export type BrowserPermissionCategory =
+  | 'browser.read'
+  | 'browser.navigate.local'
+  | 'browser.navigate.external'
+  | 'browser.interact'
+  | 'browser.type'
+  | 'browser.sensitive'
+  | 'browser.download'
+  | 'browser.upload'
+  | 'browser.privileged'
+
+export type BrowserApprovalStatus =
+  | 'pending'
+  | 'approved'
+  | 'denied'
+  | 'timed_out'
+  | 'cancelled'
+  | 'executing'
+  | 'completed'
+  | 'failed'
+
+export interface BrowserApprovalRequest {
+  requestId: string
+  createdAt: number
+  expiresAt: number
+  status: BrowserApprovalStatus
+  agentId: string
+  agentName: string
+  identityVerified: boolean
+  transport: string
+  tabId?: string
+  category: BrowserPermissionCategory
+  toolName: string
+  currentUrl?: string
+  currentOrigin?: string
+  targetUrl?: string
+  targetOrigin?: string
+  leavesLocalhost?: boolean
+  elementId?: string
+  elementRole?: string
+  elementName?: string
+  actionSummary: string
+  redactedInputPreview?: string
+  characterCount?: number
+  sensitive: boolean
+  riskFlags: string[]
+}
+
+export interface BrowserApprovalDecision {
+  requestId: string
+  approved: boolean
+  allowForSession?: boolean
+}
+
+export interface BrowserApprovalResult {
+  success: boolean
+  error?: string
+}
 
 export type LayoutNode =
   | { type: 'pane'; id: DockPanel }
@@ -281,7 +388,16 @@ export interface RemoteHermesConfig {
   hermesPath: string
 }
 
-export interface HermesActivity { ts: number; kind: string; message: string }
+export interface HermesActivity {
+  ts: number
+  kind: string
+  message: string
+  toolName?: string
+  status?: 'running' | 'done' | 'error'
+  args?: unknown
+  result?: string
+  details?: unknown
+}
 export interface HermesCheck {
   wsl2: boolean
   installed: boolean
@@ -676,6 +792,8 @@ export interface IpcApi {
     getConfigPath(): Promise<string>
     getKnowledgeServerPath(): Promise<string>
     getKnowledgeServerConfig(): Promise<McpServerConfig>
+    getBrowserServerPath(): Promise<string>
+    getBrowserServerConfig(): Promise<McpServerConfig>
   }
   setup: {
     detectTools(): Promise<ToolDetection>
@@ -696,6 +814,29 @@ export interface IpcApi {
     status(): Promise<WebCompanionStatus>
     configure(config: WebCompanionConfigureRequest): Promise<WebCompanionStatus>
     regenerateToken(): Promise<WebCompanionRegenerateResponse>
+  }
+  browser: {
+    createTab(url?: string): Promise<string>
+    closeTab(tabId: string): Promise<void>
+    setActiveTab(tabId: string): Promise<void>
+    navigate(tabId: string, url: string): Promise<void>
+    goBack(tabId: string): Promise<void>
+    goForward(tabId: string): Promise<void>
+    reload(tabId: string): Promise<void>
+    stop(tabId: string): Promise<void>
+    setBounds(tabId: string, bounds: BrowserBounds): Promise<void>
+    hideAll(): Promise<void>
+    listTabs(): Promise<BrowserTabListResponse>
+    getDownloads(): Promise<BrowserDownloadStatus[]>
+    reloadSessions(): Promise<void>
+    onTabUpdated(cb: (d: BrowserTabState) => void): () => void
+    onTabCreated(cb: (d: BrowserTabCreatedEvent) => void): () => void
+    onTabClosed(cb: (d: BrowserTabClosedEvent) => void): () => void
+  }
+  approvals: {
+    list(): Promise<BrowserApprovalRequest[]>
+    respond(decision: BrowserApprovalDecision): Promise<BrowserApprovalResult>
+    onChanged(cb: (requests: BrowserApprovalRequest[]) => void): () => void
   }
   activity: {
     onLog(cb: (entry: ActivityEntry) => void): () => void

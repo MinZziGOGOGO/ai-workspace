@@ -24,7 +24,7 @@ The current Windows config produces unsigned builds and skips executable resourc
 
 ## GPU Startup Note
 
-The packaged app does not rely on `ELECTRON_DISABLE_GPU=1`. The main process already calls Electron GPU-disabling switches and `app.disableHardwareAcceleration()` before creating the window, so the packaged app uses the same safe startup path as Windows development.
+The packaged app uses Electron GPU acceleration by default for smoother rendering. If a driver issue causes blank windows, flicker, or launch failures, start with `AIWORKSPACE_DISABLE_GPU=1` or `ELECTRON_DISABLE_GPU=1` to force the software-rendering fallback.
 
 ## Native Modules
 

@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import anime, {
   AnimatedScaleBar,
-  animateScrollToBottom,
   cascadeItems,
   prefersReducedMotion,
   stopMotion,
@@ -32,7 +31,7 @@ import { useToast } from './ToastContext'
 import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { cleanupGeneratedTitle, fallbackTitleFromText, firstExchange, isGenericSessionTitle } from '../../../shared/sessionTitles'
-import { AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
+import { AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
 import {
@@ -149,15 +148,14 @@ const MessageItem = React.memo(function MessageItem({ message: m, answeredClarif
 
   if (m.role === 'user') {
     return (
-      <div ref={wrapRef}>
-        <EditableUserMessage
-          content={m.content}
-          timestamp={m.created_at}
-          disabled={editDisabled}
-          onSaveResend={(newContent) => onEditResend(m.id, newContent)}
-          onCopy={() => onCopy(m.content)}
-        />
-      </div>
+      <EditableUserMessage
+        rootRef={wrapRef}
+        content={m.content}
+        timestamp={m.created_at}
+        disabled={editDisabled}
+        onSaveResend={(newContent) => onEditResend(m.id, newContent)}
+        onCopy={() => onCopy(m.content)}
+      />
     )
   }
 
@@ -229,6 +227,22 @@ const MessageItem = React.memo(function MessageItem({ message: m, answeredClarif
 
 interface CtxMenu { sessionId: string; x: number; y: number }
 
+function ThinkingBlock(props: { text: string; tokenCount: number; done: boolean }) {
+  const [open, setOpen] = useState(false)
+  if (!props.text) return null
+  const label = props.done ? `Thought for ${props.tokenCount} token${props.tokenCount !== 1 ? 's' : ''}` : 'Thinking...'
+  return (
+    <div className={`thinking-block ${props.done ? 'done' : 'live'} ${open ? 'open' : ''}`}>
+      <button className="thinking-toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span className="thinking-icon">{open ? '\u25BE' : '\u25B8'}</span>
+        <span className="thinking-label">{label}</span>
+        {!props.done && <span className="thinking-cursor">&#x2587;</span>}
+      </button>
+      {open && <pre className="thinking-body">{props.text}</pre>}
+    </div>
+  )
+}
+
 export default function ChatTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
   const { setActive: setAgentActive } = useAgentActivity()
@@ -240,6 +254,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const [model, setModel] = useState('')
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState('')
+  const [thinking, setThinking] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [extracting, setExtracting] = useState(false)
@@ -274,8 +289,6 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   })
 
   const scrollRef = useRef<HTMLDivElement>(null)
-  const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
-  const scrollAnimRef = useRef<MotionHandle>(null)
   const sessionSwitchAnimRef = useRef<MotionHandle>(null)
   const sessionRef = useRef<Session | null>(null)
   const sendRef = useRef<typeof send | null>(null)
@@ -287,13 +300,19 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const suggestToken = useRef(0)
   const tokenTimestamps = useRef<number[]>([])
   const streamingBufferRef = useRef('')
+  const thinkingBufferRef = useRef('')
   const streamingFrameRef = useRef<number | null>(null)
   const skipNextSessionLoad = useRef(false)
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const memoryProjectId = isGlobalWorkspace ? null : props.project.id
   const active = props.active ?? true
   const notifyCompletion = useCompletionNotifier(active)
-  const statusPhrase = useStatusPhrase({ active: busy, hasStarted: streaming.length > 0, toolName: null, progressKey: streaming.length })
+  const statusPhrase = useStatusPhrase({ active: busy, hasStarted: streaming.length > 0 || thinking.length > 0, toolName: null, progressKey: `${streaming.length}:${thinking.length}` })
+  const { showJumpToBottom, jumpToBottom } = useChatScrollFollow(
+    scrollRef,
+    [messages.length, streaming.length, thinking.length],
+    { resetKey: session?.id, immediate: Boolean(streaming || thinking), activeDelay: streaming || thinking ? 100 : 0 }
+  )
   sessionRef.current = session
 
   // Publish start/stop only (not per streamed token) so the topbar activity
@@ -304,7 +323,6 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   }, [busy, setAgentActive])
 
   useEffect(() => () => {
-    stopMotion(scrollAnimRef.current)
     stopMotion(sessionSwitchAnimRef.current)
     if (streamingFrameRef.current !== null) cancelAnimationFrame(streamingFrameRef.current)
   }, [])
@@ -424,17 +442,20 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   }), [session])
 
   useEffect(() => {
+    if (skipNextSessionLoad.current) {
+      skipNextSessionLoad.current = false
+      return
+    }
     if (streamingFrameRef.current !== null) {
       cancelAnimationFrame(streamingFrameRef.current)
       streamingFrameRef.current = null
     }
     streamingBufferRef.current = ''
+    thinkingBufferRef.current = ''
+    setStreaming('')
+    setThinking('')
     setMode(modeMapRef.current.get(session?.id ?? '') ?? 'plan')
     setHandoff(null); setHandoffDraft(''); setCheckingHandoff(false)
-    if (skipNextSessionLoad.current) {
-      skipNextSessionLoad.current = false
-      return
-    }
     if (session) window.api.chat.messages(session.id).then(setMessages)
     else setMessages([])
     setExtracted(null); setExtractError(''); setSuggestions([]); setChatUsage(null)
@@ -451,32 +472,54 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         session?: Session
         messages?: Message[]
         model?: string
+        streaming?: string
+        thinking?: string
+        busy?: boolean
       }
       if (!Array.isArray(detail?.messages)) return
-      const nextSession = detail.session ?? { id: 'test-chat-session', project_id: props.project.id, mode: 'chat', title: 'Test chat', created_at: Date.now() }
+      const nextSession = detail.session ?? sessionRef.current ?? { id: 'test-chat-session', project_id: props.project.id, mode: 'chat', title: 'Test chat', created_at: Date.now() }
       skipNextSessionLoad.current = true
       setSession(nextSession)
       setMessages(detail.messages)
       setAnsweredClarifications(new Set())
-      setBusy(false)
-      setStreaming('')
+      setBusy(Boolean(detail.busy))
+      setStreaming(typeof detail.streaming === 'string' ? detail.streaming : '')
+      setThinking(typeof detail.thinking === 'string' ? detail.thinking : '')
       setError('')
       if (typeof detail.model === 'string') setModel(detail.model)
     }
+    function handleTestLiveState(event: Event) {
+      const detail = (event as CustomEvent).detail as {
+        streaming?: string
+        thinking?: string
+        busy?: boolean
+      }
+      setBusy(Boolean(detail?.busy))
+      setStreaming(typeof detail?.streaming === 'string' ? detail.streaming : '')
+      setThinking(typeof detail?.thinking === 'string' ? detail.thinking : '')
+    }
     window.addEventListener('aiworkspace:test:set-chat-state', handleTestState)
-    return () => window.removeEventListener('aiworkspace:test:set-chat-state', handleTestState)
+    window.addEventListener('aiworkspace:test:set-chat-live-state', handleTestLiveState)
+    return () => {
+      window.removeEventListener('aiworkspace:test:set-chat-state', handleTestState)
+      window.removeEventListener('aiworkspace:test:set-chat-live-state', handleTestLiveState)
+    }
   }, [props.project.id])
 
   useEffect(() => {
     const offToken = window.api.chat.onToken((d) => {
       if (d.sessionId === session?.id) {
-        streamingBufferRef.current += d.token
+        if (d.kind === 'thinking') thinkingBufferRef.current += d.token
+        else streamingBufferRef.current += d.token
         if (streamingFrameRef.current === null) {
           streamingFrameRef.current = requestAnimationFrame(() => {
             streamingFrameRef.current = null
-            const next = streamingBufferRef.current
+            const nextAnswer = streamingBufferRef.current
+            const nextThinking = thinkingBufferRef.current
             streamingBufferRef.current = ''
-            if (next) setStreaming((s) => s + next)
+            thinkingBufferRef.current = ''
+            if (nextAnswer) setStreaming((s) => s + nextAnswer)
+            if (nextThinking) setThinking((s) => s + nextThinking)
           })
         }
         tokenTimestamps.current.push(Date.now())
@@ -489,7 +532,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         streamingFrameRef.current = null
       }
       streamingBufferRef.current = ''
-      setStreaming(''); setBusy(false); tokenTimestamps.current = []; setTokPerSec(0)
+      thinkingBufferRef.current = ''
+      setStreaming(''); setThinking(''); setBusy(false); tokenTimestamps.current = []; setTokPerSec(0)
       const msgs = await window.api.chat.messages(d.sessionId)
       setMessages(msgs)
       if (msgs.some((m) => m.role === 'assistant')) void loadSuggestions(msgs)
@@ -503,7 +547,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
           streamingFrameRef.current = null
         }
         streamingBufferRef.current = ''
-        setBusy(false); setStreaming(''); setError(d.error); setTokPerSec(0)
+        thinkingBufferRef.current = ''
+        setBusy(false); setStreaming(''); setThinking(''); setError(d.error); setTokPerSec(0)
       }
     })
     return () => { offToken(); offDone(); offError() }
@@ -520,17 +565,6 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     }, 500)
     return () => clearInterval(iv)
   }, [busy])
-
-  // Debounced scroll: 100ms during streaming, immediate on message settle
-  useEffect(() => {
-    clearTimeout(scrollTimeoutRef.current)
-    scrollTimeoutRef.current = setTimeout(() => {
-      const el = scrollRef.current
-      if (!el) return
-      stopMotion(scrollAnimRef.current)
-      scrollAnimRef.current = animateScrollToBottom(el, Boolean(streaming))
-    }, streaming ? 100 : 0)
-  }, [messages, streaming])
 
   // Close context menu on outside click
   useEffect(() => {
@@ -554,7 +588,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
     setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
     if (session?.id === target.id) {
-      setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
+      setSession(null); setMessages([]); setStreaming(''); setThinking(''); setSuggestions([])
       setExtracted(null); setExtractError(''); setError('')
     }
     addToast('Session deleted')
@@ -607,7 +641,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
       setSessions(prev => prev.filter(x => x.id !== target.id))
       setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
       if (session?.id === target.id) {
-        setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
+        setSession(null); setMessages([]); setStreaming(''); setThinking(''); setSuggestions([])
         setExtracted(null); setExtractError(''); setError('')
       }
     } else {
@@ -626,23 +660,6 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setShowCloudSetup(false)
     if (key) void loadCloudModels(true)
     else { setCloudModels([]); setCloudModelsError('') }
-  }
-
-  async function deleteManySessions(ids: string[]) {
-    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
-    const failed = results.filter(({ result }) => !result.success)
-    if (failed.length > 0) {
-      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
-    }
-    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
-    if (idSet.size === 0) return
-    setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    if (session && idSet.has(session.id)) {
-      setSession(null); setMessages([]); setStreaming(''); setSuggestions([])
-      setExtracted(null); setExtractError(''); setError('')
-    }
-    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
   }
 
   async function send(text?: string) {
@@ -677,7 +694,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
       s = await window.api.sessions.create(props.project.id, 'chat', 'New chat')
       setSessions((prev) => [s!, ...prev]); setSession(s)
     }
-    setError(''); setBusy(true)
+    setError(''); setBusy(true); setStreaming(''); setThinking(''); streamingBufferRef.current = ''; thinkingBufferRef.current = ''
     if (text === undefined) setInput('')
     setMessages((m) => [...m, { id: 'tmp', session_id: s!.id, role: 'user', content, model: null, created_at: Date.now() }])
     const systemPrefix = mode === 'execute' ? EXECUTE_SYSTEM_PROMPT : PLAN_SYSTEM_PROMPT
@@ -883,7 +900,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const chatResend = useCallback((content: string, regenerateMessageId: string) => {
     if (!session || busy) return
     if (!model) { setError('No model available. Is Ollama running? Try: ollama pull <model>'); return }
-    setError(''); setBusy(true)
+    setError(''); setBusy(true); setStreaming(''); setThinking(''); streamingBufferRef.current = ''; thinkingBufferRef.current = ''
     const systemPrefix = mode === 'execute' ? EXECUTE_SYSTEM_PROMPT : PLAN_SYSTEM_PROMPT
     window.api.chat.send({ sessionId: session.id, projectId: props.project.id, model, content, systemPrefix, regenerateMessageId })
   }, [session, busy, model, mode, props.project.id])
@@ -1042,13 +1059,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         newLabel="New chat"
         newTitle="Start a new chat"
         emptyLabel="No chats yet"
+        openMenuSessionId={contextMenu?.sessionId ?? null}
         onNew={newSession}
         onSelect={selectSession}
         onOptions={openContextMenu}
         onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
         onRenameCommit={(s) => void commitRename(s)}
         onRenameCancel={() => setRenaming(null)}
-        onDeleteMany={deleteManySessions}
       />
 
       {/* ── Main area ── */}
@@ -1082,6 +1099,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
               detail={model ? `Model: ${model.startsWith('cloud:') ? model.slice(6) : model}` : 'No model selected'}
             />
 
+            <div className="chat-scroll-shell">
             <div className="chat-scroll" ref={scrollRef}>
               {messages.length > RENDER_LIMIT + renderOffset && (
                 <button className="ghost load-older-btn" onClick={() => setRenderOffset((o) => o + RENDER_LIMIT)}>
@@ -1106,6 +1124,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
                   onReaction={setReaction}
                 />
               ))}
+              {thinking && <ThinkingBlock text={thinking} tokenCount={thinking.split(/\s+/).filter(Boolean).length} done={streaming.length > 0} />}
               {streaming && (
                 <div className="msg assistant">
                   <div className="msg-body md-body"><Markdown>{streaming}</Markdown><span className="cursor">▋</span></div>
@@ -1174,6 +1193,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
                   )}
                 </div>
               )}
+            </div>
+            <ChatJumpToBottomButton visible={showJumpToBottom} onClick={jumpToBottom} />
             </div>
 
             {(extracted || extractError) && (

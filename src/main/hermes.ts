@@ -52,6 +52,11 @@ export interface HermesActivity {
   ts: number
   kind: string // 'tool' | 'thought' | 'plan' | 'error'
   message: string
+  toolName?: string
+  status?: 'running' | 'done' | 'error'
+  args?: unknown
+  result?: string
+  details?: unknown
 }
 
 export interface HermesPlanEntry {
@@ -222,6 +227,72 @@ function describeHermesAction(params: any, kind: HermesActionKind): string {
     return `${verb} \`${path}\``
   }
   return `Perform a ${kind} action`
+}
+
+function compactJson(value: unknown, max = 220): string {
+  if (value === undefined || value === null || value === '') return ''
+  try {
+    const raw = typeof value === 'string' ? value : JSON.stringify(value)
+    return raw.length > max ? `${raw.slice(0, max - 3)}...` : raw
+  } catch {
+    return String(value)
+  }
+}
+
+function firstText(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function toolNameFromUpdate(update: any): string {
+  const toolCall = update?.toolCall ?? update?.tool_call ?? update?.call ?? {}
+  const rawInput = toolCall.rawInput ?? toolCall.input ?? update?.rawInput ?? update?.input ?? update?.args ?? {}
+  const name = firstText(
+    update?.toolName,
+    update?.tool_name,
+    update?.name,
+    update?.title,
+    toolCall.name,
+    toolCall.toolName,
+    toolCall.title,
+    rawInput.command,
+    rawInput.path,
+    rawInput.file_path,
+    rawInput.query
+  )
+  if (name && name.toLowerCase() !== 'tool') return name
+  return 'Remote tool'
+}
+
+function toolArgsFromUpdate(update: any): unknown {
+  const toolCall = update?.toolCall ?? update?.tool_call ?? update?.call ?? {}
+  return update?.args ?? update?.input ?? update?.params ?? toolCall.rawInput ?? toolCall.input ?? undefined
+}
+
+function toolResultFromUpdate(update: any): string {
+  return compactJson(update?.result ?? update?.output ?? update?.response ?? update?.content?.text ?? update?.error, 480)
+}
+
+function planEntriesFromUpdate(update: any): HermesPlanEntry[] {
+  const candidates = [
+    update?.entries,
+    update?.plan?.entries,
+    update?.plan,
+    update?.todos,
+    update?.tasks,
+    update?.items,
+    update?.content?.entries
+  ]
+  const rawEntries = candidates.find((value) => Array.isArray(value)) as any[] | undefined
+  if (!rawEntries) return []
+  return rawEntries
+    .map((entry) => ({
+      content: String(entry?.content ?? entry?.title ?? entry?.text ?? entry?.description ?? '').trim(),
+      status: String(entry?.status ?? entry?.state ?? (entry?.done ? 'completed' : 'pending')).trim() || 'pending'
+    }))
+    .filter((entry) => entry.content)
 }
 
 // This Hermes ACP build responds to permission requests with a plain
@@ -538,6 +609,7 @@ class HermesAcpClient {
 
     this.updateListeners.set(acpSessionId, (update: any) => {
       const su: string = update?.sessionUpdate ?? ''
+      const inferredPlanEntries = planEntriesFromUpdate(update)
       if (su === 'agent_message_chunk') {
         const t = update?.content?.text
         if (typeof t === 'string' && t) {
@@ -550,16 +622,54 @@ class HermesAcpClient {
           onEvent({ kind: 'thought', text: t })
         }
       } else if (su === 'tool_call_update') {
-        const name: string = update?.toolName ?? update?.name ?? 'tool'
-        const args = update?.args ? JSON.stringify(update.args).slice(0, 100) : ''
-        onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'tool', message: args ? `${name}(${args})` : name } })
+        const name = toolNameFromUpdate(update)
+        const args = toolArgsFromUpdate(update)
+        const argsPreview = compactJson(args, 100)
+        const note = firstText(update?.content?.text, update?.message, update?.description, update?.statusText)
+        onEvent({
+          kind: 'activity',
+          activity: {
+            ts: Date.now(),
+            kind: 'tool',
+            message: argsPreview ? `${name}(${argsPreview})` : note ?? name,
+            toolName: name === 'Remote tool' && note ? undefined : name,
+            status: 'running',
+            args,
+            details: update
+          }
+        })
       } else if (su === 'tool_call') {
         // Tool completed - show a brief result note
-        const name: string = update?.toolName ?? update?.name ?? 'tool'
-        const res = String(update?.result ?? '').slice(0, 120)
-        if (res) onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'tool', message: `✓ ${name}: ${res}` } })
-      } else if (su === 'plan') {
-        const entries: any[] = update?.entries ?? []
+        const name = toolNameFromUpdate(update)
+        const res = toolResultFromUpdate(update)
+        if (res) {
+          onEvent({
+            kind: 'activity',
+            activity: {
+              ts: Date.now(),
+              kind: 'tool',
+              message: `✓ ${name}: ${res}`,
+              toolName: name,
+              status: 'done',
+              result: res,
+              details: update
+            }
+          })
+        } else {
+          onEvent({
+            kind: 'activity',
+            activity: {
+              ts: Date.now(),
+              kind: 'tool',
+              message: `✓ ${name}`,
+              toolName: name,
+              status: 'done',
+              details: update
+            }
+          })
+        }
+      } else if (su === 'plan' || su === 'plan_update' || su === 'task_list' || su === 'todo_update' || inferredPlanEntries.length > 0) {
+        const entries = inferredPlanEntries
         const active = entries.find((e: any) => e.status === 'in_progress') ?? entries[0]
         if (active?.content) {
           onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'plan', message: active.content } })
@@ -567,7 +677,7 @@ class HermesAcpClient {
         if (entries.length > 0) {
           onEvent({
             kind: 'plan',
-            entries: entries.map((e: any) => ({ content: String(e.content ?? ''), status: String(e.status ?? 'pending') }))
+            entries
           })
         }
       } else if (su === 'usage_update') {
@@ -857,7 +967,7 @@ export async function runHermesPrompt(opts: {
       return { ok: false, text: '', error: 'Fake Hermes permission denied' }
     }
     const text = `Fake Hermes approved and completed: ${opts.prompt}`
-    opts.onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'tool', message: 'npm test' } })
+    opts.onEvent({ kind: 'activity', activity: { ts: Date.now(), kind: 'tool', message: 'npm test', toolName: 'npm test', status: 'running', args: { command: 'npm test' } } })
     opts.onEvent({ kind: 'text', text })
     return { ok: true, text, stopReason: 'end_turn' }
   }

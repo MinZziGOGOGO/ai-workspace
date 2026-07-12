@@ -13,7 +13,8 @@ import { StatusBadge, WorkspaceNotice } from './WorkspacePrimitives'
 import { useShortcuts } from '../ShortcutContext'
 import { formatShortcutKey, isModifierOnlyKey, parseKey, type Shortcut } from '../shortcuts'
 import { applyMotionPreference, type MotionMode } from '../motion'
-import { applyTheme } from '../theme'
+import { applyFontFamily, applyTheme, readStoredFontFamily, storeFontFamily } from '../theme'
+import { APP_FONT_OPTIONS } from '../../../shared/appFonts'
 import { SETTING_CHANGED_EVENT } from '../notify'
 
 type OllamaStatus = { connected: boolean; defaultModel: string | null }
@@ -30,7 +31,7 @@ interface SettingMeta {
   description: string
   section: SectionId
   type: 'toggle' | 'select' | 'text' | 'number'
-  options?: { value: string; label: string }[]
+  options?: { value: string; label: string; stack?: string }[]
   wired: 'wired' | 'partial' | 'planned'
 }
 
@@ -44,6 +45,7 @@ const SETTINGS: SettingMeta[] = [
   { key: 'ui_font_scale', label: 'UI text size', description: 'Scales interface text across the renderer.', section: 'appearance', type: 'select', wired: 'wired', options: [
     { value: '95', label: 'Small (95%)' }, { value: '100', label: 'Default (100%)' }, { value: '110', label: 'Large (110%)' }, { value: '120', label: 'Extra large (120%)' },
   ] },
+  { key: 'ui_font_family', label: 'App font', description: 'Changes the main interface font across the app. Code and terminal text keep the monospace font.', section: 'appearance', type: 'select', wired: 'wired', options: APP_FONT_OPTIONS },
   { key: 'ui_motion_mode', label: 'Motion', description: 'Controls workspace animation. Reduced also follows the OS reduced-motion setting.', section: 'appearance', type: 'select', wired: 'wired', options: [
     { value: 'full', label: 'Full' }, { value: 'reduced', label: 'Reduced' }, { value: 'off', label: 'Off' },
   ] },
@@ -109,6 +111,7 @@ const DEFAULT_VALUES: Record<string, string> = {
   ui_theme: 'system',
   ui_density: 'comfortable',
   ui_font_scale: '100',
+  ui_font_family: 'default',
   ui_motion_mode: 'full',
   ui_reduced_motion: 'false',
   notify_sound_enabled: 'false',
@@ -130,6 +133,7 @@ const DEFAULT_VALUES: Record<string, string> = {
 function applyUiPrefs(values: Record<string, string | null>) {
   const root = document.documentElement
   applyTheme(values.ui_theme ?? DEFAULT_VALUES.ui_theme)
+  applyFontFamily(values.ui_font_family ?? DEFAULT_VALUES.ui_font_family)
   root.dataset.density = values.ui_density ?? DEFAULT_VALUES.ui_density
   root.dataset.fontScale = values.ui_font_scale ?? DEFAULT_VALUES.ui_font_scale
   const rawMotion = values.ui_motion_mode ?? (values.ui_reduced_motion === 'true' ? 'reduced' : DEFAULT_VALUES.ui_motion_mode)
@@ -224,13 +228,23 @@ function SettingsToggle(props: { checked: boolean; onChange: (next: boolean) => 
 
 function SettingsSelect(props: {
   value: string
-  options: { value: string; label: string }[]
+  options: { value: string; label: string; stack?: string }[]
   onChange: (next: string) => void
   label: string
 }) {
+  const selected = props.options.find((option) => option.value === props.value)
   return (
-    <select aria-label={props.label} value={props.value} onChange={(e) => props.onChange(e.target.value)}>
-      {props.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+    <select
+      aria-label={props.label}
+      value={props.value}
+      onChange={(e) => props.onChange(e.target.value)}
+      style={selected?.stack ? { fontFamily: selected.stack } : undefined}
+    >
+      {props.options.map((option) => (
+        <option key={option.value} value={option.value} style={option.stack ? { fontFamily: option.stack } : undefined}>
+          {option.label}
+        </option>
+      ))}
     </select>
   )
 }
@@ -418,7 +432,11 @@ export default function SettingsPanel(props: {
       ])
       if (seq !== refreshSeq.current) return
       setSummary(settingsSummary)
-      const merged = { ...DEFAULT_VALUES, ...settingsSummary.values }
+      const merged = {
+        ...DEFAULT_VALUES,
+        ...settingsSummary.values,
+        ui_font_family: settingsSummary.values.ui_font_family ?? readStoredFontFamily() ?? DEFAULT_VALUES.ui_font_family,
+      }
       setValues(merged)
       applyUiPrefs(merged)
       setWebCompanion(nextWeb)
@@ -488,12 +506,41 @@ export default function SettingsPanel(props: {
   async function saveSetting(meta: SettingMeta, next: string) {
     const validationError = validate(meta, next)
     setValidation((prev) => ({ ...prev, [meta.key]: validationError }))
+    const nextValues = { ...values, [meta.key]: next }
     setValues((prev) => ({ ...prev, [meta.key]: next }))
     if (validationError) return
+
+    if (meta.key === 'ui_font_family') {
+      storeFontFamily(next)
+      applyUiPrefs(nextValues)
+      window.dispatchEvent(new CustomEvent(SETTING_CHANGED_EVENT, { detail: { key: meta.key, value: next } }))
+
+      const mainSupportsFontSetting = Object.prototype.hasOwnProperty.call(summary?.values ?? {}, meta.key)
+      if (!mainSupportsFontSetting) {
+        showMessage('Saved')
+        return
+      }
+
+      setSavingKey(meta.key)
+      try {
+        await window.api.settings.set(meta.key, next)
+        showMessage('Saved')
+      } catch (e: any) {
+        if (String(e?.message ?? e).includes('Unsupported setting')) {
+          showMessage('Saved')
+        } else {
+          setError(String(e?.message ?? e))
+        }
+      } finally {
+        setSavingKey(null)
+      }
+      return
+    }
+
     setSavingKey(meta.key)
     try {
       await window.api.settings.set(meta.key, next)
-      if (meta.section === 'appearance') applyUiPrefs({ ...values, [meta.key]: next })
+      if (meta.section === 'appearance') applyUiPrefs(nextValues)
       window.dispatchEvent(new CustomEvent(SETTING_CHANGED_EVENT, { detail: { key: meta.key, value: next } }))
       showMessage('Saved')
     } catch (e: any) {

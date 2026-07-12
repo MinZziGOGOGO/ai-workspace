@@ -44,5 +44,9 @@ if ($ollamaUp) {
 }
 
 Write-Host "Starting AI Workspace..." -ForegroundColor Cyan
-$env:ELECTRON_DISABLE_GPU = 1
+if ($env:AIWORKSPACE_DISABLE_GPU -eq "1" -or $env:ELECTRON_DISABLE_GPU -eq "1") {
+    Write-Host "GPU acceleration disabled by environment override." -ForegroundColor Yellow
+} else {
+    Write-Host "GPU acceleration enabled." -ForegroundColor DarkGray
+}
 npm run dev

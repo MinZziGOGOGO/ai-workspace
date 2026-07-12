@@ -1,10 +1,139 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type DependencyList, type MouseEvent, type ReactNode, type Ref } from 'react'
 import { createPortal } from 'react-dom'
 import type { Message, Session } from '../types'
 import { StatusBadge, WorkspaceNotice } from './WorkspacePrimitives'
-import { BreathingDot, pressElement, stopMotion, type MotionHandle } from '../motion'
+import { animateScrollToBottom, BreathingDot, pressElement, stopMotion, type MotionHandle } from '../motion'
 import RelativeTime from './RelativeTime'
 import { exchangeCount } from '../sessionSummary'
+
+const CHAT_BOTTOM_THRESHOLD = 96
+
+function chatIsNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= CHAT_BOTTOM_THRESHOLD
+}
+
+export function useChatScrollFollow(
+  scrollRef: { current: HTMLElement | null },
+  deps: DependencyList,
+  opts: { resetKey?: unknown; immediate?: boolean; activeDelay?: number; settleDelay?: number } = {}
+): { showJumpToBottom: boolean; jumpToBottom: () => void } {
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false)
+  const followRef = useRef(true)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const frameRef = useRef<number | null>(null)
+  const animRef = useRef<MotionHandle>(null)
+  const attachedElRef = useRef<HTMLElement | null>(null)
+  const detachScrollRef = useRef<(() => void) | null>(null)
+
+  const updateFromScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const nearBottom = chatIsNearBottom(el)
+    followRef.current = nearBottom
+    setShowJumpToBottom(!nearBottom && el.scrollHeight > el.clientHeight + CHAT_BOTTOM_THRESHOLD)
+  }, [scrollRef])
+
+  const setBottomNow = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    stopMotion(animRef.current)
+    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+    followRef.current = true
+    setShowJumpToBottom(false)
+  }, [scrollRef])
+
+  const queueBottomNow = useCallback(() => {
+    if (frameRef.current !== null) return
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null
+      setBottomNow()
+    })
+  }, [setBottomNow])
+
+  const scrollToBottom = useCallback((immediate = false) => {
+    const el = scrollRef.current
+    if (!el) return
+    stopMotion(animRef.current)
+    if (immediate) {
+      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+      animRef.current = null
+    } else {
+      animRef.current = animateScrollToBottom(el)
+    }
+    followRef.current = true
+    setShowJumpToBottom(false)
+  }, [scrollRef])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (attachedElRef.current === el) return
+    detachScrollRef.current?.()
+    attachedElRef.current = el
+    if (!el) {
+      detachScrollRef.current = null
+      return
+    }
+    const handleScroll = () => updateFromScroll()
+    const handleUserScroll = () => {
+      window.requestAnimationFrame(() => {
+        if (!chatIsNearBottom(el)) stopMotion(animRef.current)
+      })
+    }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    el.addEventListener('wheel', handleUserScroll, { passive: true })
+    el.addEventListener('touchmove', handleUserScroll, { passive: true })
+    updateFromScroll()
+    detachScrollRef.current = () => {
+      el.removeEventListener('scroll', handleScroll)
+      el.removeEventListener('wheel', handleUserScroll)
+      el.removeEventListener('touchmove', handleUserScroll)
+    }
+  })
+
+  useEffect(() => {
+    followRef.current = true
+    setShowJumpToBottom(false)
+    window.requestAnimationFrame(() => scrollToBottom(true))
+  }, [opts.resetKey, scrollToBottom])
+
+  useEffect(() => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    if (opts.immediate) {
+      if (followRef.current) queueBottomNow()
+      else updateFromScroll()
+      return
+    }
+    const delay = opts.immediate ? (opts.activeDelay ?? 100) : (opts.settleDelay ?? 0)
+    timeoutRef.current = setTimeout(() => {
+      if (followRef.current) scrollToBottom(false)
+      else updateFromScroll()
+    }, delay)
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...deps, opts.immediate, opts.settleDelay, queueBottomNow, scrollToBottom, updateFromScroll])
+
+  useEffect(() => () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
+    detachScrollRef.current?.()
+    stopMotion(animRef.current)
+  }, [])
+
+  return { showJumpToBottom, jumpToBottom: () => scrollToBottom(true) }
+}
+
+export function ChatJumpToBottomButton({ visible, onClick }: { visible: boolean; onClick: () => void }) {
+  if (!visible) return null
+  return (
+    <button type="button" className="chat-jump-bottom" data-testid="chat-jump-bottom" onClick={onClick} aria-label="Jump to latest message">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 5v14M6.5 12.5 12 19l5.5-6.5" />
+      </svg>
+    </button>
+  )
+}
 
 // Fires window.api.sessions.generateSummary(...) after every 4 completed
 // user/assistant exchanges, and once more when the session is switched away
@@ -155,22 +284,17 @@ export function SessionContextMenu({
   const [pendingDelete, setPendingDelete] = useState(false)
   const deleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const pendingDeleteRef = useRef(pendingDelete)
+  pendingDeleteRef.current = pendingDelete
 
   useEffect(() => () => { if (deleteTimer.current) clearTimeout(deleteTimer.current) }, [])
 
   useEffect(() => {
     menuRef.current?.querySelector('button')?.focus()
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      onClose?.()
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [onClose])
+  }, [])
 
   function handleDeleteClick() {
-    if (confirmDestructive && !pendingDelete) {
+    if (confirmDestructive && !pendingDeleteRef.current) {
       setPendingDelete(true)
       if (deleteTimer.current) clearTimeout(deleteTimer.current)
       deleteTimer.current = setTimeout(() => setPendingDelete(false), 3000)
@@ -180,12 +304,43 @@ export function SessionContextMenu({
     onDelete()
   }
 
+  // Single-letter shortcuts (P/R/A/D) mirror the labels shown in the menu.
+  // Scoped to a document listener for the lifetime of this open menu only.
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') { event.preventDefault(); onClose?.(); return }
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+      const target = event.target as HTMLElement | null
+      if (target && /^(input|textarea)$/i.test(target.tagName)) return
+      switch (event.key.toLowerCase()) {
+        case 'p': event.preventDefault(); onTogglePin(); break
+        case 'r': event.preventDefault(); onRename(); break
+        case 'a': if (onToggleArchive) { event.preventDefault(); onToggleArchive() } break
+        case 'd': event.preventDefault(); handleDeleteClick(); break
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [onClose, onTogglePin, onRename, onToggleArchive, confirmDestructive])
+
   return createPortal(
     <div ref={menuRef} className="session-context-menu" style={{ top: y, left: x }} role="menu" onPointerDown={e => e.stopPropagation()}>
-      <button className="session-context-item" role="menuitem" data-testid="session-menu-pin" onClick={onTogglePin}>{pinned ? 'Unpin' : 'Pin'}</button>
-      <button className="session-context-item" role="menuitem" data-testid="session-menu-rename" onClick={onRename}>Rename</button>
+      <button className="session-context-item" role="menuitem" data-testid="session-menu-pin" onClick={onTogglePin}>
+        <span>{pinned ? 'Unpin' : 'Pin'}</span>
+        <span className="session-ctx-shortcut">P</span>
+      </button>
+      <button className="session-context-item" role="menuitem" data-testid="session-menu-rename" onClick={onRename}>
+        <span>Rename</span>
+        <span className="session-ctx-shortcut">R</span>
+      </button>
       {onToggleArchive && (
-        <button className="session-context-item" role="menuitem" data-testid="session-menu-archive" onClick={onToggleArchive}>{archived ? 'Unarchive' : 'Archive'}</button>
+        <>
+          <div className="session-context-divider" />
+          <button className="session-context-item" role="menuitem" data-testid="session-menu-archive" onClick={onToggleArchive}>
+            <span>{archived ? 'Unarchive' : 'Archive'}</span>
+            <span className="session-ctx-shortcut">A</span>
+          </button>
+        </>
       )}
       <div className="session-context-divider" />
       <button
@@ -194,7 +349,8 @@ export function SessionContextMenu({
         data-testid="session-menu-delete"
         onClick={handleDeleteClick}
       >
-        {pendingDelete ? 'Click again to confirm' : 'Delete'}
+        <span>{pendingDelete ? 'Click again to confirm' : 'Delete'}</span>
+        {!pendingDelete && <span className="session-ctx-shortcut">D</span>}
       </button>
     </div>,
     document.body
@@ -213,13 +369,13 @@ export function AgentSessionRail({
   disabledTitle,
   emptyLabel = 'No sessions yet',
   headerSlot,
+  openMenuSessionId,
   onNew,
   onSelect,
   onOptions,
   onRenameChange,
   onRenameCommit,
   onRenameCancel,
-  onDeleteMany,
 }: {
   sessions: Session[]
   archivedSessions?: Session[]
@@ -231,22 +387,23 @@ export function AgentSessionRail({
   disabled?: boolean
   disabledTitle?: string
   emptyLabel?: string
+  /** File-instructions buttons (CLAUDE.md, App CLAUDE.md, AI.md, …), shown in the bottom dropup. */
   headerSlot?: ReactNode
+  /** The session whose context menu is currently open, so its row's "..." stays visible without hover. */
+  openMenuSessionId?: string | null
   onNew?: () => void
   onSelect: (session: Session) => void
   onOptions: (event: MouseEvent, session: Session) => void
   onRenameChange: (value: string) => void
   onRenameCommit: (session: Session) => void
   onRenameCancel: () => void
-  /** Enables the select-mode toggle + bulk delete bar when provided. */
-  onDeleteMany?: (ids: string[]) => void
 }) {
   const [filter, setFilter] = useState('')
   const [showArchived, setShowArchived] = useState(false)
-  const [selectMode, setSelectMode] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [pendingBulkDelete, setPendingBulkDelete] = useState(false)
-  const bulkDeleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [instructionsDropupOpen, setInstructionsDropupOpen] = useState(false)
+  const [dropupRect, setDropupRect] = useState<{ left: number; bottom: number; width: number } | null>(null)
+  const dropupTriggerRef = useRef<HTMLButtonElement>(null)
+  const dropupPanelRef = useRef<HTMLDivElement>(null)
   const query = filter.trim().toLowerCase()
   const filteredSessions = query
     ? sessions.filter(s => (s.title || newLabel).toLowerCase().includes(query))
@@ -260,60 +417,47 @@ export function AgentSessionRail({
     sessionMotionRef.current = []
   }, [])
 
-  useEffect(() => () => { if (bulkDeleteTimer.current) clearTimeout(bulkDeleteTimer.current) }, [])
-
-  function toggleSelectMode() {
-    setSelectMode(v => !v)
-    setSelectedIds(new Set())
-    setPendingBulkDelete(false)
-    if (bulkDeleteTimer.current) clearTimeout(bulkDeleteTimer.current)
-  }
-
-  function toggleSelected(id: string) {
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id); else next.add(id)
-      return next
-    })
-  }
-
-  function handleBulkDeleteClick() {
-    if (selectedIds.size === 0) return
-    if (!pendingBulkDelete) {
-      setPendingBulkDelete(true)
-      if (bulkDeleteTimer.current) clearTimeout(bulkDeleteTimer.current)
-      bulkDeleteTimer.current = setTimeout(() => setPendingBulkDelete(false), 3000)
-      return
+  function toggleInstructionsDropup() {
+    if (!instructionsDropupOpen && dropupTriggerRef.current) {
+      const r = dropupTriggerRef.current.getBoundingClientRect()
+      setDropupRect({ left: r.left + 8, bottom: window.innerHeight - r.top, width: r.width - 16 })
     }
-    if (bulkDeleteTimer.current) clearTimeout(bulkDeleteTimer.current)
-    setPendingBulkDelete(false)
-    const ids = [...selectedIds]
-    setSelectedIds(new Set())
-    setSelectMode(false)
-    onDeleteMany?.(ids)
+    setInstructionsDropupOpen(v => !v)
   }
+
+  // The panel is portaled to <body> (see render below) so it can escape the
+  // sidebar's `overflow: hidden` and float above the trigger — so "outside
+  // click" here must check both the trigger and the portaled panel.
+  useEffect(() => {
+    if (!instructionsDropupOpen) return
+    function handlePointerDown(e: PointerEvent) {
+      const target = e.target as Node
+      if (dropupTriggerRef.current?.contains(target)) return
+      if (dropupPanelRef.current?.contains(target)) return
+      setInstructionsDropupOpen(false)
+    }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setInstructionsDropupOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [instructionsDropupOpen])
 
   function renderRow(s: Session) {
     const isActive = activeSessionId === s.id
     const isRenaming = renaming?.id === s.id
-    const isChecked = selectedIds.has(s.id)
+    const menuOpen = openMenuSessionId === s.id
     return (
       <li key={s.id} className="session-row">
-        {selectMode && (
-          <input
-            type="checkbox"
-            className="session-row-checkbox"
-            checked={isChecked}
-            onChange={() => toggleSelected(s.id)}
-            onClick={e => e.stopPropagation()}
-            aria-label={`Select ${s.title || newLabel}`}
-          />
-        )}
         <button
           className={`session-item${isActive ? ' active' : ''}`}
           data-testid="session-item"
           onPointerDown={(e) => pressElement(e, sessionMotionRef.current)}
-          onClick={() => { if (selectMode) { toggleSelected(s.id); return } if (!isRenaming) onSelect(s) }}
+          onClick={() => { if (!isRenaming) onSelect(s) }}
         >
           {isRenaming ? (
             <input
@@ -333,22 +477,23 @@ export function AgentSessionRail({
             <span className="session-item-body">
               <span className="session-item-row1">
                 <span className="session-item-title">{s.title || newLabel}</span>
-                {typeof s.updated_at === 'number' && <RelativeTime ts={s.updated_at} compact />}
               </span>
               {s.summary && <span className="session-item-summary">{s.summary}</span>}
             </span>
           )}
         </button>
-        {!selectMode && (
-          <button
-            className="session-dot-menu"
-            data-testid="session-options"
-            title="Session options"
-            aria-label={`Options for ${s.title || newLabel}`}
-            onClick={e => onOptions(e, s)}
-          >
-            ...
-          </button>
+        {!isRenaming && (
+          <span className="session-row-meta">
+            {typeof s.updated_at === 'number' && <RelativeTime ts={s.updated_at} compact />}
+            <button
+              className={`session-row-more-btn${menuOpen ? ' menu-open' : ''}`}
+              data-testid="session-options"
+              aria-label={`Options for ${s.title || newLabel}`}
+              onClick={e => onOptions(e, s)}
+            >
+              <span className="session-row-more-icon" aria-hidden>&#8942;</span>
+            </button>
+          </span>
         )}
       </li>
     )
@@ -362,29 +507,7 @@ export function AgentSessionRail({
           {newLabel}
         </button>
       </div>
-      {headerSlot && <div className="session-list-extra">{headerSlot}</div>}
-      {onDeleteMany && sessions.length > 0 && (
-        <div className="session-search">
-          {sessions.length > 8 && (
-            <input
-              placeholder="Search sessions..."
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              aria-label="Search sessions"
-            />
-          )}
-          <button
-            className={`session-select-toggle${selectMode ? ' on' : ''}`}
-            onClick={toggleSelectMode}
-            title={selectMode ? 'Exit select mode' : 'Select multiple sessions'}
-            aria-label="Toggle select mode"
-            aria-pressed={selectMode}
-          >
-            ☑
-          </button>
-        </div>
-      )}
-      {!onDeleteMany && sessions.length > 8 && (
+      {sessions.length > 8 && (
         <div className="session-search">
           <input
             placeholder="Search sessions..."
@@ -420,16 +543,30 @@ export function AgentSessionRail({
           </>
         )}
       </div>
-      {selectMode && selectedIds.size > 0 && (
-        <div className="session-bulk-bar">
-          <span>{selectedIds.size} selected</span>
-          <div className="session-bulk-bar-actions">
-            <button className="ghost tiny" onClick={toggleSelectMode}>Cancel</button>
-            <button className={`danger tiny${pendingBulkDelete ? ' pending-confirm' : ''}`} onClick={handleBulkDeleteClick}>
-              {pendingBulkDelete ? `Click again to delete ${selectedIds.size} session${selectedIds.size === 1 ? '' : 's'}` : 'Delete selected'}
-            </button>
-          </div>
+      {headerSlot && (
+        <div className="instructions-dropup">
+          <button
+            ref={dropupTriggerRef}
+            type="button"
+            className="instructions-dropup-trigger"
+            onClick={toggleInstructionsDropup}
+            aria-expanded={instructionsDropupOpen}
+          >
+            <span className="instructions-dropup-label">📋 Instructions</span>
+            <span className="instructions-dropup-chevron" aria-hidden>&#8963;</span>
+          </button>
         </div>
+      )}
+      {instructionsDropupOpen && dropupRect && createPortal(
+        <div
+          ref={dropupPanelRef}
+          className="instructions-dropup-panel"
+          style={{ left: dropupRect.left, bottom: dropupRect.bottom, width: dropupRect.width }}
+          onClick={() => setInstructionsDropupOpen(false)}
+        >
+          {headerSlot}
+        </div>,
+        document.body
       )}
     </aside>
   )
@@ -554,6 +691,7 @@ export function EditableUserMessage({
   onSaveResend,
   onCopy,
   extraMeta,
+  rootRef,
 }: {
   content: string
   timestamp: number
@@ -562,6 +700,7 @@ export function EditableUserMessage({
   onCopy?: () => void
   /** Extra content rendered in the message's meta row (e.g. a checkpoint badge). */
   extraMeta?: ReactNode
+  rootRef?: Ref<HTMLDivElement>
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(content)
@@ -583,7 +722,7 @@ export function EditableUserMessage({
 
   if (editing) {
     return (
-      <div className="msg user editing">
+      <div ref={rootRef} className="msg user editing">
         <div className="msg-edit-wrap">
           <textarea
             className="msg-edit-textarea"
@@ -606,7 +745,7 @@ export function EditableUserMessage({
   }
 
   return (
-    <div className="msg user">
+    <div ref={rootRef} className="msg user">
       <div className="msg-body" onClick={startEdit} title={disabled ? undefined : 'Click to edit'}>{content}</div>
       <div className="msg-meta">
         <span className="msg-timestamp"><RelativeTime ts={timestamp} /></span>

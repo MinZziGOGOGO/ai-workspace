@@ -2,6 +2,7 @@ import { test, expect, _electron as electron, type Page } from '@playwright/test
 import { execFileSync } from 'node:child_process'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { createServer } from 'node:http'
 import { cleanupGeneratedTitle, fallbackTitleFromText, isGenericSessionTitle } from '../../src/shared/sessionTitles'
 
 type Rect = { x: number; y: number; width: number; height: number }
@@ -222,9 +223,15 @@ test('shared session rail supports pin, rename, archive, search, and confirmed d
     await expect(chatPanel.locator('.session-archived-list').getByTestId('session-item')).toContainText('Renamed parity session')
 
     await chatPanel.locator('.session-archived-list').getByTestId('session-options').click()
-    await page.getByTestId('session-menu-delete').click()
-    await expect(page.getByTestId('session-menu-delete')).toContainText('Click again to confirm')
-    await page.getByTestId('session-menu-delete').click()
+    const deleteMenuItem = page.getByTestId('session-menu-delete')
+    const restingDeleteColor = await deleteMenuItem.evaluate(element => getComputedStyle(element).color)
+    await expect(deleteMenuItem).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await deleteMenuItem.hover()
+    await expect(deleteMenuItem).toHaveCSS('background-color', restingDeleteColor)
+    await expect(deleteMenuItem).toHaveCSS('color', 'rgb(255, 255, 255)')
+    await deleteMenuItem.click()
+    await expect(deleteMenuItem).toContainText('Click again to confirm')
+    await deleteMenuItem.click()
     await expect(chatPanel.locator('.session-archived-list')).toHaveCount(0)
     await expect(chatPanel.getByRole('button', { name: /archived session/ })).toHaveCount(0)
   } finally {
@@ -300,6 +307,105 @@ test('accessibility mechanics keep focus, contrast, and compact targets usable',
     expect(menuItemBox.height).toBeGreaterThanOrEqual(32)
     await page.keyboard.press('Escape')
     await expect(page.locator('.session-context-menu')).toHaveCount(0)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Chat user messages use the same feed column as agent messages', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Chat Message Layout Project')
+
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+    await page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          messages: [
+            {
+              id: 'layout-user',
+              session_id: 'layout-session',
+              role: 'user',
+              content: 'This message should sit in the normal feed column.',
+              model: null,
+              created_at: Date.now() - 1000,
+            },
+            {
+              id: 'layout-assistant',
+              session_id: 'layout-session',
+              role: 'assistant',
+              content: 'Assistant response for layout comparison.',
+              model: 'e2e-chat-model',
+              created_at: Date.now(),
+            },
+          ],
+        },
+      }))
+    })
+
+    await expect(chatPanel.locator('.chat-scroll > .msg.user')).toHaveCount(1)
+    const layout = await chatPanel.locator('.chat-scroll').evaluate((scroll) => {
+      const user = scroll.querySelector<HTMLElement>('.msg.user')
+      const assistant = scroll.querySelector<HTMLElement>('.msg.assistant')
+      if (!user || !assistant) throw new Error('Missing test messages')
+      const userRect = user.getBoundingClientRect()
+      const assistantRect = assistant.getBoundingClientRect()
+      return {
+        userIsDirectChild: user.parentElement === scroll,
+        userWidth: Math.round(userRect.width),
+        assistantWidth: Math.round(assistantRect.width),
+      }
+    })
+    expect(layout.userIsDirectChild).toBe(true)
+    expect(Math.abs(layout.userWidth - layout.assistantWidth)).toBeLessThanOrEqual(8)
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: {
+          busy: true,
+          thinking: 'I am checking the relevant constraints before answering.',
+          streaming: 'Here is the answer so far.',
+        },
+      }))
+    })
+    await expect(chatPanel.locator('.thinking-block')).toBeVisible()
+    await expect(chatPanel.locator('.thinking-block')).toContainText('Thought for')
+
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'layout-long-session', project_id: 'test', mode: 'chat', title: 'Long chat', created_at: now },
+          messages: Array.from({ length: 32 }, (_, index) => ({
+            id: `layout-long-${index}`,
+            session_id: 'layout-long-session',
+            role: index % 2 === 0 ? 'user' : 'assistant',
+            content: `Long scroll message ${index + 1}\n\n${'This line gives the chat enough height to scroll naturally. '.repeat(8)}`,
+            model: index % 2 === 0 ? null : 'e2e-chat-model',
+            created_at: now + index,
+          })),
+        },
+      }))
+    })
+
+    const scroll = chatPanel.locator('.chat-scroll')
+    await expect.poll(() => scroll.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true)
+    await expect.poll(() => scroll.evaluate((el) => Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight - 4)).toBe(true)
+    await scroll.evaluate((el) => {
+      el.dispatchEvent(new WheelEvent('wheel', { deltaY: -500, bubbles: true }))
+      el.scrollTop = 0
+      el.dispatchEvent(new Event('scroll'))
+    })
+    await expect(chatPanel.getByTestId('chat-jump-bottom')).toBeVisible()
+    await chatPanel.getByTestId('chat-jump-bottom').click({ force: true })
+    await expect.poll(() => scroll.evaluate((el) => Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight - 4)).toBe(true)
   } finally {
     await electronApp.close().catch(() => undefined)
   }
@@ -425,6 +531,35 @@ test('Hermes ask mode renders permission approvals for deny, allow once, and all
     await page.getByTestId('hermes-permission-allow-once').click()
     await expect(page.getByTestId('hermes-permission-card')).toHaveCount(0)
     await expect(hermesPanel).toContainText('Fake Hermes approved and completed: allow this permission once')
+    const firstTool = hermesPanel.getByTestId('hermes-tool-summary').filter({ hasText: 'npm test' }).first()
+    await expect(firstTool).toBeVisible()
+    await firstTool.click()
+    await expect(hermesPanel.getByTestId('hermes-tool-details').first()).toContainText('Tool')
+    await expect(hermesPanel.getByTestId('hermes-tool-details').first()).toContainText('npm test')
+    await expect(hermesPanel.locator('.hermes-tool-details .syntax-block').first()).toBeVisible()
+    await expect(hermesPanel.locator('.hermes-tool-details .syntax-command').first()).toBeVisible()
+    const toolBox = await hermesPanel.getByTestId('hermes-tool-card').first().boundingBox()
+    const responseBox = await hermesPanel.getByText('Fake Hermes approved and completed: allow this permission once').boundingBox()
+    if (!toolBox || !responseBox) throw new Error('Missing Hermes tool ordering geometry')
+    expect(toolBox.y).toBeLessThan(responseBox.y)
+    const inlineToolStyle = await hermesPanel.evaluate((panel) => {
+      const toolCard = panel.querySelector<HTMLElement>('[data-testid="hermes-tool-card"]')
+      const summary = panel.querySelector<HTMLElement>('[data-testid="hermes-tool-summary"]')
+      if (!toolCard || !summary) throw new Error('Missing Hermes inline tool targets')
+      const cardStyle = getComputedStyle(toolCard)
+      const summaryStyle = getComputedStyle(summary)
+      return {
+        cardBorder: cardStyle.borderTopStyle,
+        cardBackground: cardStyle.backgroundColor,
+        summaryBackground: summaryStyle.backgroundColor
+      }
+    })
+    expect(inlineToolStyle.cardBorder).toBe('none')
+    expect(inlineToolStyle.cardBackground).toBe('rgba(0, 0, 0, 0)')
+    expect(inlineToolStyle.summaryBackground).toBe('rgba(0, 0, 0, 0)')
+    await hermesPanel.getByRole('button', { name: 'Board' }).click()
+    await expect(hermesPanel.locator('.kanban-board')).toContainText('npm test')
+    await hermesPanel.getByRole('button', { name: 'Chat' }).click()
 
     await page.getByTestId('hermes-composer').fill('allow this permission for the session')
     await page.getByTestId('hermes-send').click()
@@ -1292,7 +1427,21 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('knowledge-detail')).toContainText(extractedSmokeTitle)
     await expect(page.getByTestId('knowledge-detail')).toContainText('extractor')
     await expect(page.getByTestId('knowledge-detail-content')).toContainText('Full detail inspection text only appears after opening the knowledge item.')
+    await expect(page.locator('.memory-edit')).toHaveCount(0)
+    const detailOffset = await page.getByTestId('knowledge-detail').evaluate((el) => {
+      const rect = el.getBoundingClientRect()
+      return {
+        x: Math.abs(rect.left + rect.width / 2 - window.innerWidth / 2),
+        y: Math.abs(rect.top + rect.height / 2 - window.innerHeight / 2)
+      }
+    })
+    expect(detailOffset.x).toBeLessThanOrEqual(12)
+    expect(detailOffset.y).toBeLessThanOrEqual(12)
     await expect(page.getByTestId('knowledge-detail-copy')).toBeVisible()
+    await page.getByTestId('knowledge-detail-edit').click()
+    await page.getByTestId('knowledge-detail-editor').fill(`${extractedSmokeContent}\nEdited inside the detail window only.`)
+    await page.getByTestId('knowledge-detail-save-edit').click()
+    await expect(page.getByTestId('knowledge-detail-content')).toContainText('Edited inside the detail window only.')
     await expect(page.getByTestId('knowledge-detail')).toContainText('Uses')
     await page.getByTestId('knowledge-detail-stale').click()
     await expect(page.getByTestId('knowledge-detail')).toContainText('Stale since')
@@ -1609,7 +1758,35 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     const extensionsPanel = page.getByTestId('workspace-panel-extensions')
     await expect(extensionsPanel).toBeVisible()
     await expect(extensionsPanel).toContainText('MCP SERVERS')
-    await expect(extensionsPanel.getByRole('button', { name: 'MCP Servers' })).toBeVisible()
+    await expect(extensionsPanel.getByRole('tab', { name: 'MCP Servers' })).toHaveAttribute('aria-selected', 'true')
+    const extensionsScroll = extensionsPanel.locator('.ext-tab-panel').first()
+    await expect(extensionsScroll).toBeVisible()
+    const initialTabMetrics = await extensionsPanel.evaluate((panel) => {
+      const active = panel.querySelector<HTMLElement>('.ext-tab.active')
+      const inactive = panel.querySelector<HTMLElement>('.ext-tab:not(.active)')
+      const body = panel.querySelector<HTMLElement>('.ext-tab-panel')
+      const registry = panel.querySelector<HTMLElement>('[data-testid="mcp-registry-browser"]')
+      if (!active || !inactive || !body || !registry) throw new Error('Missing extension picker or panel body')
+      const probe = document.createElement('div')
+      probe.style.height = '900px'
+      probe.style.flex = '0 0 900px'
+      body.appendChild(probe)
+      body.scrollTop = 400
+      const scrollProbeMoved = body.scrollTop > 0
+      probe.remove()
+      body.scrollTop = 0
+      return {
+        activeBackground: getComputedStyle(active).backgroundColor,
+        inactiveBackground: getComputedStyle(inactive).backgroundColor,
+        panelOverflowY: getComputedStyle(body).overflowY,
+        registryIsClipped: registry.scrollHeight > registry.clientHeight + 1,
+        scrollProbeMoved,
+      }
+    })
+    expect(initialTabMetrics.activeBackground).not.toBe(initialTabMetrics.inactiveBackground)
+    expect(initialTabMetrics.panelOverflowY).toBe('auto')
+    expect(initialTabMetrics.registryIsClipped).toBe(false)
+    expect(initialTabMetrics.scrollProbeMoved).toBe(true)
     await expect(extensionsPanel.getByTestId('mcp-registry-browser')).toContainText('Discover MCP servers')
     await expect(extensionsPanel.getByRole('button', { name: /Developer Tools/ })).toBeVisible()
     await expect(extensionsPanel.getByRole('button', { name: /Data & Storage/ })).toBeVisible()
@@ -1619,7 +1796,8 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(extensionsPanel.getByTestId('mcp-registry-query-note')).toContainText('postgres')
     await expect(extensionsPanel.getByTestId('mcp-registry-result').first()).toContainText('postgres MCP Server')
 
-    await extensionsPanel.getByRole('button', { name: 'Skills', exact: true }).click()
+    await extensionsPanel.getByRole('tab', { name: 'Skills', exact: true }).click()
+    await expect(extensionsPanel.getByRole('tab', { name: 'Skills', exact: true })).toHaveAttribute('aria-selected', 'true')
     // Deterministic chrome only: the list/error body depends on whether a real
     // Hermes dashboard is reachable on the machine running the suite.
     await expect(extensionsPanel).toContainText('INSTALLED SKILLS')
@@ -2046,6 +2224,18 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     // Motion mode is fully wired and updates the document-level motion guard.
     await page.getByRole('combobox', { name: 'Motion' }).selectOption('off')
     await expect.poll(() => page.evaluate(() => document.documentElement.dataset.motion)).toBe('off')
+    await expect(page.getByRole('combobox', { name: 'App font' }).locator('option')).toHaveCount(27)
+    await expect
+      .poll(() =>
+        page
+          .getByRole('combobox', { name: 'App font' })
+          .locator('option[value="palatino"]')
+          .evaluate((option) => (option as HTMLOptionElement).style.fontFamily)
+      )
+      .toContain('Palatino')
+    await page.getByRole('combobox', { name: 'App font' }).selectOption('georgia')
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.fontFamily)).toBe('georgia')
+    await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--font-sans'))).toContain('Georgia')
     // Save feedback appears briefly
     await expect(page.getByTestId('settings-message')).toBeVisible({ timeout: 3000 })
 
@@ -2075,6 +2265,7 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     const restartedPage = await electronApp.firstWindow()
     await restartedPage.waitForLoadState('domcontentloaded')
     await expect(restartedPage.getByTestId('workspace-shell')).toBeVisible()
+    await expect.poll(() => restartedPage.evaluate(() => document.documentElement.dataset.fontFamily)).toBe('georgia')
     await restartedPage.getByTestId('open-settings').click()
     await restartedPage.getByTestId('settings-nav-shortcuts').click()
     await expect(restartedPage.getByTestId('shortcut-key-nav_chat')).toContainText('Ctrl+Alt+Y')
@@ -2187,5 +2378,147 @@ test('setup wizard runs on first launch and stays dismissed after completion', a
     await expect(third.getByTestId('setup-wizard-step-1')).toBeVisible()
   } finally {
     await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Browser panel opens with working chrome and closes cleanly', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    // Default closed in all workspaces.
+    await expect(page.getByTestId('workspace-panel-browser')).toHaveCount(0)
+
+    // Opens from the Tools group and renders the full chrome (tab bar + URL bar).
+    // The web page itself is a native WebContentsView above the DOM, so the e2e
+    // harness can only exercise the React-rendered chrome, not real page loads.
+    await page.getByTestId('workspace-tool-browser').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-tabbar')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-url-input')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-new-tab')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-persist-toggle')).toBeVisible()
+
+    // A first tab is created automatically; a second can be added and selected.
+    await expect.poll(() => browserPanel.getByTestId('browser-tab').count()).toBeGreaterThanOrEqual(1)
+    const initialCount = await browserPanel.getByTestId('browser-tab').count()
+    await browserPanel.getByTestId('browser-new-tab').click()
+    await expect.poll(() => browserPanel.getByTestId('browser-tab').count()).toBe(initialCount + 1)
+
+    // The URL bar accepts input (address editing works without a live page).
+    await browserPanel.getByTestId('browser-url-input').fill('example.com')
+    await expect(browserPanel.getByTestId('browser-url-input')).toHaveValue('example.com')
+
+    // Unsafe schemes are blocked in main and surfaced in the browser chrome.
+    await browserPanel.getByTestId('browser-url-input').fill('file:///C:/Windows/win.ini')
+    await browserPanel.getByTestId('browser-go').click()
+    await expect(browserPanel.getByTestId('browser-navigation-error')).toContainText('unsupported scheme')
+
+    // The chrome reads correctly in both themes.
+    for (const theme of ['dark', 'light'] as const) {
+      await page.evaluate((t) => {
+        if (t === 'dark') document.documentElement.dataset.theme = 'dark'
+        else document.documentElement.removeAttribute('data-theme')
+      }, theme)
+      const colors = await browserPanel.getByTestId('browser-url-input').evaluate((el) => {
+        const s = getComputedStyle(el)
+        return { bg: s.backgroundColor, fg: s.color }
+      })
+      expect(colors.bg).not.toBe(colors.fg)
+    }
+
+    // Closing the panel removes it and unmounts the chrome.
+    await page.getByTestId('workspace-panel-close-browser').click()
+    await expect(page.getByTestId('workspace-panel-browser')).toHaveCount(0)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Browser MCP navigation uses the shared approval card and parks native content', async ({}, testInfo) => {
+  const port = 18973
+  const pagePort = 18974
+  const localPage = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<!doctype html><html><body><label for="note">Private note</label><input id="note" aria-label="Private note"><button>Save</button></body></html>')
+  })
+  await new Promise<void>((resolve) => localPage.listen(pagePort, '127.0.0.1', resolve))
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_BROWSER_CONTROL: '1',
+    AIWORKSPACE_BROWSER_CONTROL_PORT: String(port),
+  })
+  const headers = {
+    'content-type': 'application/json',
+    'x-aiw-agent-id': 'e2e-codex',
+    'x-aiw-agent-name': 'Codex E2E',
+    'x-aiw-identity-source': 'app-launch',
+  }
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-browser').click()
+    await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).activeTabId).not.toBeNull()
+    const tabId = (await page.evaluate(() => window.api.browser.listTabs())).activeTabId!
+    await expect.poll(async () => {
+      try { return (await fetch(`http://127.0.0.1:${port}/browser/state`, { headers })).status } catch { return 0 }
+    }).toBe(200)
+
+    const deniedFetch = fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/navigate`, {
+      method: 'POST', headers: { ...headers, 'x-aiw-request-id': 'deny-navigation' }, body: JSON.stringify({ url: 'https://example.com/denied' })
+    })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await expect(page.getByTestId('browser-approval-card')).toContainText('Codex E2E')
+    await expect(page.getByTestId('browser-approval-card')).toContainText('https://example.com')
+    const parked = await (await fetch(`http://127.0.0.1:${port}/browser/state`, { headers })).json() as { result?: { panelVisible?: boolean } }
+    expect(parked.result?.panelVisible).toBe(false)
+    await page.getByTestId('browser-approval-deny').click()
+    expect((await deniedFetch).status).toBe(403)
+    expect((await page.evaluate(() => window.api.browser.listTabs())).tabs.find((tab) => tab.id === tabId)?.url).not.toContain('/denied')
+
+    const approvedFetch = fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/navigate`, {
+      method: 'POST', headers: { ...headers, 'x-aiw-request-id': 'approve-navigation' }, body: JSON.stringify({ url: 'https://example.com/approved' })
+    })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await page.getByTestId('browser-approval-approve').click()
+    expect((await approvedFetch).status).toBe(200)
+    await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).tabs.find((tab) => tab.id === tabId)?.url).toContain('/approved')
+    await expect(page.getByTestId('browser-approval-card')).toHaveCount(0)
+
+    // Element-bound actions use the same queue. Mode 2 permits reads/local
+    // navigation but prompts for typing, which lets this test invalidate an
+    // approved target by navigating while its card is pending.
+    await page.evaluate(({ id, url }) => window.api.browser.navigate(id, url), { id: tabId, url: `http://127.0.0.1:${pagePort}/form` })
+    await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).tabs.find((tab) => tab.id === tabId)?.url).toContain('/form')
+    await page.evaluate(() => window.api.hermes.setPermissionMode(2))
+    const snapshotResponse = await fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/snapshot`, { headers })
+    const snapshotJson = await snapshotResponse.json() as { result: { elements: Array<{ id: string; role: string }> } }
+    const inputId = snapshotJson.result.elements.find((element) => element.role === 'textbox')?.id
+    expect(inputId).toBeTruthy()
+
+    const staleType = fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/type`, {
+      method: 'POST', headers: { ...headers, 'x-aiw-request-id': 'stale-type' }, body: JSON.stringify({ elementId: inputId, text: 'do not retain me' })
+    })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await page.evaluate(({ id, url }) => window.api.browser.navigate(id, url), { id: tabId, url: `http://127.0.0.1:${pagePort}/changed` })
+    expect((await staleType).status).toBe(403)
+    await expect(page.getByTestId('browser-approval-card')).toHaveCount(0)
+
+    await page.evaluate(({ id, url }) => window.api.browser.navigate(id, url), { id: tabId, url: `http://127.0.0.1:${pagePort}/form` })
+    await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).tabs.find((tab) => tab.id === tabId)?.url).toContain('/form')
+    const freshSnapshot = await (await fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/snapshot`, { headers })).json() as { result: { elements: Array<{ id: string; role: string }> } }
+    const freshInputId = freshSnapshot.result.elements.find((element) => element.role === 'textbox')?.id
+    const approvedType = fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/type`, {
+      method: 'POST', headers: { ...headers, 'x-aiw-request-id': 'approved-type' }, body: JSON.stringify({ elementId: freshInputId, text: 'approved text' })
+    })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await expect(page.getByTestId('browser-approval-card')).toContainText('13 characters')
+    await page.getByTestId('browser-approval-approve').click()
+    expect((await approvedType).status).toBe(200)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+    await new Promise<void>((resolve) => localPage.close(() => resolve()))
   }
 })

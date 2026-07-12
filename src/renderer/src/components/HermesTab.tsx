@@ -8,10 +8,11 @@ import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import { useToast } from './ToastContext'
 import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
-import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
+import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import { WorkspaceNotice } from './WorkspacePrimitives'
 import InstructionsEditor from './InstructionsEditor'
-import anime, { animateScrollToBottom, prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
+import ToolSyntaxBlock from './ToolSyntaxBlock'
+import anime, { prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
 import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
@@ -56,8 +57,8 @@ function ThinkingBlock(props: { text: string; tokenCount: number; done: boolean 
 
 const KANBAN_COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
   { key: 'todo', label: 'To Do', statuses: ['pending'] },
-  { key: 'in_progress', label: 'In Progress', statuses: ['in_progress'] },
-  { key: 'done', label: 'Done', statuses: ['completed'] },
+  { key: 'in_progress', label: 'In Progress', statuses: ['in_progress', 'running'] },
+  { key: 'done', label: 'Done', statuses: ['completed', 'done', 'error'] },
 ]
 
 function columnForStatus(status: string): string {
@@ -92,18 +93,166 @@ function KanbanBoard(props: { entries: HermesPlanEntry[] }) {
   )
 }
 
+function cleanActivityMessage(message: string): string {
+  return message.replace(/^✓\s*/, '').replace(/^âœ“\s*/, '').trim()
+}
+
+function terminalCommandFromActivity(activity: HermesActivity): string | null {
+  const candidates = [activity.toolName, activity.message, activity.result].filter((value): value is string => typeof value === 'string')
+  for (const value of candidates) {
+    const cleaned = cleanActivityMessage(value)
+    const match = cleaned.match(/^terminal:\s*(.+)$/i)
+    if (match?.[1]?.trim()) return match[1].trim()
+  }
+  return null
+}
+
+function commandTextFromActivity(activity: HermesActivity): string | null {
+  const terminal = terminalCommandFromActivity(activity)
+  if (terminal) return terminal
+  if (activity.args && typeof activity.args === 'object' && 'command' in activity.args) {
+    const command = (activity.args as { command?: unknown }).command
+    if (typeof command === 'string' && command.trim()) return command.trim()
+  }
+  const candidates = [activity.toolName, activity.message].filter((value): value is string => typeof value === 'string')
+  for (const value of candidates) {
+    const cleaned = cleanActivityMessage(value)
+    if (/^(?:npm|pnpm|yarn|node|git|rg|grep|python|pip|wsl|powershell|cmd|date|whoami|uname)\b/i.test(cleaned)) return cleaned
+  }
+  return null
+}
+
+function hasOnlyGenericToolName(activity: HermesActivity): boolean {
+  const name = activity.toolName?.trim().toLowerCase()
+  return !name || name === 'tool' || name === 'remote tool'
+}
+
+function meaningfulActivityMessage(activity: HermesActivity): string {
+  const message = cleanActivityMessage(activity.message)
+  if (!message || /^remote tool$/i.test(message) || /^tool$/i.test(message)) return ''
+  return message
+}
+
+function activityLabel(activity: HermesActivity): string {
+  if (activity.kind === 'plan') return 'Updated plan'
+  if (activity.kind === 'error') return 'Tool error'
+  if (terminalCommandFromActivity(activity)) return activity.status === 'done' ? 'Ran command' : 'Running command'
+  if (hasOnlyGenericToolName(activity) && meaningfulActivityMessage(activity)) return activity.status === 'done' ? 'Completed update' : 'Hermes update'
+  if (activity.status === 'done') return 'Finished tool'
+  return 'Used tool'
+}
+
+function activityName(activity: HermesActivity): string {
+  const command = terminalCommandFromActivity(activity)
+  if (command) return command
+  if (hasOnlyGenericToolName(activity)) {
+    const message = meaningfulActivityMessage(activity)
+    if (message) return message
+  }
+  return activity.toolName || activity.message.replace(/^✓\s*/, '').split(':')[0].split('(')[0].trim() || activity.kind
+}
+
+function formatToolValue(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function ToolActivityCard(props: { activity: HermesActivity; live?: boolean }) {
+  const { activity } = props
+  const [open, setOpen] = useState(false)
+  const args = formatToolValue(activity.args)
+  const result = formatToolValue(activity.result)
+  const details = formatToolValue(activity.details)
+  const commandText = commandTextFromActivity(activity)
+  return (
+    <div className={`hermes-tool-card${open ? ' open' : ''}${activity.kind === 'error' ? ' err' : ''}`} data-testid="hermes-tool-card">
+      <button
+        type="button"
+        className="hermes-tool-summary"
+        data-testid="hermes-tool-summary"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="hermes-tool-chevron" aria-hidden>{open ? 'v' : '>'}</span>
+        <span className="hermes-tool-label">{activityLabel(activity)}</span>
+        <span className="hermes-tool-name">{activityName(activity)}</span>
+        {props.live && <span className="hermes-tool-live-dot" aria-hidden />}
+      </button>
+      {open && (
+        <div className="hermes-tool-details" data-testid="hermes-tool-details">
+          <div className="hermes-tool-detail-row">
+            <span>Tool</span>
+            <strong>{activityName(activity)}</strong>
+          </div>
+          {activity.status && (
+            <div className="hermes-tool-detail-row">
+              <span>Status</span>
+              <strong>{activity.status}</strong>
+            </div>
+          )}
+          <ToolSyntaxBlock value={commandText ?? activity.message} language={commandText ? 'shell' : 'text'} />
+          {args && (
+            <>
+              <div className="hermes-tool-detail-heading">Input</div>
+              <ToolSyntaxBlock value={args} language="json" />
+            </>
+          )}
+          {result && (
+            <>
+              <div className="hermes-tool-detail-heading">Result</div>
+              <ToolSyntaxBlock value={result} language={commandText ? 'shell' : 'auto'} />
+            </>
+          )}
+          {details && !args && !result && (
+            <>
+              <div className="hermes-tool-detail-heading">Remote payload</div>
+              <ToolSyntaxBlock value={details} language="json" />
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+type HermesLiveSegment =
+  | { id: string; kind: 'text'; text: string }
+  | { id: string; kind: 'activity'; activity: HermesActivity }
+
+function boardEntryFromActivity(activity: HermesActivity): HermesPlanEntry {
+  const name = activityName(activity)
+  const detail = activity.message && activity.message !== name ? `: ${activity.message}` : ''
+  return {
+    content: `${activityLabel(activity)} ${name}${detail}`,
+    status: activity.status === 'done' ? 'completed' : activity.status === 'error' ? 'error' : 'in_progress'
+  }
+}
+
+function activitiesFromToolMessages(messages: Message[]): HermesActivity[] {
+  const activities: HermesActivity[] = []
+  for (const message of messages) {
+    if (message.role !== 'tool') continue
+    try {
+      const parsed = JSON.parse(message.content)
+      if (Array.isArray(parsed)) activities.push(...parsed)
+    } catch {
+      // Ignore legacy tool blobs that were not JSON arrays.
+    }
+  }
+  return activities
+}
+
 function ActivityLog(props: { entries: HermesActivity[]; live?: boolean }) {
   if (props.entries.length === 0) return null
   return (
-    <div className="tool-activity">
+    <div className="hermes-tool-stack">
       {props.entries.map((e, i) => (
-        <div key={i} className="activity-line-item">
-          <div className="activity-line">
-            <span className={`activity-line-name${e.kind === 'error' ? ' err' : ''}`}>{e.kind}</span>
-            <span className="activity-line-detail">{e.message}</span>
-            {props.live && i === props.entries.length - 1 && <span className="activity-line-spinner" aria-hidden>◌</span>}
-          </div>
-        </div>
+        <ToolActivityCard key={i} activity={e} live={props.live && i === props.entries.length - 1} />
       ))}
     </div>
   )
@@ -219,6 +368,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [streamText, setStreamText] = useState('')
   const [thoughtText, setThoughtText] = useState('')
   const [activity, setActivity] = useState<HermesActivity[]>([])
+  const [liveSegments, setLiveSegments] = useState<HermesLiveSegment[]>([])
   const [planEntries, setPlanEntries] = useState<HermesPlanEntry[]>([])
   const [view, setView] = useState<'chat' | 'board'>('chat')
   const [error, setError] = useState('')
@@ -245,8 +395,6 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [emptyHeading] = useState(() => HERMES_EMPTY_HEADINGS[Math.floor(Math.random() * HERMES_EMPTY_HEADINGS.length)])
 
   const scrollRef = useRef<HTMLDivElement>(null)
-  const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
-  const scrollAnimRef = useRef<MotionHandle>(null)
   const sessionSwitchAnimRef = useRef<MotionHandle>(null)
   const sessionRef = useRef<Session | null>(null)
   const newSessionRef = useRef<() => void>(() => {})
@@ -275,10 +423,38 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     toolName: activeToolName,
     progressKey: `${streamText.length}:${thoughtText.length}:${activity.length}:${lastActivity?.message.length ?? 0}`
   })
+  const { showJumpToBottom, jumpToBottom } = useChatScrollFollow(
+    scrollRef,
+    [messages.length, liveSegments.length, streamText.length, thoughtText.length, activity.length, running],
+    { resetKey: session?.id, immediate: running, activeDelay: running ? 100 : 0 }
+  )
   sessionRef.current = session
 
+  function resetLiveRunState() {
+    setStreamText('')
+    setThoughtText('')
+    setActivity([])
+    setLiveSegments([])
+  }
+
+  function appendLiveText(text: string) {
+    setLiveSegments((prev) => {
+      const last = prev[prev.length - 1]
+      if (last?.kind === 'text') {
+        return [...prev.slice(0, -1), { ...last, text: last.text + text }]
+      }
+      return [...prev, { id: `text-${Date.now()}-${prev.length}`, kind: 'text', text }]
+    })
+  }
+
+  function appendLiveActivity(nextActivity: HermesActivity) {
+    setLiveSegments((prev) => [
+      ...prev,
+      { id: `activity-${nextActivity.ts}-${prev.length}`, kind: 'activity', activity: nextActivity }
+    ])
+  }
+
   useEffect(() => () => {
-    stopMotion(scrollAnimRef.current)
     stopMotion(sessionSwitchAnimRef.current)
   }, [])
 
@@ -476,7 +652,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => {
     if (session) window.api.hermes.messages(session.id).then(setMessages)
     else setMessages([])
-    setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setError('')
+    resetLiveRunState(); setPlanEntries([]); setError('')
     setPendingPermission(session ? pendingPermissionsRef.current.get(session.id) ?? null : null)
     setRenderOffset(0)
   }, [session])
@@ -505,9 +681,15 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       const e: HermesEvent = d.event
       const isCurrentSession = d.sessionId === sessionRef.current?.id
       if (!isCurrentSession && e.kind !== 'permissionRequest') return
-      if (e.kind === 'text') setStreamText((t) => t + e.text)
+      if (e.kind === 'text') {
+        setStreamText((t) => t + e.text)
+        appendLiveText(e.text)
+      }
       else if (e.kind === 'thought') setThoughtText((t) => t + e.text)
-      else if (e.kind === 'activity') setActivity((a) => [...a, e.activity])
+      else if (e.kind === 'activity') {
+        setActivity((a) => [...a, e.activity])
+        appendLiveActivity(e.activity)
+      }
       else if (e.kind === 'error') setError(e.message)
       else if (e.kind === 'model') setHermesModel(e.name)
       else if (e.kind === 'commands') setCommands(e.commands)
@@ -522,24 +704,14 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       setRunning(false)
       if (d.sessionId !== sessionRef.current?.id) return
       setPendingPermission(null)
-      setStreamText(''); setThoughtText('')
-      setMessages(await window.api.hermes.messages(d.sessionId)); setActivity([])
+      resetLiveRunState()
+      setMessages(await window.api.hermes.messages(d.sessionId))
       notifyCompletion()
     })
     return () => { offEvent(); offDone() }
   }, [session])
 
   useEffect(() => { return window.api.hermes.onUsage((d) => setHermesUsage(d)) }, [])
-
-  useEffect(() => {
-    clearTimeout(scrollTimeoutRef.current)
-    scrollTimeoutRef.current = setTimeout(() => {
-      const el = scrollRef.current
-      if (!el) return
-      stopMotion(scrollAnimRef.current)
-      scrollAnimRef.current = animateScrollToBottom(el, running)
-    }, running ? 100 : 0)
-  }, [messages, activity, streamText, thoughtText, running])
 
   // Close context menu on outside click
   useEffect(() => {
@@ -564,7 +736,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     setSessions((prev) => prev.filter((s) => s.id !== target.id))
     setArchivedSessions((prev) => prev.filter((s) => s.id !== target.id))
     pendingPermissionsRef.current.delete(target.id)
-    if (session?.id === target.id) { setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('') }
+    if (session?.id === target.id) { setSession(null); setMessages([]); resetLiveRunState(); setError('') }
     addToast('Session deleted')
   }
 
@@ -604,7 +776,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     if (archive) {
       setSessions(prev => prev.filter(x => x.id !== target.id))
       setArchivedSessions(prev => [{ ...target, archived: 1 }, ...prev])
-      if (session?.id === target.id) { setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('') }
+      if (session?.id === target.id) { setSession(null); setMessages([]); resetLiveRunState(); setError('') }
     } else {
       setArchivedSessions(prev => prev.filter(x => x.id !== target.id))
       setSessions(prev => [{ ...target, archived: 0 }, ...prev])
@@ -628,7 +800,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       setPendingContextBlock(null)
     }
 
-    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setInput(''); setHermesUsage(null)
+    setError(''); setRunning(true); resetLiveRunState(); setPlanEntries([]); setInput(''); setHermesUsage(null)
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: prompt, model: null, created_at: Date.now() }])
     window.api.hermes.send({ sessionId: s.id, projectId: props.project.id, prompt: finalPrompt, injectMemory })
     setInjectMemory(false)
@@ -643,28 +815,11 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       setSessions((prev) => [s!, ...prev])
     }
     setSession(s)
-    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setHermesUsage(null)
+    setError(''); setRunning(true); resetLiveRunState(); setPlanEntries([]); setHermesUsage(null)
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: detail.prompt, model: null, created_at: Date.now() }])
     window.api.hermes.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, injectMemory: false })
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
-
-  async function deleteManySessions(ids: string[]) {
-    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
-    const failed = results.filter(({ result }) => !result.success)
-    if (failed.length > 0) {
-      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
-    }
-    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
-    if (idSet.size === 0) return
-    setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    idSet.forEach((id) => pendingPermissionsRef.current.delete(id))
-    if (session && idSet.has(session.id)) {
-      setSession(null); setMessages([]); setStreamText(''); setThoughtText(''); setActivity([]); setError('')
-    }
-    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
-  }
 
   async function run() {
     if (running || !input.trim()) return
@@ -748,7 +903,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   // this tab only supplies how to fetch messages and how to kick a fresh task.
   const hermesResend = useCallback((content: string, regenerateMessageId: string) => {
     if (!session || running) return
-    setError(''); setRunning(true); setStreamText(''); setThoughtText(''); setActivity([]); setPlanEntries([]); setHermesUsage(null)
+    setError(''); setRunning(true); resetLiveRunState(); setPlanEntries([]); setHermesUsage(null)
     window.api.hermes.send({ sessionId: session.id, projectId: props.project.id, prompt: content, injectMemory: false, regenerateMessageId })
   }, [session, running, props.project.id])
 
@@ -763,6 +918,19 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     resend: hermesResend,
     onError: addToast
   })
+
+  const renderLiveSegment = (segment: HermesLiveSegment, index: number) => {
+    const isLast = index === liveSegments.length - 1
+    if (segment.kind === 'activity') return <ActivityLog key={segment.id} entries={[segment.activity]} live={running && isLast} />
+    return (
+      <div key={segment.id} className="msg assistant hermes-live-segment">
+        <div className="msg-body md-body">
+          <Markdown>{segment.text}</Markdown>
+          {running && isLast && <span className="cursor">&#x2587;</span>}
+        </div>
+      </div>
+    )
+  }
 
   const renderMessage = (m: Message) => {
     if (m.role === 'tool') {
@@ -801,6 +969,13 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const ctxSession = contextMenu ? [...sessions, ...archivedSessions].find(s => s.id === contextMenu.sessionId) : null
   const isRemote = config?.mode === 'remote'
   const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
+  const boardEntries = useMemo(() => {
+    if (planEntries.length > 0) return planEntries
+    const sourceActivities = activity.length > 0 ? activity : activitiesFromToolMessages(messages)
+    if (sourceActivities.length > 0) return sourceActivities.slice(-18).map(boardEntryFromActivity)
+    if (running && session?.title) return [{ content: session.title, status: 'in_progress' }]
+    return []
+  }, [activity, messages, planEntries, running, session?.title])
 
   // Context line + unified composer shell, shared between the empty state and
   // an active session — the empty state IS the composer, ready to type into.
@@ -877,81 +1052,11 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     </>
   )
 
-  if (isGlobalWorkspace) return (
-    <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
-      <div className="chat-layout">
-        <aside className="session-list">
-          <div className="session-list-header">
-            <button className="session-new-btn" disabled title="Hermes needs a project folder">
-              <span className="session-new-icon">＋</span> New task
-            </button>
-          </div>
-          <div className="session-list-extra">
-            <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
-              📋 App CLAUDE.md
-            </button>
-          </div>
-        </aside>
-        <section className="chat-main">
-          <AiContextBar testId="context-bar-hermes" model={HERMES_MODEL} mode="Hermes" status="Project required" disabledReason="Open a project folder" />
-          <div className="empty center cc-setup" data-testid="hermes-global-unavailable">
-            <h2>Hermes needs a project folder.</h2>
-            <p className="muted">Open a project workspace to use Hermes. Global Workspace is available for general chat and shared memory, but this Hermes integration should not run without a real project path.</p>
-          </div>
-        </section>
-      </div>
-      {instructionsOpen && (
-        <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
-      )}
-    </div>
+  const hermesGlobalHeaderSlot = (
+    <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
+      📋 App CLAUDE.md
+    </button>
   )
-
-  if (check && !check.connected && !running) {
-    const currentMode = config?.mode ?? 'local'
-    return (
-      <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
-        <div className="chat-layout">
-          <aside className="session-list">
-            <div className="session-list-header">
-              <button className="session-new-btn" disabled title="Hermes is not connected">
-                <span className="session-new-icon">＋</span> New task
-              </button>
-            </div>
-            <div className="session-list-extra">
-              <button
-                className={`instructions-md-btn${agentMdExists ? ' exists' : ''}`}
-                onClick={() => setInstructionsOpen({ agentId: 'hermes', agentLabel: 'Hermes' })}
-                title="Edit HERMES.md"
-              >
-                📋 HERMES.md{!agentMdExists ? ' (create)' : ''}
-              </button>
-              <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
-                📋 App CLAUDE.md
-              </button>
-              <button
-                className={`instructions-md-btn${sharedMdExists ? ' exists' : ''}`}
-                onClick={() => setInstructionsOpen({ agentId: 'shared', agentLabel: 'Shared' })}
-                title="Edit AI.md (shared instructions for all agents)"
-              >
-                📋 AI.md{!sharedMdExists ? ' (create)' : ''}
-              </button>
-            </div>
-          </aside>
-          <section className="chat-main">
-            <header className="chat-header">
-              <span className="chat-header-title">Hermes Connection</span>
-              <button className={`ghost icon-btn ${settingsOpen ? 'on' : ''}`} onClick={() => setSettingsOpen((v) => !v)} title="Connection settings" aria-label="Toggle connection settings">⚙</button>
-            </header>
-            {settingsOpen && config && <HermesSettings config={config} onSave={saveConfig} onTest={testConnection} />}
-            <SetupNotice check={check} mode={currentMode} onRecheck={recheck} onConnect={doConnect} connecting={connecting} connectProgress={connectProgress} />
-          </section>
-        </div>
-        {instructionsOpen && (
-          <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
-        )}
-      </div>
-    )
-  }
 
   const hermesHeaderSlot = (
     <>
@@ -979,6 +1084,74 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     </>
   )
 
+  if (isGlobalWorkspace) return (
+    <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
+      <div className="chat-layout">
+        <AgentSessionRail
+          sessions={[]}
+          pinnedIds={new Set()}
+          renaming={null}
+          newLabel="New task"
+          disabled
+          disabledTitle="Hermes needs a project folder"
+          emptyLabel="No Hermes tasks yet"
+          headerSlot={hermesGlobalHeaderSlot}
+          onSelect={() => {}}
+          onOptions={() => {}}
+          onRenameChange={() => {}}
+          onRenameCommit={() => {}}
+          onRenameCancel={() => {}}
+        />
+        <section className="chat-main">
+          <AiContextBar testId="context-bar-hermes" model={HERMES_MODEL} mode="Hermes" status="Project required" disabledReason="Open a project folder" />
+          <div className="empty center cc-setup" data-testid="hermes-global-unavailable">
+            <h2>Hermes needs a project folder.</h2>
+            <p className="muted">Open a project workspace to use Hermes. Global Workspace is available for general chat and shared memory, but this Hermes integration should not run without a real project path.</p>
+          </div>
+        </section>
+      </div>
+      {instructionsOpen && (
+        <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
+      )}
+    </div>
+  )
+
+  if (check && !check.connected && !running) {
+    const currentMode = config?.mode ?? 'local'
+    return (
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
+        <div className="chat-layout">
+          <AgentSessionRail
+            sessions={[]}
+            pinnedIds={new Set()}
+            renaming={null}
+            newLabel="New task"
+            disabled
+            disabledTitle="Hermes is not connected"
+            emptyLabel="No Hermes tasks yet"
+            headerSlot={hermesHeaderSlot}
+            onSelect={() => {}}
+            onOptions={() => {}}
+            onRenameChange={() => {}}
+            onRenameCommit={() => {}}
+            onRenameCancel={() => {}}
+          />
+          <section className="chat-main">
+            <header className="chat-header">
+              <span className="chat-header-title">Hermes Connection</span>
+              <button className={`ghost icon-btn ${settingsOpen ? 'on' : ''}`} onClick={() => setSettingsOpen((v) => !v)} title="Connection settings" aria-label="Toggle connection settings">⚙</button>
+            </header>
+            {settingsOpen && config && <HermesSettings config={config} onSave={saveConfig} onTest={testConnection} />}
+            <SetupNotice check={check} mode={currentMode} onRecheck={recheck} onConnect={doConnect} connecting={connecting} connectProgress={connectProgress} />
+          </section>
+        </div>
+        {instructionsOpen && (
+          <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
+        )}
+      </div>
+    )
+  }
+
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
     <div className="chat-layout">
@@ -992,13 +1165,13 @@ export default function HermesTab(props: { project: Project; active?: boolean })
         newTitle="Start a new Hermes task"
         emptyLabel="No Hermes tasks yet"
         headerSlot={hermesHeaderSlot}
+        openMenuSessionId={contextMenu?.sessionId ?? null}
         onNew={newSession}
         onSelect={selectSession}
         onOptions={openContextMenu}
         onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
         onRenameCommit={(s) => void commitRename(s)}
         onRenameCancel={() => setRenaming(null)}
-        onDeleteMany={deleteManySessions}
       />
 
       <section className="chat-main">
@@ -1048,9 +1221,10 @@ export default function HermesTab(props: { project: Project; active?: boolean })
 
             {view === 'board' ? (
               <div className="chat-scroll kanban-scroll">
-                <KanbanBoard entries={planEntries} />
+                <KanbanBoard entries={boardEntries} />
               </div>
             ) : (
+              <div className="chat-scroll-shell">
               <div className="chat-scroll" ref={scrollRef}>
                 {messages.length > RENDER_LIMIT + renderOffset && (
                   <button className="ghost load-older-btn" onClick={() => setRenderOffset((o) => o + RENDER_LIMIT)}>
@@ -1061,11 +1235,12 @@ export default function HermesTab(props: { project: Project; active?: boolean })
                 {running && (
                   <div className="cc-live">
                     {thoughtText && <ThinkingBlock text={thoughtText} tokenCount={thoughtText.split(/\s+/).filter(Boolean).length} done={streamText.length > 0} />}
-                    {streamText && <div className="msg assistant"><div className="msg-body md-body"><Markdown>{streamText}</Markdown><span className="cursor">&#x2587;</span></div></div>}
-                    <ActivityLog entries={activity} live />
+                    {liveSegments.map(renderLiveSegment)}
                     {!streamText && !thoughtText && activity.length === 0 && <div className="cc-note muted small">{statusPhrase ?? 'Connecting to Hermes…'}<span className="cursor">&#x2587;</span></div>}
                   </div>
                 )}
+              </div>
+              <ChatJumpToBottomButton visible={showJumpToBottom} onClick={jumpToBottom} />
               </div>
             )}
 

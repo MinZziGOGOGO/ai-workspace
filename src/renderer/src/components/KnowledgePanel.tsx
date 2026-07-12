@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { Project, MemoryItem, KnowledgeDiagnostics } from '../types'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceEmptyState } from './WorkspacePrimitives'
@@ -50,6 +51,7 @@ export default function KnowledgePanel(props: {
   const [selectedItem, setSelectedItem] = useState<MemoryItem | null>(null)
   const [diagnostics, setDiagnostics] = useState<KnowledgeDiagnostics | null>(null)
   const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [query, setQuery] = useState('')
   const [scope, setScope] = useState<Scope>('project')
@@ -121,14 +123,17 @@ export default function KnowledgePanel(props: {
   useEffect(() => {
     if (!selectedItem) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setSelectedItem(null)
+      if (event.key !== 'Escape') return
+      if (editing?.id === selectedItem.id) setEditing(null)
+      else setSelectedItem(null)
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [selectedItem])
+  }, [editing, selectedItem])
 
   useEffect(() => {
     setCopyState('idle')
+    setEditing(null)
   }, [selectedItem?.id])
 
   // Live-refresh when the background indexer writes memory for this project,
@@ -165,19 +170,36 @@ export default function KnowledgePanel(props: {
   // the corrected copy first (re-embedding it), then remove the stale one.
   async function commitEdit(item: MemoryItem) {
     const content = editing?.value.trim() ?? ''
-    setEditing(null)
-    if (!content || content === item.content) return
-    await window.api.memory.save({
-      projectId: item.project_id,
-      type: item.type,
-      title: item.title,
-      content,
-      source: item.source,
-      tags: item.tags
-    })
-    await window.api.memory.delete(item.id)
-    if (selectedItem?.id === item.id) setSelectedItem(null)
-    refresh()
+    if (editing?.id !== item.id) return
+    if (!content) {
+      addToast('Memory content cannot be empty')
+      return
+    }
+    if (content === item.content) {
+      setEditing(null)
+      return
+    }
+    setEditSaving(true)
+    try {
+      const saved = await window.api.memory.save({
+        projectId: item.project_id,
+        type: item.type,
+        title: item.title,
+        content,
+        source: item.source,
+        tags: item.tags
+      }) as MemoryItem
+      await window.api.memory.delete(item.id)
+      setSelectedItem(saved)
+      setEditing(null)
+      await refresh()
+      addToast('Memory updated')
+    } catch (err) {
+      setEditing({ id: item.id, value: content })
+      addToast(`Failed to update memory: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally {
+      setEditSaving(false)
+    }
   }
 
   async function inspectItem(item: MemoryItem) {
@@ -401,53 +423,22 @@ export default function KnowledgePanel(props: {
       <ul className="memory-list motion-list motion-list-tight">
         {items.map((m) => (
           <li key={m.id} ref={(el) => { itemRefs.current[m.id] = el }} className={`memory-item ${selectedItem?.id === m.id ? 'selected' : ''}`}>
-            {editing?.id === m.id ? (
-              <div className="memory-open memory-editing">
-                <div className="memory-head">
-                  <span className={`pill pill-${m.type}`}>{m.type}</span>
-                  <span className="muted small">{m.source}</span>
-                </div>
-                <div className="memory-title">{m.title}</div>
-                <textarea
-                  className="memory-edit-area"
-                  value={editing.value}
-                  autoFocus
-                  aria-label={`Edit memory: ${m.title}`}
-                  onChange={(e) => setEditing({ id: m.id, value: e.target.value })}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void commitEdit(m) }
-                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
-                  }}
-                  onBlur={() => void commitEdit(m)}
-                />
-                <div className="memory-edit-hint muted small">Enter to save · Shift+Enter for newline · Esc to cancel</div>
-              </div>
-            ) : (
-              <button
-                type="button"
-                className="memory-open"
-                data-testid="knowledge-item"
-                aria-label={`Inspect knowledge item: ${m.title}`}
-                onClick={() => void inspectItem(m)}
-              >
-                <div className="memory-head">
-                  <span className={`pill pill-${m.type}`}>{m.type}</span>
-                  <span className="muted small">
-                    {m.source}{m.score !== undefined ? ` - ${(m.score * 100).toFixed(0)}%` : ''}
-                    {m.stale_at ? ' - stale' : ''}
-                  </span>
-                </div>
-                <div className="memory-title">{m.title}</div>
-                <div className="memory-content muted small">{snippetAt(m.content, 200)}</div>
-              </button>
-            )}
             <button
-              className="ghost tiny memory-edit"
-              title="Edit memory"
-              aria-label={`Edit memory: ${m.title}`}
-              onClick={() => setEditing(editing?.id === m.id ? null : { id: m.id, value: m.content })}
+              type="button"
+              className="memory-open"
+              data-testid="knowledge-item"
+              aria-label={`Inspect knowledge item: ${m.title}`}
+              onClick={() => void inspectItem(m)}
             >
-              ✎
+              <div className="memory-head">
+                <span className={`pill pill-${m.type}`}>{m.type}</span>
+                <span className="muted small">
+                  {m.source}{m.score !== undefined ? ` - ${(m.score * 100).toFixed(0)}%` : ''}
+                  {m.stale_at ? ' - stale' : ''}
+                </span>
+              </div>
+              <div className="memory-title">{m.title}</div>
+              <div className="memory-content muted small">{snippetAt(m.content, 200)}</div>
             </button>
             <button
               className="ghost tiny memory-delete"
@@ -461,78 +452,131 @@ export default function KnowledgePanel(props: {
           </li>
         ))}
       </ul>
-      {selectedItem && (
-        <section
-          key={selectedItem.id}
-          className="knowledge-detail motion-detail"
-          data-testid="knowledge-detail"
-          role="dialog"
-          aria-label="Knowledge item details"
-        >
-          <div className="knowledge-detail-head">
-            <div className="knowledge-detail-title-wrap">
-              <span className={`pill pill-${selectedItem.type}`}>{selectedItem.type}</span>
-              <h2>{selectedItem.title || 'Untitled knowledge item'}</h2>
-              <p className="muted small">{selectedItem.source || 'Unknown source'}</p>
+      {selectedItem && createPortal(
+        <div className="knowledge-detail-backdrop" onClick={() => setSelectedItem(null)}>
+          <section
+            key={selectedItem.id}
+            className="knowledge-detail motion-detail"
+            data-testid="knowledge-detail"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Knowledge item details"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="knowledge-detail-head">
+              <div className="knowledge-detail-title-wrap">
+                <span className={`pill pill-${selectedItem.type}`}>{selectedItem.type}</span>
+                <h2>{selectedItem.title || 'Untitled knowledge item'}</h2>
+                <p className="muted small">{selectedItem.source || 'Unknown source'}</p>
+              </div>
+              <button
+                type="button"
+                className="ghost tiny"
+                data-testid="knowledge-detail-close"
+                onClick={() => setSelectedItem(null)}
+                aria-label="Close knowledge details"
+              >
+                Close
+              </button>
             </div>
-            <button
-              type="button"
-              className="ghost tiny"
-              data-testid="knowledge-detail-close"
-              onClick={() => setSelectedItem(null)}
-              aria-label="Close knowledge details"
-            >
-              Close
-            </button>
-          </div>
-          <div className="knowledge-detail-meta" aria-label="Knowledge item metadata">
-            <div><span>Created</span>{formatDate(selectedItem.created_at)}</div>
-            <div><span>Updated</span>{formatDate(selectedItem.updated_at)}</div>
-            <div><span>Last used</span>{formatDate(selectedItem.last_accessed_at)}</div>
-            <div><span>Uses</span>{selectedItem.access_count ?? 0}</div>
-            <div><span>Status</span>{selectedItem.stale_at ? `Stale since ${formatDate(selectedItem.stale_at)}` : 'Active'}</div>
-            <div><span>Tags</span>{selectedTags}</div>
-            <div><span>ID</span>{selectedItem.id}</div>
-          </div>
-          {(selectedItem.quality_reason || selectedItem.quality_flags?.length) && (
-            <div className="knowledge-quality-note" data-testid="knowledge-quality-note">
-              {selectedItem.quality_reason ?? 'Review suggested'}
-              {selectedItem.quality_flags?.length ? ` (${selectedItem.quality_flags.join(', ')})` : ''}
+            <div className="knowledge-detail-meta" aria-label="Knowledge item metadata">
+              <div><span>Created</span>{formatDate(selectedItem.created_at)}</div>
+              <div><span>Updated</span>{formatDate(selectedItem.updated_at)}</div>
+              <div><span>Last used</span>{formatDate(selectedItem.last_accessed_at)}</div>
+              <div><span>Uses</span>{selectedItem.access_count ?? 0}</div>
+              <div><span>Status</span>{selectedItem.stale_at ? `Stale since ${formatDate(selectedItem.stale_at)}` : 'Active'}</div>
+              <div><span>Tags</span>{selectedTags}</div>
+              <div><span>ID</span>{selectedItem.id}</div>
             </div>
-          )}
-          <div className="knowledge-detail-content" data-testid="knowledge-detail-content">
-            {selectedItem.content?.trim() ? selectedItem.content : 'No content is stored for this knowledge item.'}
-          </div>
-          <div className="knowledge-detail-actions">
-            <button
-              type="button"
-              className="ghost tiny"
-              data-testid="knowledge-detail-copy"
-              onClick={copySelectedContent}
-              disabled={!selectedItem.content?.trim()}
-            >
-              {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
-            </button>
-            <button
-              type="button"
-              className="ghost tiny"
-              data-testid="knowledge-detail-stale"
-              disabled={staleUpdatingId === selectedItem.id}
-              onClick={() => void toggleStale(selectedItem)}
-            >
-              {staleUpdatingId === selectedItem.id ? 'Updating...' : selectedItem.stale_at ? 'Mark active' : 'Mark stale'}
-            </button>
-            <button
-              type="button"
-              className="ghost tiny settings-danger-link"
-              data-testid="knowledge-detail-delete"
-              disabled={deletingId === selectedItem.id}
-              onClick={() => void deleteItem(selectedItem)}
-            >
-              {deletingId === selectedItem.id ? 'Deleting...' : 'Delete'}
-            </button>
-          </div>
-        </section>
+            {(selectedItem.quality_reason || selectedItem.quality_flags?.length) && (
+              <div className="knowledge-quality-note" data-testid="knowledge-quality-note">
+                {selectedItem.quality_reason ?? 'Review suggested'}
+                {selectedItem.quality_flags?.length ? ` (${selectedItem.quality_flags.join(', ')})` : ''}
+              </div>
+            )}
+            {editing?.id === selectedItem.id ? (
+              <textarea
+                className="knowledge-detail-editor"
+                data-testid="knowledge-detail-editor"
+                value={editing.value}
+                autoFocus
+                disabled={editSaving}
+                aria-label={`Edit knowledge item: ${selectedItem.title}`}
+                onChange={(e) => setEditing({ id: selectedItem.id, value: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
+                }}
+              />
+            ) : (
+              <div className="knowledge-detail-content" data-testid="knowledge-detail-content">
+                {selectedItem.content?.trim() ? selectedItem.content : 'No content is stored for this knowledge item.'}
+              </div>
+            )}
+            <div className="knowledge-detail-actions">
+              {editing?.id === selectedItem.id ? (
+                <>
+                  <button
+                    type="button"
+                    className="ghost tiny"
+                    data-testid="knowledge-detail-cancel-edit"
+                    onClick={() => setEditing(null)}
+                    disabled={editSaving}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="primary tiny"
+                    data-testid="knowledge-detail-save-edit"
+                    onClick={() => void commitEdit(selectedItem)}
+                    disabled={editSaving}
+                  >
+                    {editSaving ? 'Saving...' : 'Save'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="ghost tiny"
+                    data-testid="knowledge-detail-edit"
+                    onClick={() => setEditing({ id: selectedItem.id, value: selectedItem.content })}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost tiny"
+                    data-testid="knowledge-detail-copy"
+                    onClick={copySelectedContent}
+                    disabled={!selectedItem.content?.trim()}
+                  >
+                    {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost tiny"
+                    data-testid="knowledge-detail-stale"
+                    disabled={staleUpdatingId === selectedItem.id}
+                    onClick={() => void toggleStale(selectedItem)}
+                  >
+                    {staleUpdatingId === selectedItem.id ? 'Updating...' : selectedItem.stale_at ? 'Mark active' : 'Mark stale'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost tiny settings-danger-link"
+                    data-testid="knowledge-detail-delete"
+                    disabled={deletingId === selectedItem.id}
+                    onClick={() => void deleteItem(selectedItem)}
+                  >
+                    {deletingId === selectedItem.id ? 'Deleting...' : 'Delete'}
+                  </button>
+                </>
+              )}
+            </div>
+          </section>
+        </div>,
+        document.body
       )}
       {!isGlobalWorkspace && (
         <div className="knowledge-related-projects" data-testid="related-projects">

@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
   ActivityEntry,
+  BrowserTabCreatedEvent,
+  BrowserTabClosedEvent,
+  BrowserTabState,
+  BrowserApprovalRequest,
+  BrowserApprovalDecision,
   ChatDoneEvent,
   ChatErrorEvent,
   ChatTokenEvent,
@@ -199,7 +204,9 @@ const api: IpcApi = {
     checkAll: () => ipcRenderer.invoke('mcp:checkAll'),
     getConfigPath: () => ipcRenderer.invoke('mcp:getConfigPath'),
     getKnowledgeServerPath: () => ipcRenderer.invoke('mcp:getKnowledgeServerPath'),
-    getKnowledgeServerConfig: () => ipcRenderer.invoke('mcp:getKnowledgeServerConfig')
+    getKnowledgeServerConfig: () => ipcRenderer.invoke('mcp:getKnowledgeServerConfig'),
+    getBrowserServerPath: () => ipcRenderer.invoke('mcp:getBrowserServerPath'),
+    getBrowserServerConfig: () => ipcRenderer.invoke('mcp:getBrowserServerConfig')
   },
   // First-run setup wizard: tool detection + completion flag.
   setup: {
@@ -222,6 +229,32 @@ const api: IpcApi = {
     status: () => ipcRenderer.invoke('webCompanion:status'),
     configure: (config: unknown) => ipcRenderer.invoke('webCompanion:configure', config),
     regenerateToken: () => ipcRenderer.invoke('webCompanion:regenerateToken')
+  },
+  // Browser panel — native WebContentsView tabs positioned over a renderer
+  // placeholder (manual browsing, Phase 1).
+  browser: {
+    createTab: (url?: string) => ipcRenderer.invoke('browser:createTab', url),
+    closeTab: (tabId: string) => ipcRenderer.invoke('browser:closeTab', tabId),
+    setActiveTab: (tabId: string) => ipcRenderer.invoke('browser:setActiveTab', tabId),
+    navigate: (tabId: string, url: string) => ipcRenderer.invoke('browser:navigate', tabId, url),
+    goBack: (tabId: string) => ipcRenderer.invoke('browser:goBack', tabId),
+    goForward: (tabId: string) => ipcRenderer.invoke('browser:goForward', tabId),
+    reload: (tabId: string) => ipcRenderer.invoke('browser:reload', tabId),
+    stop: (tabId: string) => ipcRenderer.invoke('browser:stop', tabId),
+    setBounds: (tabId: string, bounds: { x: number; y: number; width: number; height: number }) =>
+      ipcRenderer.invoke('browser:setBounds', tabId, bounds),
+    hideAll: () => ipcRenderer.invoke('browser:hideAll'),
+    listTabs: () => ipcRenderer.invoke('browser:listTabs'),
+    getDownloads: () => ipcRenderer.invoke('browser:getDownloads'),
+    reloadSessions: () => ipcRenderer.invoke('browser:reloadSessions'),
+    onTabUpdated: (cb: (d: BrowserTabState) => void) => onPayload('browser:tabUpdated', cb),
+    onTabCreated: (cb: (d: BrowserTabCreatedEvent) => void) => onPayload('browser:tabCreated', cb),
+    onTabClosed: (cb: (d: BrowserTabClosedEvent) => void) => onPayload('browser:tabClosed', cb)
+  },
+  approvals: {
+    list: () => ipcRenderer.invoke('approvals:list'),
+    respond: (decision: BrowserApprovalDecision) => ipcRenderer.invoke('approvals:respond', decision),
+    onChanged: (cb: (requests: BrowserApprovalRequest[]) => void) => onPayload('approvals:changed', cb)
   },
   // Activity log: real-time events from all AI sources (CHAT, HERMES, CODE, etc.).
   activity: {

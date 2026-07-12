@@ -2,6 +2,12 @@ import type { IpcApi } from '../../shared/ipcTypes'
 
 export type {
   ActivityEntry,
+  BrowserBounds,
+  BrowserDownloadStatus,
+  BrowserTabState,
+  BrowserApprovalRequest,
+  BrowserApprovalDecision,
+  BrowserApprovalResult,
   CCActivityEntry,
   CCEvent,
   CCFileDiff,

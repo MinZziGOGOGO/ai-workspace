@@ -96,6 +96,32 @@ export function knowledgeMcpLaunchConfig(serverCjsPath: string, dbDir: string): 
 }
 
 /**
+ * Launch config for the bundled browser-control MCP server.
+ *
+ * Unlike the knowledge server, this one loads no native modules — it is a thin
+ * stdio→HTTP proxy to the app's local browser-control server — so it has no
+ * Electron-ABI requirement and runs under plain stock `node`. The control
+ * server's loopback port is baked into the env so the standalone process knows
+ * where to connect. Single source of truth for every registration path
+ * (Claude Desktop config, the Extensions quick-add). The Hermes/WSL path needs
+ * the process to run Windows-side (127.0.0.1 must reach the app), so it wraps
+ * this differently — see resolveHermesMcpServers in ipc.ts.
+ */
+export function browserMcpLaunchConfig(serverCjsPath: string, controlPort: number, identityToken = ''): McpServerConfig {
+  return {
+    command: 'node',
+    args: [serverCjsPath],
+    env: {
+      AIWORKSPACE_BROWSER_PORT: String(controlPort),
+      AIWORKSPACE_BROWSER_AGENT_ID: 'claude-desktop',
+      AIWORKSPACE_BROWSER_AGENT_NAME: 'Claude Desktop',
+      AIWORKSPACE_BROWSER_IDENTITY_SOURCE: 'app-launch',
+      AIWORKSPACE_BROWSER_CONTROL_TOKEN: identityToken
+    }
+  }
+}
+
+/**
  * Servers from claude_desktop_config.json filtered by the app's local
  * enabled/disabled state (app_meta). This is what in-app consumers (e.g. the
  * Hermes session MCP list) must use, so the Extensions toggle actually gates

@@ -5,7 +5,7 @@ import SetupWizard from './components/SetupWizard'
 import { ShortcutProvider } from './ShortcutContext'
 import { AgentActivityProvider } from './AgentActivityContext'
 import { useMotionPreference } from './hooks/useMotionPreference'
-import { applyTheme } from './theme'
+import { applyFontFamily, applyTheme, readStoredFontFamily } from './theme'
 
 export default function App() {
   useMotionPreference()
@@ -33,9 +33,18 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
-  // Apply the stored theme on startup (Settings re-applies it on change).
+  // Apply stored appearance preferences on startup (Settings re-applies on change).
   useEffect(() => {
-    window.api.settings.get('ui_theme').then(applyTheme).catch(() => applyTheme('system'))
+    window.api.settings
+      .getMany(['ui_theme', 'ui_font_family'])
+      .then((values) => {
+        applyTheme(values.ui_theme)
+        applyFontFamily(values.ui_font_family ?? readStoredFontFamily())
+      })
+      .catch(() => {
+        applyTheme('system')
+        applyFontFamily('default')
+      })
   }, [])
 
   useEffect(() => {

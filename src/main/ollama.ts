@@ -27,6 +27,20 @@ export interface ChatMessage {
   images?: string[]
 }
 
+export type ChatStreamPart = { kind: 'answer' | 'thinking'; text: string }
+
+function stringField(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function pickString(...values: unknown[]): string | null {
+  for (const value of values) {
+    const text = stringField(value)
+    if (text) return text
+  }
+  return null
+}
+
 export async function listModels(): Promise<string[]> {
   if (isFakeOllama()) return ['e2e-chat-model']
   try {
@@ -38,17 +52,17 @@ export async function listModels(): Promise<string[]> {
   }
 }
 
-export async function* streamChat(
+export async function* streamChatParts(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal
-): AsyncGenerator<string> {
+): AsyncGenerator<ChatStreamPart> {
   if (isFakeOllama()) {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user')
     const text = `Fake Chat response: ${lastUser?.content ?? 'empty prompt'}`
     for (const token of text.match(/.{1,24}/g) ?? [text]) {
       if (signal?.aborted) return
-      yield token
+      yield { kind: 'answer', text: token }
     }
     return
   }
@@ -71,11 +85,29 @@ export async function* streamChat(
       if (!line.trim()) continue
       try {
         const chunk = JSON.parse(line)
-        if (chunk.message?.content) yield chunk.message.content as string
+        const thinking = pickString(
+          chunk.message?.thinking,
+          chunk.message?.reasoning_content,
+          chunk.message?.reasoning,
+          chunk.message?.thought
+        )
+        if (thinking) yield { kind: 'thinking', text: thinking }
+        const content = stringField(chunk.message?.content)
+        if (content) yield { kind: 'answer', text: content }
       } catch {
         continue // skip malformed NDJSON lines instead of killing the stream
       }
     }
+  }
+}
+
+export async function* streamChat(
+  model: string,
+  messages: ChatMessage[],
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  for await (const part of streamChatParts(model, messages, signal)) {
+    if (part.kind === 'answer') yield part.text
   }
 }
 
@@ -151,12 +183,12 @@ export async function ollamaStatus(): Promise<{ connected: boolean; defaultModel
 
 const OLLAMA_CLOUD = 'https://ollama.com/v1'
 
-export async function* streamCloudChat(
+export async function* streamCloudChatParts(
   model: string,
   messages: ChatMessage[],
   apiKey: string,
   signal?: AbortSignal
-): AsyncGenerator<string> {
+): AsyncGenerator<ChatStreamPart> {
   const res = await fetch(`${OLLAMA_CLOUD}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -179,11 +211,25 @@ export async function* streamCloudChat(
       if (trimmed.startsWith('data: ')) {
         try {
           const chunk = JSON.parse(trimmed.slice(6))
-          const content = chunk.choices?.[0]?.delta?.content
-          if (typeof content === 'string' && content) yield content
+          const delta = chunk.choices?.[0]?.delta
+          const thinking = pickString(delta?.thinking, delta?.reasoning_content, delta?.reasoning, delta?.thought)
+          if (thinking) yield { kind: 'thinking', text: thinking }
+          const content = stringField(delta?.content)
+          if (content) yield { kind: 'answer', text: content }
         } catch { /* bad JSON */ }
       }
     }
+  }
+}
+
+export async function* streamCloudChat(
+  model: string,
+  messages: ChatMessage[],
+  apiKey: string,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  for await (const part of streamCloudChatParts(model, messages, apiKey, signal)) {
+    if (part.kind === 'answer') yield part.text
   }
 }
 

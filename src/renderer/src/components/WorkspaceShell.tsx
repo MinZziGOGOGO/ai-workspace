@@ -16,6 +16,8 @@ import TerminalPanel from './TerminalPanel'
 import ResearchPanel from './ResearchPanel'
 import ActivityPanel from './ActivityPanel'
 import ExtensionsPanel from './ExtensionsPanel'
+import BrowserPanel from './BrowserPanel'
+import ApprovalCenter from './ApprovalCenter'
 import CommandPalette from './CommandPalette'
 import { ToastProvider, useToast } from './ToastContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
@@ -40,7 +42,7 @@ import {
 type DockPanel =
   | 'home'
   | 'navigator' | 'chat' | 'knowledge'
-  | 'hermes' | 'claudecode' | 'codex' | 'editor' | 'terminal' | 'research' | 'activity' | 'extensions'
+  | 'hermes' | 'claudecode' | 'codex' | 'editor' | 'terminal' | 'research' | 'activity' | 'extensions' | 'browser'
 
 type SplitDirection = 'horizontal' | 'vertical'
 
@@ -107,7 +109,7 @@ const ZONES: ZoneEntry[] = [
 ]
 
 const PANELS: DockPanel[] = [
-  'home', 'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'editor', 'terminal', 'research', 'activity', 'extensions'
+  'home', 'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'editor', 'terminal', 'research', 'activity', 'extensions', 'browser'
 ]
 
 const PANEL_TITLES: Record<DockPanel, string> = {
@@ -123,6 +125,7 @@ const PANEL_TITLES: Record<DockPanel, string> = {
   research: 'Research',
   activity: 'Activity',
   extensions: 'Extensions',
+  browser: 'Browser',
 }
 
 const PANEL_META: Record<DockPanel, {
@@ -203,6 +206,12 @@ const PANEL_META: Record<DockPanel, {
     status: 'Manage',
     tone: 'info',
   },
+  browser: {
+    kind: 'Browser',
+    hint: 'Browse the web in an embedded Chromium tab',
+    status: 'Manual',
+    tone: 'neutral',
+  },
 }
 
 type TopbarPanel = { id: DockPanel; label: string; icon?: ReactNode }
@@ -211,29 +220,110 @@ function topbarPanel(id: DockPanel, icon?: ReactNode): TopbarPanel {
   return { id, label: PANEL_TITLES[id], icon }
 }
 
-const extensionsIcon = (
-  <svg className="topbar-dropdown-item-icon" viewBox="0 0 14 14" width="14" height="14" aria-hidden>
-    <path
-      d="M5 2h4v2h2l1 1v2h-1v4H3V7H2V5l1-1h2V2z M5 7h4"
+function tablerIcon(paths: string[]) {
+  return (
+    <svg
+      className="topbar-dropdown-item-icon"
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.2"
+      strokeWidth="1.5"
       strokeLinecap="round"
-    />
-  </svg>
-)
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      {paths.map((d, i) => <path key={i} d={d} />)}
+    </svg>
+  )
+}
+
+const homeIcon = tablerIcon([
+  'M5 12l-2 0l9 -9l9 9l-2 0',
+  'M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-7',
+  'M9 21v-6a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v6',
+])
+
+const chatIcon = tablerIcon([
+  'M8 9h8',
+  'M8 13h6',
+  'M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1 -3 3h-5l-5 3v-3h-2a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12z',
+])
+
+const hermesIcon = tablerIcon([
+  'M7 7h10a2 2 0 0 1 2 2v7a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-7a2 2 0 0 1 2 -2z',
+  'M10 16h.01',
+  'M14 16h.01',
+  'M9 7l-1 -4',
+  'M15 7l1 -4',
+  'M8 11l0 2',
+  'M16 11l0 2',
+])
+
+const claudeCodeIcon = tablerIcon(['M7 8l-4 4l4 4', 'M17 8l4 4l-4 4', 'M14 4l-4 16'])
+
+const codexIcon = tablerIcon([
+  'M21 16.008v-8.018a1.98 1.98 0 0 0 -1 -1.717l-7 -4.008a2.016 2.016 0 0 0 -2 0l-7 4.008c-.619 .359 -1 1.02 -1 1.718v8.018c0 .698 .381 1.359 1 1.718l7 4.008a2.016 2.016 0 0 0 2 0l7 -4.008c.619 -.359 1 -1.02 1 -1.718z',
+  'M12 22v-10',
+  'M12 12l8.73 -5.04',
+  'M3.27 6.96l8.73 5.04',
+])
+
+const navigatorIcon = tablerIcon(['M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2'])
+
+const editorIcon = tablerIcon([
+  'M14 3v4a1 1 0 0 0 1 1h4',
+  'M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z',
+  'M9 9l1 0',
+  'M9 13l6 0',
+  'M9 17l6 0',
+])
+
+const terminalIcon = tablerIcon(['M6 8l4 4l-4 4', 'M12 16l6 0'])
+
+const activityIcon = tablerIcon(['M3 12h4l3 8l4 -16l3 8h4'])
+
+const extensionsIcon = tablerIcon([
+  'M4 7h3a1 1 0 0 0 1 -1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h3a1 1 0 0 1 1 1v3a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4h-1a1 1 0 0 0 -1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-1a2 2 0 0 0 -4 0v1a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h1a2 2 0 0 0 0 -4h-1a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1',
+])
+
+const knowledgeIcon = tablerIcon([
+  'M12 6m-8 0a8 3 0 1 0 16 0a8 3 0 1 0 -16 0',
+  'M4 6v6a8 3 0 0 0 16 0v-6',
+  'M4 12v6a8 3 0 0 0 16 0v-6',
+])
+
+const researchIcon = tablerIcon(['M10 10m-7 0a7 7 0 1 0 14 0a7 7 0 1 0 -14 0', 'M21 21l-6 -6'])
+
+const browserIcon = tablerIcon([
+  'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0',
+  'M3.6 9h16.8',
+  'M3.6 15h16.8',
+  'M11.5 3a17 17 0 0 0 0 18',
+  'M12.5 3a17 17 0 0 1 0 18',
+])
 
 const TOPBAR_GROUPS: { label: string; panels: TopbarPanel[] }[] = [
-  { label: 'Home',      panels: [topbarPanel('home')] },
-  { label: 'AI',        panels: ['chat', 'hermes', 'claudecode', 'codex'].map((id) => topbarPanel(id as DockPanel)) },
+  { label: 'Home',      panels: [topbarPanel('home', homeIcon)] },
+  { label: 'AI',        panels: [
+    topbarPanel('chat', chatIcon),
+    topbarPanel('hermes', hermesIcon),
+    topbarPanel('claudecode', claudeCodeIcon),
+    topbarPanel('codex', codexIcon),
+  ] },
   { label: 'Tools',     panels: [
-    topbarPanel('navigator'),
-    topbarPanel('editor'),
-    topbarPanel('terminal'),
-    topbarPanel('activity'),
+    topbarPanel('navigator', navigatorIcon),
+    topbarPanel('editor', editorIcon),
+    topbarPanel('terminal', terminalIcon),
+    topbarPanel('browser', browserIcon),
+    topbarPanel('activity', activityIcon),
     topbarPanel('extensions', extensionsIcon),
   ] },
-  { label: 'Knowledge', panels: ['knowledge', 'research'].map((id) => topbarPanel(id as DockPanel)) },
+  { label: 'Knowledge', panels: [
+    topbarPanel('knowledge', knowledgeIcon),
+    topbarPanel('research', researchIcon),
+  ] },
 ]
 
 // ── Layout helpers ─────────────────────────────────────────────────────────────
@@ -1173,6 +1263,8 @@ function WorkspaceShellInner(props: {
         return <ActivityPanel />
       case 'extensions':
         return <ExtensionsPanel active={openIds.includes('extensions')} />
+      case 'browser':
+        return <BrowserPanel active={openIds.includes('browser')} />
     }
   }
 
@@ -1764,6 +1856,7 @@ export default function WorkspaceShell(props: {
   return (
     <ToastProvider>
       <WorkspaceShellInner {...props} />
+      <ApprovalCenter />
     </ToastProvider>
   )
 }

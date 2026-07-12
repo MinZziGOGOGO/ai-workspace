@@ -27,7 +27,16 @@ const EMPTY_FORM: FormState = {
   error: ''
 }
 
-const QUICK_ADDS: Array<{ name: string; description: string; config: McpServerConfig; builtin?: boolean }> = [
+const QUICK_ADDS: Array<{
+  name: string
+  description: string
+  config: McpServerConfig
+  builtin?: boolean
+  // Which bundled server this card resolves; drives the "already configured"
+  // check and which main-process config resolver quickAdd calls.
+  builtinKind?: 'knowledge' | 'browser'
+  builtinServerName?: string
+}> = [
   {
     name: 'Filesystem',
     description: 'Access local files and folders',
@@ -53,7 +62,18 @@ const QUICK_ADDS: Array<{ name: string; description: string; config: McpServerCo
     description: 'Your workspace knowledge base',
     // Placeholder only — quickAdd resolves the real server.cjs path via IPC.
     config: { command: 'node', args: [] },
-    builtin: true
+    builtin: true,
+    builtinKind: 'knowledge',
+    builtinServerName: 'ai-workspace-knowledge'
+  },
+  {
+    name: 'AI Workspace Browser',
+    description: 'Let agents drive the Browser panel',
+    // Placeholder only — quickAdd resolves the real browser-server.cjs config via IPC.
+    config: { command: 'node', args: [] },
+    builtin: true,
+    builtinKind: 'browser',
+    builtinServerName: 'ai-workspace-browser'
   }
 ]
 
@@ -441,15 +461,16 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
   async function quickAdd(item: (typeof QUICK_ADDS)[number]) {
     const safeName = uniqueName(item.name.replace(/\s+/g, '-').toLowerCase())
     let config = item.config
-    // The knowledge server ships with the app — resolve its real script path
-    // instead of inserting a placeholder into the live config.
+    // Bundled servers ship with the app — resolve their real launch config from
+    // main instead of inserting a placeholder into the live config.
     if (item.builtin) {
       try {
-        // Full launch config from main: Electron-as-Node so the server loads
-        // the matching-ABI better-sqlite3 (not a bare `node`).
-        config = await window.api.mcp.getKnowledgeServerConfig()
+        config =
+          item.builtinKind === 'browser'
+            ? await window.api.mcp.getBrowserServerConfig()
+            : await window.api.mcp.getKnowledgeServerConfig()
       } catch {
-        addToast('Could not resolve the knowledge server config')
+        addToast(`Could not resolve the ${item.name} config`)
         return
       }
     }
@@ -608,9 +629,30 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
   return (
     <div className="extensions-panel">
       <div className="ext-tabs" role="tablist" aria-label="Extensions">
-        <button className={`ext-tab ${tab === 'mcp' ? 'active' : ''}`} onClick={() => setTab('mcp')}>MCP Servers</button>
-        <button className={`ext-tab ${tab === 'skills' ? 'active' : ''}`} onClick={() => setTab('skills')}>Skills</button>
-        <button className={`ext-tab ${tab === 'agents' ? 'active' : ''}`} onClick={() => setTab('agents')}>Agents</button>
+        <button
+          role="tab"
+          aria-selected={tab === 'mcp'}
+          className={`ext-tab ${tab === 'mcp' ? 'active' : ''}`}
+          onClick={() => setTab('mcp')}
+        >
+          MCP Servers
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === 'skills'}
+          className={`ext-tab ${tab === 'skills' ? 'active' : ''}`}
+          onClick={() => setTab('skills')}
+        >
+          Skills
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === 'agents'}
+          className={`ext-tab ${tab === 'agents' ? 'active' : ''}`}
+          onClick={() => setTab('agents')}
+        >
+          Agents
+        </button>
       </div>
 
       {tab === 'mcp' && (
@@ -724,9 +766,11 @@ export default function ExtensionsPanel(props: { active?: boolean }) {
               <div className="ext-featured-grid">
                 <div className="ext-quick-add-grid">
                   {QUICK_ADDS.map((item) => {
-                    // The knowledge server is auto-registered on app startup;
-                    // don't offer a second copy when it is already configured.
-                    const builtinConfigured = Boolean(item.builtin && serverNames.has('ai-workspace-knowledge'))
+                    // Bundled servers are auto-registered on app startup;
+                    // don't offer a second copy when already configured.
+                    const builtinConfigured = Boolean(
+                      item.builtin && item.builtinServerName && serverNames.has(item.builtinServerName)
+                    )
                     return (
                       <div className="ext-quick-add-card" key={item.name}>
                         <strong>{item.name}</strong>

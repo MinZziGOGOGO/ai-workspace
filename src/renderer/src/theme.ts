@@ -4,6 +4,9 @@
 // default warm light gray palette from the visual overhaul).
 
 export type ThemeSetting = 'system' | 'dark' | 'light'
+import { appFontStack, normalizeAppFont } from '../../shared/appFonts'
+
+export const APP_FONT_STORAGE_KEY = 'aiworkspace.ui_font_family'
 
 let currentSetting: ThemeSetting = 'system'
 
@@ -18,6 +21,29 @@ function resolve(setting: ThemeSetting): 'dark' | 'light' {
 export function applyTheme(setting: string | null | undefined): void {
   currentSetting = setting === 'dark' || setting === 'light' ? setting : 'system'
   document.documentElement.dataset.theme = resolve(currentSetting)
+}
+
+export function applyFontFamily(setting: string | null | undefined): void {
+  const font = normalizeAppFont(setting)
+  document.documentElement.dataset.fontFamily = font
+  document.documentElement.style.setProperty('--font-sans', appFontStack(font))
+}
+
+export function readStoredFontFamily(): string | null {
+  try {
+    return localStorage.getItem(APP_FONT_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function storeFontFamily(setting: string): void {
+  try {
+    localStorage.setItem(APP_FONT_STORAGE_KEY, normalizeAppFont(setting))
+  } catch {
+    // localStorage can be unavailable in unusual browser contexts; the live
+    // CSS variable update still applies for the current session.
+  }
 }
 
 // Follow live OS preference changes while the setting is 'system'.

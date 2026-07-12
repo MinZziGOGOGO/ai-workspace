@@ -9,9 +9,10 @@ import { useToast } from './ToastContext'
 import { useAgentActivity } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { fallbackTitleFromText, isGenericSessionTitle } from '../../../shared/sessionTitles'
-import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
+import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import InstructionsEditor from './InstructionsEditor'
-import anime, { animateScrollToBottom, prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
+import ToolSyntaxBlock from './ToolSyntaxBlock'
+import anime, { prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
 import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
@@ -66,9 +67,9 @@ function ToolCard(props: { entry: CodexActivityEntry; live?: boolean }) {
         <span className={`activity-line-name${status === 'error' ? ' err' : ''}`}>{entry.name}</span>
         <span className="activity-line-detail">{detail}</span>
         {status === 'running' && <span className="activity-line-spinner" aria-hidden>◌</span>}
-        {hasBody && <span className="chevron">{open ? '⌄' : '›'}</span>}
+        {hasBody && <span className="chevron">{open ? 'v' : '>'}</span>}
       </button>
-      {hasBody && open && <div className="activity-detail"><pre className="tool-output">{body}</pre></div>}
+      {hasBody && open && <div className="activity-detail"><ToolSyntaxBlock value={body} language="auto" /></div>}
     </div>
   )
 }
@@ -137,8 +138,6 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const [emptyHeading] = useState(() => CODEX_EMPTY_HEADINGS[Math.floor(Math.random() * CODEX_EMPTY_HEADINGS.length)])
 
   const scrollRef = useRef<HTMLDivElement>(null)
-  const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
-  const scrollAnimRef = useRef<MotionHandle>(null)
   const sessionSwitchAnimRef = useRef<MotionHandle>(null)
   const sessionRef = useRef<Session | null>(null)
   const newSessionRef = useRef<() => void>(() => {})
@@ -160,10 +159,14 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     toolName: !output && lastCodexActivity ? lastCodexActivity.name : null,
     progressKey: `${output.length}:${activity.length}`
   })
+  const { showJumpToBottom, jumpToBottom } = useChatScrollFollow(
+    scrollRef,
+    [messages.length, output.length, activity.length, running],
+    { resetKey: session?.id, immediate: running, activeDelay: running ? 100 : 0 }
+  )
   sessionRef.current = session
 
   useEffect(() => () => {
-    stopMotion(scrollAnimRef.current)
     stopMotion(sessionSwitchAnimRef.current)
   }, [])
 
@@ -310,16 +313,6 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     return () => { offEvent(); offDone() }
   }, [session])
 
-  useEffect(() => {
-    clearTimeout(scrollTimeoutRef.current)
-    scrollTimeoutRef.current = setTimeout(() => {
-      const el = scrollRef.current
-      if (!el) return
-      stopMotion(scrollAnimRef.current)
-      scrollAnimRef.current = animateScrollToBottom(el, running)
-    }, running ? 100 : 0)
-  }, [messages, output, activity, running])
-
   // Close context menu on outside click
   useEffect(() => {
     if (!contextMenu) return
@@ -420,22 +413,6 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, sandbox, skipGitRepoCheck, model })
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
-
-  async function deleteManySessions(ids: string[]) {
-    const results = await Promise.all(ids.map(async (id) => ({ id, result: await window.api.sessions.delete(id) })))
-    const failed = results.filter(({ result }) => !result.success)
-    if (failed.length > 0) {
-      addToast(`Failed to delete ${failed.length} session${failed.length === 1 ? '' : 's'}: ${failed[0].result.error ?? 'unknown error'}`)
-    }
-    const idSet = new Set(results.filter(({ result }) => result.success).map(({ id }) => id))
-    if (idSet.size === 0) return
-    setSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    setArchivedSessions((prev) => prev.filter((s) => !idSet.has(s.id)))
-    if (session && idSet.has(session.id)) {
-      setSession(null); setMessages([]); setOutput(''); setActivity([]); setNote(''); setError('')
-    }
-    addToast(`${idSet.size} session${idSet.size === 1 ? '' : 's'} deleted`)
-  }
 
   async function run() {
     if (running || !check?.installed) return
@@ -703,73 +680,11 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     </>
   )
 
-  if (isGlobalWorkspace) return (
-    <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
-      <div className="chat-layout">
-        <aside className="session-list">
-          <div className="session-list-header">
-            <button className="session-new-btn" disabled title="Codex needs a project folder">
-              <span className="session-new-icon">＋</span> New task
-            </button>
-          </div>
-          <div className="session-list-extra">
-            <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
-              📋 App CLAUDE.md
-            </button>
-          </div>
-        </aside>
-        <section className="chat-main">
-          <AiContextBar testId="context-bar-codex" model={CODEX_MODEL} mode="Codex" status="Project required" disabledReason="Open a project folder" />
-          <div className="empty center cc-setup" data-testid="codex-project-required">
-            <h2>Open a project to use Codex.</h2>
-            <p className="muted">Codex runs against a selected project folder. Open a project workspace to use it — Global Workspace has no folder for it to work in.</p>
-          </div>
-        </section>
-      </div>
-      {instructionsOpen && (
-        <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
-      )}
-    </div>
+  const codexGlobalHeaderSlot = (
+    <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
+      📋 App CLAUDE.md
+    </button>
   )
-
-  if (check && !check.installed) {
-    return (
-      <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
-        <div className="chat-layout">
-          <aside className="session-list">
-            <div className="session-list-header">
-              <button className="session-new-btn" disabled title="Codex is unavailable">
-                <span className="session-new-icon">＋</span> New task
-              </button>
-            </div>
-            <div className="session-list-extra">
-              <button
-                className={`instructions-md-btn${agentMdExists ? ' exists' : ''}`}
-                onClick={() => setInstructionsOpen({ agentId: 'codex', agentLabel: 'Codex' })}
-                title="Edit CODEX.md"
-              >
-                📋 CODEX.md{!agentMdExists ? ' (create)' : ''}
-              </button>
-              <button className="instructions-md-btn exists" onClick={() => setInstructionsOpen({ agentId: 'app', agentLabel: 'App' })} title="Edit App CLAUDE.md">
-                📋 App CLAUDE.md
-              </button>
-              <button
-                className={`instructions-md-btn${sharedMdExists ? ' exists' : ''}`}
-                onClick={() => setInstructionsOpen({ agentId: 'shared', agentLabel: 'Shared' })}
-                title="Edit AI.md (shared instructions for all agents)"
-              >
-                📋 AI.md{!sharedMdExists ? ' (create)' : ''}
-              </button>
-            </div>
-          </aside>
-          <section className="chat-main"><SetupNotice check={check} onRecheck={recheck} /></section>
-        </div>
-        {instructionsOpen && (
-          <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
-        )}
-      </div>
-    )
-  }
 
   const codexHeaderSlot = (
     <>
@@ -797,6 +712,66 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     </>
   )
 
+  if (isGlobalWorkspace) return (
+    <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
+      <div className="chat-layout">
+        <AgentSessionRail
+          sessions={[]}
+          pinnedIds={new Set()}
+          renaming={null}
+          newLabel="New task"
+          disabled
+          disabledTitle="Codex needs a project folder"
+          emptyLabel="No Codex tasks yet"
+          headerSlot={codexGlobalHeaderSlot}
+          onSelect={() => {}}
+          onOptions={() => {}}
+          onRenameChange={() => {}}
+          onRenameCommit={() => {}}
+          onRenameCancel={() => {}}
+        />
+        <section className="chat-main">
+          <AiContextBar testId="context-bar-codex" model={CODEX_MODEL} mode="Codex" status="Project required" disabledReason="Open a project folder" />
+          <div className="empty center cc-setup" data-testid="codex-project-required">
+            <h2>Open a project to use Codex.</h2>
+            <p className="muted">Codex runs against a selected project folder. Open a project workspace to use it — Global Workspace has no folder for it to work in.</p>
+          </div>
+        </section>
+      </div>
+      {instructionsOpen && (
+        <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
+      )}
+    </div>
+  )
+
+  if (check && !check.installed) {
+    return (
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
+        <div className="chat-layout">
+          <AgentSessionRail
+            sessions={[]}
+            pinnedIds={new Set()}
+            renaming={null}
+            newLabel="New task"
+            disabled
+            disabledTitle="Codex is unavailable"
+            emptyLabel="No Codex tasks yet"
+            headerSlot={codexHeaderSlot}
+            onSelect={() => {}}
+            onOptions={() => {}}
+            onRenameChange={() => {}}
+            onRenameCommit={() => {}}
+            onRenameCancel={() => {}}
+          />
+          <section className="chat-main"><SetupNotice check={check} onRecheck={recheck} /></section>
+        </div>
+        {instructionsOpen && (
+          <InstructionsEditor agentId={instructionsOpen.agentId} agentLabel={instructionsOpen.agentLabel} projectPath={props.project.path ?? null} onClose={() => setInstructionsOpen(null)} />
+        )}
+      </div>
+    )
+  }
+
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
     <div className="chat-layout">
@@ -810,13 +785,13 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
         newTitle="Start a new Codex task"
         emptyLabel="No Codex tasks yet"
         headerSlot={codexHeaderSlot}
+        openMenuSessionId={contextMenu?.sessionId ?? null}
         onNew={newSession}
         onSelect={selectSession}
         onOptions={openContextMenu}
         onRenameChange={(value) => renaming && setRenaming({ ...renaming, value })}
         onRenameCommit={(s) => void commitRename(s)}
         onRenameCancel={() => setRenaming(null)}
-        onDeleteMany={deleteManySessions}
       />
 
       <section className="chat-main">
@@ -845,6 +820,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
               detail={`${model} · ${sandbox}${skipGitRepoCheck ? ' · untrusted allowed' : ''}`}
             />
 
+            <div className="chat-scroll-shell">
             <div className="chat-scroll" ref={scrollRef}>
               {messages.length > RENDER_LIMIT + renderOffset && (
                 <button className="ghost load-older-btn" onClick={() => setRenderOffset((o) => o + RENDER_LIMIT)}>
@@ -863,6 +839,8 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
                   )}
                 </div>
               )}
+            </div>
+            <ChatJumpToBottomButton visible={showJumpToBottom} onClick={jumpToBottom} />
             </div>
 
             {error && <AgentErrorNotice title="Codex could not run" testId="codex-error">{error}</AgentErrorNotice>}
