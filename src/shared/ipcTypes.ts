@@ -1,4 +1,4 @@
-export type AgentMode = 'chat' | 'hermes' | 'claudecode' | 'codex'
+export type AgentMode = 'chat' | 'hermes' | 'claudecode' | 'codex' | 'kimi'
 export type SearchScope = 'project' | 'related' | 'global'
 
 export interface FsEntry { name: string; isDir: boolean; path: string }
@@ -22,7 +22,7 @@ export interface ComposerAttachment {
 }
 
 export interface ActivityEntry {
-  source: 'CHAT' | 'HERMES' | 'CODE' | 'INDEXER' | 'MEMORY' | 'RESEARCH'
+  source: 'CHAT' | 'HERMES' | 'CODE' | 'INDEXER' | 'MEMORY' | 'RESEARCH' | 'KIMI'
   message: string
   timestamp: number
 }
@@ -193,12 +193,27 @@ export type DockPanel =
   | 'hermes'
   | 'claudecode'
   | 'codex'
+  | 'kimi'
   | 'editor'
   | 'terminal'
   | 'research'
   | 'activity'
   | 'extensions'
   | 'browser'
+  | 'preview'
+
+// ── Preview panel (read-only, user-only live viewer) ──────────────────────────
+export interface PreviewPanelState {
+  url: string
+  title: string
+  isLoading: boolean
+  navigationError: string | null
+}
+
+export interface PreviewDevServerDetectedEvent {
+  projectPath: string
+  url: string
+}
 
 // ── Browser panel (manual WebContentsView browsing) ──────────────────────────
 export interface BrowserBounds {
@@ -216,6 +231,29 @@ export interface BrowserTabState {
   canGoBack: boolean
   canGoForward: boolean
   navigationError?: string | null
+  previewMode?: boolean
+}
+
+export interface BrowserPreviewScriptSuggestion {
+  script: 'dev' | 'start' | 'preview'
+  command: string
+  packageManager: 'npm' | 'pnpm' | 'yarn'
+}
+
+export interface BrowserPreviewDetectionResult {
+  urls: string[]
+  suggestions: BrowserPreviewScriptSuggestion[]
+  signals: string[]
+  probedPorts: number[]
+  timeoutMs: number
+  error?: string
+}
+
+export interface BrowserPreviewInspection {
+  blank: boolean
+  textLength: number
+  visualElementCount: number
+  reason?: 'empty-document' | 'no-visible-content'
 }
 
 export interface BrowserTabListResponse {
@@ -229,6 +267,11 @@ export interface BrowserTabCreatedEvent {
 
 export interface BrowserTabClosedEvent {
   tabId: string
+}
+
+export interface BrowserPreviewOpenRequest {
+  tabId: string
+  url: string
 }
 
 export interface BrowserDownloadStatus {
@@ -332,6 +375,7 @@ export interface ToolStatus {
 export interface ToolDetection {
   claudeCode: ToolStatus
   codex: ToolStatus
+  kimi: ToolStatus
   ollama: ToolStatus
   hermes: ToolStatus
 }
@@ -448,7 +492,114 @@ export interface HermesRespondPermissionRequest {
   alwaysAllowSession?: boolean
 }
 
+// ── Kimi (ACP over local stdio — see src/main/kimi.ts) ────────────────────────
+
+export interface KimiCheck { installed: boolean; version?: string; bin?: string; error?: string }
+export interface KimiActivity {
+  ts: number
+  kind: string
+  message: string
+  toolName?: string
+  status?: 'running' | 'done' | 'error'
+  args?: unknown
+  result?: string
+  details?: unknown
+}
+export interface KimiCommand { name: string; description: string; hint?: string }
+export interface KimiPlanEntry { content: string; status: string }
+/** One choice inside an ACP config select (session/new configOptions). */
+export interface KimiConfigChoice { value: string; name: string; description?: string }
+/**
+ * A non-model ACP config select (e.g. thinking effort, conversation capacity)
+ * reported by kimi-code's session/new — rendered as a drill-in row in the
+ * Kimi model picker. The model select itself stays a dedicated flat list.
+ */
+export interface KimiConfigSelect { id: string; name: string; currentValue?: string; options: KimiConfigChoice[] }
+export type KimiPermissionMode = 1 | 2 | 3 | 4 | 5
+export type KimiActionKind = 'read' | 'create' | 'edit' | 'execute' | 'destructive' | 'catastrophic'
+export interface KimiPermissionRequestInfo { requestId: string; action: KimiActionKind; title: string }
+export type KimiEvent =
+  | { kind: 'text'; text: string }
+  | { kind: 'thought'; text: string }
+  | { kind: 'activity'; activity: KimiActivity }
+  | { kind: 'error'; message: string }
+  | { kind: 'model'; name: string }
+  | { kind: 'usage'; used: number; size: number }
+  | { kind: 'commands'; commands: KimiCommand[] }
+  | { kind: 'plan'; entries: KimiPlanEntry[] }
+  | { kind: 'permissionRequest'; request: KimiPermissionRequestInfo }
+  | { kind: 'configOptions'; options: KimiConfigSelect[] }
+
+export interface KimiSendRequest {
+  sessionId: string
+  projectId: string
+  prompt: string
+  injectMemory?: boolean
+  /** ACP model id (e.g. 'kimi-code/k3'). Applied per-session via session/set_config_option. */
+  model?: string
+  /** Non-model config selects (keyed by configOption id). Applied like `model`. */
+  configValues?: Record<string, string>
+  regenerateMessageId?: string
+}
+
+export interface KimiDoneEvent {
+  sessionId: string
+  ok?: boolean
+  memorySaved?: boolean
+  error?: string
+}
+
+export interface KimiUsageEvent { used: number; max: number }
+export interface KimiIpcEvent { sessionId: string; event: KimiEvent }
+
+export interface KimiRespondPermissionRequest {
+  sessionId: string
+  requestId: string
+  approved: boolean
+  actionKind?: KimiActionKind
+  alwaysAllowSession?: boolean
+}
+
+export type KimiAuthMethod = 'oauth' | 'apikey'
+export interface KimiAuthStatus { method: KimiAuthMethod; configured: boolean; detail?: string }
+export type KimiLoginEvent =
+  | { kind: 'status'; message: string }
+  | { kind: 'deviceCode'; url: string; code: string }
+  | { kind: 'done'; success: boolean; error?: string }
+
+// Shared model-catalog shape for the agent model pickers (Claude Code, Kimi,
+// Codex). Every field must come from a real source (the CLI's own caches,
+// config files, or verified static knowledge) — never invented marketing copy.
+export interface AgentEffortLevel {
+  value: string
+  label: string
+  description?: string
+}
+export interface AgentModelInfo {
+  id: string // value passed to the CLI / ACP (e.g. 'claude-sonnet-5', 'gpt-5.6-sol', 'kimi-code/k3')
+  label: string // display name
+  description?: string // one-liner, only from real data
+  badge?: string // only from real data
+  efforts?: AgentEffortLevel[] // real supported levels; absent = no effort control
+  defaultEffort?: string
+  /** Real context window size in tokens (e.g. Kimi config.toml max_context_size). */
+  contextSize?: number
+  /** True when the entry belongs under a "More models" submenu (older models). */
+  extra?: boolean
+  /** True when the model has a real fast/priority service tier (Codex service_tiers). */
+  fastTier?: boolean
+  /** Real description of the fast service tier (e.g. "1.5x speed, increased usage"). */
+  fastTierDescription?: string
+}
+
 export interface CCFileDiff { path: string; before: string | null; after: string }
+
+// Real per-turn context usage from the CLI's final result event
+// (modelUsage.<model> = {inputTokens, cacheReadInputTokens,
+// cacheCreationInputTokens, contextWindow, ...}). used = input + cacheRead +
+// cacheCreation; total = contextWindow. No plan-limit data exists locally.
+export interface CCModelUsage { model: string; used: number; contextWindow?: number }
+export interface CCUsage { used: number; total: number | null; perModel: CCModelUsage[] }
 export interface CCActivityEntry { name: string; summary: string; ok?: boolean; id?: string; diff?: CCFileDiff }
 export type CCEvent =
   | { kind: 'system'; summary: string; model?: string }
@@ -456,6 +607,7 @@ export type CCEvent =
   | { kind: 'tool'; id: string; name: string; summary: string }
   | { kind: 'tool-result'; id: string; ok: boolean; summary: string }
   | { kind: 'file_diff'; toolCallId: string; path: string; before: string | null; after: string }
+  | { kind: 'usage'; usage: CCUsage }
   | { kind: 'error'; message: string }
 
 export interface ClaudeCodeCheck { installed: boolean; version?: string; bin?: string; error?: string }
@@ -466,10 +618,20 @@ export interface ClaudeCodeSendRequest {
   prompt: string
   injectMemory?: boolean
   model?: string
-  effort?: 'normal' | 'high' | 'max'
+  // CLI `--effort` levels: 'low' | 'medium' | 'high' | 'xhigh' | 'max'.
+  // 'default' / 'normal' (legacy) omit the flag. Typed as string so new CLI
+  // levels don't require a renderer type bump.
+  effort?: string
   thinking?: boolean
+  // Autonomy control → CLI `--permission-mode`. Only the three modes that behave
+  // meaningfully in this app's headless (`-p`) runs are offered (see runClaudeCode
+  // in src/main/claudecode.ts). Omitted ⇒ 'acceptEdits'.
+  permissionMode?: ClaudeCodePermissionMode
   regenerateMessageId?: string
 }
+
+/** Claude Code autonomy modes exposed by this app's headless composer. */
+export type ClaudeCodePermissionMode = 'plan' | 'acceptEdits' | 'bypassPermissions'
 
 export interface ClaudeCodeIpcEvent { sessionId: string; event: CCEvent }
 export interface ClaudeCodeDoneEvent {
@@ -483,11 +645,21 @@ export interface ClaudeCodeDoneEvent {
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export interface CodexCheck { installed: boolean; version?: string; bin?: string; error?: string }
 export interface CodexActivityEntry { name: string; summary: string; ok?: boolean }
+// Real plan rate limits from the CLI's rollout files
+// (~/.codex/sessions/**/rollout-*.jsonl, last token_count line):
+// primary = the weekly window, secondary = the 5-hour window when present.
+export interface CodexRateLimitWindow {
+  kind: 'primary' | 'secondary'
+  usedPercent: number
+  windowMinutes?: number
+  resetsAt?: number // unix seconds
+}
+export interface CodexPlanUsage { planType?: string; windows: CodexRateLimitWindow[] }
 export type CodexEvent =
   | { kind: 'system'; summary: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; name: string; summary: string }
-  | { kind: 'usage'; used: number }
+  | { kind: 'usage'; used: number; total?: number | null; plan?: CodexPlanUsage }
   | { kind: 'error'; message: string }
 
 export interface CodexSendRequest {
@@ -497,6 +669,10 @@ export interface CodexSendRequest {
   sandbox?: CodexSandboxMode
   skipGitRepoCheck?: boolean
   model?: string
+  /** Per-spawn reasoning effort → `-c model_reasoning_effort=<level>` override. */
+  effort?: string
+  /** Service tier → `-c service_tier="priority"` when 'priority' (Fast tier); omitted otherwise. */
+  speed?: string
   imagePaths?: string[]
   regenerateMessageId?: string
 }
@@ -649,6 +825,16 @@ export type FsReadFileResponse = { content: string; size: number } | { error: st
 export type FsWriteFileResponse = { success: boolean } | { error: string }
 export type FileCopyResponse = { success: true; path: string } | { success: false; error: string }
 export type CloudModelsResponse = { success: true; models: { id: string; name: string }[] } | { success: false; error: string }
+
+/** Verdict on local inference speed — see src/main/inferenceSpeed.ts for the signals. */
+export type LocalSpeedVerdict = 'fast' | 'slow' | 'unknown'
+export interface LocalSpeedProbe {
+  verdict: LocalSpeedVerdict
+  tokensPerSecond: number | null
+  signal: 'vram' | 'generate' | 'unavailable'
+  detail: string
+  probedAt: number
+}
 export type MutationResponse = { success: boolean; error?: string }
 export type DeleteAfterResponse = { success: boolean; deletedCount?: number; error?: string }
 
@@ -669,6 +855,7 @@ export interface IpcApi {
   models: {
     list(): Promise<string[]>
     listCloud(): Promise<CloudModelsResponse>
+    speedProbe(force?: boolean): Promise<LocalSpeedProbe>
   }
   ollama: {
     status(): Promise<OllamaStatus>
@@ -726,6 +913,7 @@ export interface IpcApi {
     messages(sessionId: string): Promise<Message[]>
     abort(sessionId: string): Promise<void>
     send(args: CodexSendRequest): Promise<string | null>
+    listModels(): Promise<AgentModelInfo[]>
     onEvent(cb: (d: CodexIpcEvent) => void): () => void
     onDone(cb: (d: CodexDoneEvent) => void): () => void
   }
@@ -734,6 +922,7 @@ export interface IpcApi {
     messages(sessionId: string): Promise<Message[]>
     send(args: ClaudeCodeSendRequest): Promise<string | null>
     abort(sessionId: string): Promise<void>
+    listModels(): Promise<AgentModelInfo[]>
     onEvent(cb: (d: ClaudeCodeIpcEvent) => void): () => void
     onDone(cb: (d: ClaudeCodeDoneEvent) => void): () => void
     onCheckpoint(cb: (d: CheckpointEvent) => void): () => void
@@ -775,6 +964,30 @@ export interface IpcApi {
     onEvent(cb: (d: HermesIpcEvent) => void): () => void
     onDone(cb: (d: HermesDoneEvent) => void): () => void
     onUsage(cb: (d: HermesUsageEvent) => void): () => void
+  }
+  kimi: {
+    check(): Promise<KimiCheck>
+    health(): Promise<{ ok: boolean }>
+    connect(): Promise<{ connected: boolean; version?: string; error?: string }>
+    messages(sessionId: string): Promise<Message[]>
+    abort(sessionId: string): Promise<void>
+    send(args: KimiSendRequest): Promise<string | null>
+    listModels(): Promise<AgentModelInfo[]>
+    getPermissionMode(): Promise<KimiPermissionMode>
+    setPermissionMode(mode: KimiPermissionMode): Promise<MutationResponse>
+    /** Native ACP plan mode (session mode 'plan' — read-only, no tool execution). */
+    getPlanMode(): Promise<boolean>
+    setPlanMode(on: boolean): Promise<MutationResponse>
+    respondPermission(args: KimiRespondPermissionRequest): Promise<MutationResponse>
+    getAuthMethod(): Promise<KimiAuthMethod>
+    setAuthMethod(method: KimiAuthMethod): Promise<MutationResponse>
+    getAuthStatus(): Promise<KimiAuthStatus>
+    setApiKey(key: string): Promise<MutationResponse>
+    login(): Promise<{ success: boolean; error?: string }>
+    onEvent(cb: (d: KimiIpcEvent) => void): () => void
+    onDone(cb: (d: KimiDoneEvent) => void): () => void
+    onUsage(cb: (d: KimiUsageEvent) => void): () => void
+    onLoginEvent(cb: (d: KimiLoginEvent) => void): () => void
   }
   hermesSkills: {
     list(): Promise<HermesSkillsListResponse>
@@ -820,18 +1033,38 @@ export interface IpcApi {
     closeTab(tabId: string): Promise<void>
     setActiveTab(tabId: string): Promise<void>
     navigate(tabId: string, url: string): Promise<void>
+    navigatePreview(tabId: string, url: string): Promise<void>
+    setPreviewMode(tabId: string, enabled: boolean): Promise<void>
+    detectPreview(projectId: string): Promise<BrowserPreviewDetectionResult>
+    inspectPreview(tabId: string): Promise<BrowserPreviewInspection>
     goBack(tabId: string): Promise<void>
     goForward(tabId: string): Promise<void>
     reload(tabId: string): Promise<void>
     stop(tabId: string): Promise<void>
     setBounds(tabId: string, bounds: BrowserBounds): Promise<void>
     hideAll(): Promise<void>
+    parkForDrag(): Promise<void>
+    restoreAfterDrag(): Promise<void>
     listTabs(): Promise<BrowserTabListResponse>
     getDownloads(): Promise<BrowserDownloadStatus[]>
     reloadSessions(): Promise<void>
     onTabUpdated(cb: (d: BrowserTabState) => void): () => void
     onTabCreated(cb: (d: BrowserTabCreatedEvent) => void): () => void
     onTabClosed(cb: (d: BrowserTabClosedEvent) => void): () => void
+    onPreviewRequested(cb: (d: BrowserPreviewOpenRequest) => void): () => void
+  }
+  preview: {
+    navigate(url: string): Promise<void>
+    reload(): Promise<void>
+    stop(): Promise<void>
+    setBounds(bounds: BrowserBounds): Promise<void>
+    hideAll(): Promise<void>
+    parkForDrag(): Promise<void>
+    restoreAfterDrag(): Promise<void>
+    getState(): Promise<PreviewPanelState>
+    getDetectedUrl(projectId: string): Promise<string | null>
+    onUpdated(cb: (d: PreviewPanelState) => void): () => void
+    onDevServerDetected(cb: (d: PreviewDevServerDetectedEvent) => void): () => void
   }
   approvals: {
     list(): Promise<BrowserApprovalRequest[]>
@@ -868,6 +1101,7 @@ export interface IpcApi {
   }
   window: {
     notifyActivity(): Promise<void>
+    notifyApproval(payload: { source: 'browser' | 'hermes' | 'kimi'; summary: string; panelActive?: boolean }): Promise<void>
   }
   tips: {
     stats(): Promise<TipStats>
@@ -875,5 +1109,10 @@ export interface IpcApi {
     markShown(tipId: string): Promise<void>
     dismiss(tipId: string): Promise<void>
     markHandoffUsed(): Promise<void>
+  }
+  // Renderer self-healing: last-resort recovery from the fallback error page
+  // (see verifyRendererHealth in src/main/index.ts).
+  app: {
+    resetAndRestart(): Promise<void>
   }
 }

@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexSandboxMode } from '../types'
+import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexPlanUsage, CodexSandboxMode, AgentModelInfo } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import { useToast } from './ToastContext'
-import { useAgentActivity } from '../AgentActivityContext'
+import { useAgentTaskReporter } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { fallbackTitleFromText, isGenericSessionTitle } from '../../../shared/sessionTitles'
 import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import InstructionsEditor from './InstructionsEditor'
+import { CodexModelPicker } from './ModelPicker'
+import ContextMeter from './ContextMeter'
 import ToolSyntaxBlock from './ToolSyntaxBlock'
 import anime, { prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
 import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
+import LivePreviewAffordance from './LivePreviewAffordance'
 
 const CODEX_MODEL = 'Codex CLI'
 
@@ -31,7 +34,11 @@ function loadPinned(): Set<string> {
 }
 function savePinned(s: Set<string>) { localStorage.setItem(PINNED_KEY, JSON.stringify([...s])) }
 
-const KNOWN_MODELS = ['gpt-5.5', 'o3', 'o4-mini', 'o3-mini']
+// Static fallback so the picker never renders empty before the IPC catalog
+// arrives; the authoritative list comes from codex:listModels.
+const FALLBACK_MODELS: AgentModelInfo[] = [{ id: 'gpt-5.5', label: 'GPT-5.5' }]
+const EFFORT_PREF_KEY = 'codex-preferred-effort'
+const SPEED_PREF_KEY = 'codex-preferred-speed'
 const CUSTOM_MODELS_KEY = 'aiworkspace.codex.customModels'
 const CUSTOM_MODEL_SENTINEL = '__custom__'
 function loadCustomModels(): string[] {
@@ -103,7 +110,6 @@ interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function CodexTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
-  const { setActive: setAgentActive } = useAgentActivity()
   const [check, setCheck] = useState<CodexCheck | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
@@ -121,10 +127,18 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     try { return localStorage.getItem('codex-preferred-model') ?? 'gpt-5.5' } catch { return 'gpt-5.5' }
   })
   const [customModels, setCustomModels] = useState<string[]>(() => loadCustomModels())
+  const [models, setModels] = useState<AgentModelInfo[]>(FALLBACK_MODELS)
+  const [effort, setEffort] = useState<string>(() => {
+    try { return localStorage.getItem(EFFORT_PREF_KEY) ?? '' } catch { return '' }
+  })
+  const [speed, setSpeed] = useState<string>(() => {
+    try { return localStorage.getItem(SPEED_PREF_KEY) ?? 'standard' } catch { return 'standard' }
+  })
   const [customEditing, setCustomEditing] = useState(false)
   const [customDraft, setCustomDraft] = useState('')
   const [dangerConfirmOpen, setDangerConfirmOpen] = useState(false)
-  const [usageTokens, setUsageTokens] = useState<number | undefined>(undefined)
+  const [usage, setUsage] = useState<{ used: number; total?: number | null; plan?: CodexPlanUsage } | null>(null)
+  const usageTokens = usage?.used
   const [contextMenu, setContextMenu] = useState<CtxMenu | null>(null)
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
@@ -194,14 +208,34 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     })
   }
 
-  // Publish start/stop only (not per event) so the topbar activity badge
-  // doesn't re-render on every streamed chunk.
-  useEffect(() => {
-    setAgentActive('codex', running)
-    return () => setAgentActive('codex', false)
-  }, [running, setAgentActive])
+  // Publish start/stop only (not per event) so the topbar activity badge and
+  // activity popover don't re-render on every streamed chunk.
+  useAgentTaskReporter('codex', {
+    running,
+    session,
+    title: session?.summary || session?.title,
+    failed: Boolean(error)
+  })
 
   useEffect(() => { if (active) window.api.models.list().then(setOllamaModels) }, [active])
+
+  // Real model catalog from the main process (~/.codex/models_cache.json).
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
+    window.api.codex.listModels()
+      .then((list) => { if (!cancelled && Array.isArray(list) && list.length > 0) setModels(list) })
+      .catch(() => { /* keep fallback */ })
+    return () => { cancelled = true }
+  }, [active])
+
+  // Default the effort to the selected model's real default reasoning level
+  // (from the catalog) unless the user already picked one.
+  useEffect(() => {
+    if (effort) return
+    const def = models.find((m) => m.id === model)?.defaultEffort
+    if (def) setEffort(def)
+  }, [models, model, effort])
 
   useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
@@ -264,7 +298,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   useEffect(() => {
     if (session) window.api.codex.messages(session.id).then(setMessages)
     else setMessages([])
-    setOutput(''); setActivity([]); setNote(''); setError(''); setUsageTokens(undefined)
+    setOutput(''); setActivity([]); setNote(''); setError(''); setUsage(null)
     setRenderOffset(0)
   }, [session])
 
@@ -294,7 +328,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
       if (e.kind === 'text') setOutput((o) => o + (o ? '\n' : '') + e.text)
       else if (e.kind === 'tool') setActivity((a) => [...a, { name: e.name, summary: e.summary, ok: true }])
       else if (e.kind === 'system') setNote(e.summary)
-      else if (e.kind === 'usage') setUsageTokens(e.used)
+      else if (e.kind === 'usage') setUsage({ used: e.used, total: e.total, plan: e.plan })
       else if (e.kind === 'error') setError(e.message)
     })
     const offDone = window.api.codex.onDone(async (d) => {
@@ -395,7 +429,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     setError(''); setRunning(true); setOutput(''); setActivity([]); setNote('')
     setInput('')
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: prompt, model: null, created_at: Date.now() }])
-    window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt, sandbox, skipGitRepoCheck, model, imagePaths: imagePaths?.length ? imagePaths : undefined })
+    window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt, sandbox, skipGitRepoCheck, model, effort: effort || undefined, speed: speed === 'priority' ? 'priority' : undefined, imagePaths: imagePaths?.length ? imagePaths : undefined })
   }
 
   async function handoffSend(detail: HandoffSendDetail) {
@@ -410,7 +444,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     lastPromptRef.current = detail.prompt
     setError(''); setRunning(true); setOutput(''); setActivity([]); setNote('')
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: detail.prompt, model: null, created_at: Date.now() }])
-    window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, sandbox, skipGitRepoCheck, model })
+    window.api.codex.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, sandbox, skipGitRepoCheck, model, effort: effort || undefined, speed: speed === 'priority' ? 'priority' : undefined })
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
 
@@ -454,6 +488,23 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     }
     setModel(value)
     try { localStorage.setItem('codex-preferred-model', value) } catch { /* ignore */ }
+    // Effort levels are per-model real data — reset to the newly selected
+    // model's default reasoning level (unknown/custom models get no override).
+    const nextEffort = models.find((m) => m.id === value)?.defaultEffort ?? ''
+    setEffort(nextEffort)
+    try { localStorage.setItem(EFFORT_PREF_KEY, nextEffort) } catch { /* ignore */ }
+    setSpeed('standard')
+    try { localStorage.setItem(SPEED_PREF_KEY, 'standard') } catch { /* ignore */ }
+  }
+
+  function selectEffort(value: string) {
+    setEffort(value)
+    try { localStorage.setItem(EFFORT_PREF_KEY, value) } catch { /* ignore */ }
+  }
+
+  function selectSpeed(value: string) {
+    setSpeed(value)
+    try { localStorage.setItem(SPEED_PREF_KEY, value) } catch { /* ignore */ }
   }
 
   function commitCustomModel() {
@@ -462,6 +513,10 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     if (!value) return
     setModel(value)
     try { localStorage.setItem('codex-preferred-model', value) } catch { /* ignore */ }
+    setEffort('')
+    try { localStorage.setItem(EFFORT_PREF_KEY, '') } catch { /* ignore */ }
+    setSpeed('standard')
+    try { localStorage.setItem(SPEED_PREF_KEY, 'standard') } catch { /* ignore */ }
     setCustomModels((prev) => rememberCustomModel(value, prev))
   }
 
@@ -528,8 +583,8 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     if (!session || running || !check?.installed) return
     lastPromptRef.current = content
     setError(''); setRunning(true); setOutput(''); setActivity([]); setNote('')
-    window.api.codex.send({ sessionId: session.id, projectId: props.project.id, prompt: content, sandbox, skipGitRepoCheck, model, regenerateMessageId })
-  }, [session, running, check, sandbox, skipGitRepoCheck, model, props.project.id])
+    window.api.codex.send({ sessionId: session.id, projectId: props.project.id, prompt: content, sandbox, skipGitRepoCheck, model, effort: effort || undefined, speed: speed === 'priority' ? 'priority' : undefined, regenerateMessageId })
+  }, [session, running, check, sandbox, skipGitRepoCheck, model, effort, speed, props.project.id])
 
   const fetchCodexMessages = useCallback((sid: string) => window.api.codex.messages(sid), [])
 
@@ -581,8 +636,16 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
   const contextStatus = running ? 'Running' : check?.installed ? 'Ready' : 'Checking'
 
-  const modelOptions = [...KNOWN_MODELS, ...customModels.filter((m) => !KNOWN_MODELS.includes(m))]
-  const modelSelectValue = modelOptions.includes(model) ? model : CUSTOM_MODEL_SENTINEL
+  // Catalog + recently-used custom models + the trailing "Custom…" row.
+  // A restored preference absent from the catalog is appended so restoration
+  // never lies.
+  const modelOptions = useMemo<AgentModelInfo[]>(() => {
+    const base = [...models]
+    for (const custom of customModels) if (!base.some((m) => m.id === custom)) base.push({ id: custom, label: custom })
+    if (model && !base.some((m) => m.id === model)) base.push({ id: model, label: model })
+    base.push({ id: CUSTOM_MODEL_SENTINEL, label: 'Custom…', description: 'Enter any model string (-m)' })
+    return base
+  }, [models, customModels, model])
 
   // Context line + unified composer shell, shared between the empty state and
   // an active session — the empty state IS the composer, ready to type into.
@@ -635,9 +698,9 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
                 >{SANDBOX_META[m].label}</button>
               ))}
             </div>
-            <label className={`codex-trust-chip ${skipGitRepoCheck ? 'on' : ''}`} title="Only enable for folders you trust — Codex may read and modify files in this project.">
+            <label className={`codex-trust-chip ${skipGitRepoCheck ? 'on' : ''}`} title="Let Codex run in a folder that isn't a clean Git repository (--skip-git-repo-check). This is a Git-safety bypass, not an autonomy setting — the sandbox above controls what Codex may do. Only enable for folders you trust.">
               <input data-testid="codex-allow-untrusted" type="checkbox" checked={skipGitRepoCheck} disabled={running} onChange={(e) => setSkipGitRepoCheck(e.target.checked)} />
-              <span>Allow untrusted</span>
+              <span>Skip Git check</span>
             </label>
           </div>
           <div className="composer-bar-right">
@@ -658,19 +721,19 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
                 />
               </div>
             ) : (
-              <div className="model-select model-picker-plain" title="Codex model (-m)">
-                <select data-testid="codex-model" value={modelSelectValue} disabled={running} onChange={(e) => selectModel(e.target.value)}>
-                  {KNOWN_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
-                  {customModels.filter((m) => !KNOWN_MODELS.includes(m)).length > 0 && (
-                    <optgroup label="Recently used">
-                      {customModels.filter((m) => !KNOWN_MODELS.includes(m)).map((m) => <option key={m} value={m}>{m}</option>)}
-                    </optgroup>
-                  )}
-                  <option value={CUSTOM_MODEL_SENTINEL}>Custom…</option>
-                </select>
-                <span className="model-select-chevron">⌄</span>
-              </div>
+              <CodexModelPicker
+                testId="codex-model"
+                models={modelOptions}
+                model={model}
+                onModelChange={selectModel}
+                effort={effort}
+                onEffortChange={selectEffort}
+                speed={speed}
+                onSpeedChange={selectSpeed}
+                disabled={running}
+              />
             )}
+            <ContextMeter testId="context-meter-codex" used={usage?.used} total={usage?.total} plan={usage?.plan} />
             {running
               ? <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn stop" onClick={stopRun} title="Stop Codex">Stop</button>
               : <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn" data-testid="codex-send" disabled={!input.trim()} onClick={() => void run()}>Run</button>}
@@ -805,6 +868,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
               </span>
               {emptyHeading}
             </h2>
+            <LivePreviewAffordance project={props.project} agent="codex" active={active} />
             {composerBlock}
           </div>
         ) : (
@@ -818,7 +882,9 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
               tone={running ? 'info' : 'success'}
               running={running}
               detail={`${model} · ${sandbox}${skipGitRepoCheck ? ' · untrusted allowed' : ''}`}
-            />
+            >
+              <LivePreviewAffordance project={props.project} agent="codex" active={active} />
+            </AgentStatusStrip>
 
             <div className="chat-scroll-shell">
             <div className="chat-scroll" ref={scrollRef}>

@@ -1,4 +1,5 @@
 import { ipcMain, dialog, BrowserWindow, app, shell } from 'electron'
+import { showNotification } from './notifications'
 import { randomUUID } from 'crypto'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -20,8 +21,31 @@ import {
   tryCreateCheckpoint,
   gitResetHard
 } from './claudecode'
+import { probeLocalSpeed } from './inferenceSpeed'
 import { checkCodex, runCodex, summarizeCodexRun } from './codex'
+import { listClaudeCodeModels, listCodexModels, listKimiModels } from './agentModels'
 import { buildKimiPtyCommand, checkKimi, fakeKimiSessionLines, resolveKimiBin } from './kimi'
+import {
+  checkKimiAuth,
+  connectKimi,
+  disconnectKimi,
+  getKimiAuthMethod,
+  getKimiPermissionMode,
+  getKimiPlanMode,
+  setKimiPlanMode,
+  kimiConnected,
+  respondKimiPermission,
+  runKimiLogin,
+  runKimiPrompt,
+  setKimiApiKey,
+  setKimiAuthMethod,
+  setKimiPermissionMode,
+  summarizeKimiRun,
+  bumpKimiSessionOverride,
+  type KimiActivity,
+  type KimiEvent,
+  type KimiPermissionMode
+} from './kimi'
 import {
   checkMcpServer,
   getActiveMcpServers,
@@ -34,6 +58,13 @@ import {
   writeMcpServers
 } from './mcp'
 import { browserControlPort, browserControlIdentityToken } from './browserControlServer'
+import {
+  allowedFsRoots,
+  attachmentRoots,
+  grantPickedFile,
+  isPickedFileGranted,
+  resolveWithinRoots
+} from './pathScope'
 import {
   checkHermes,
   connectHermes,
@@ -65,21 +96,42 @@ import {
   closeBrowserTab,
   setActiveTab as setActiveBrowserTab,
   navigateTab as navigateBrowserTab,
+  navigatePreviewTab,
+  setPreviewMode as setBrowserPreviewMode,
   goBack as browserGoBack,
   goForward as browserGoForward,
   reloadTab as reloadBrowserTab,
   stopTab as stopBrowserTab,
   setBrowserViewBounds,
   hideAllBrowserViews,
+  parkAllForDrag,
+  restoreAfterDrag,
   listBrowserTabs,
+  inspectPreviewTab,
   agentGetDownloads,
   reloadBrowserSessions
 } from './browserPanel'
+import { detectProjectPreview } from './browserPreview'
 import { browserApprovals } from './browserApproval'
+import {
+  navigatePreviewUrl,
+  reloadPreview,
+  stopPreview,
+  setPreviewBounds,
+  hidePreviewView,
+  parkPreviewForDrag,
+  restorePreviewAfterDrag,
+  getPreviewState,
+  getLastDetectedDevServerUrl,
+  noteTerminalOutput,
+} from './previewPanel'
 import type {
   BrowserBounds,
   BrowserTabListResponse,
   BrowserDownloadStatus,
+  BrowserPreviewDetectionResult,
+  BrowserPreviewInspection,
+  PreviewPanelState,
   BrowserApprovalDecision,
   BrowserApprovalRequest,
   BrowserApprovalResult,
@@ -95,6 +147,7 @@ import type {
   Checkpoint,
   CheckpointEvent,
   CheckpointResult,
+  AgentModelInfo,
   ClaudeCodeCheck,
   ClaudeCodeDoneEvent,
   ClaudeCodeIpcEvent,
@@ -121,6 +174,15 @@ import type {
   HermesRespondPermissionRequest,
   HermesSendRequest,
   HermesUsageEvent,
+  KimiAuthMethod,
+  KimiAuthStatus,
+  KimiCheck,
+  KimiDoneEvent,
+  KimiIpcEvent,
+  KimiLoginEvent,
+  KimiRespondPermissionRequest,
+  KimiSendRequest,
+  KimiUsageEvent,
   HandoffClassification,
   HermesSkillsInstallResponse,
   HermesSkillsListResponse,
@@ -138,6 +200,7 @@ import type {
   MemorySaveRequest,
   MemorySavedEvent,
   CloudModelsResponse,
+  LocalSpeedProbe,
   Message,
   MutationResponse,
   OllamaStatus,
@@ -169,6 +232,8 @@ const fakeKimiSessions = new Set<string>()
 const FS_IGNORE = new Set(['node_modules', '.git', 'out', 'dist', 'build', 'workspace.db', '.aiworkspace.json'])
 const CHAT_FILE_READ_LIMIT = 200 * 1024
 const CHAT_FILE_WRITE_LIMIT = 500 * 1024
+const BUILT_IN_PREVIEW_AGENT_INSTRUCTION =
+  "AI Workspace browser instruction: Use AI Workspace's built-in Browser Preview for localhost, 127.0.0.1, and [::1] preview URLs. Use the ai-workspace-browser MCP tools; do not open the system browser. If built-in preview navigation fails, report: 'Could not open built-in Browser Preview. Use the Browser panel manually or check Browser control tools.' External browsing requires the human to click Open externally in the Browser panel."
 const CHAT_FILE_TOOL_HINT =
   /\b(read|open|inspect|look at|check|scan|find|search|file|folder|directory|code|repo|project|workspace|write|edit|update|change|create|fix|modify|save|replace|implement|add|remove|delete|refactor|tsx?|jsx?|css|json|md|src[\\/]|package\.json)\b/i
 
@@ -387,7 +452,7 @@ export function killAllPtys(): void {
 
 function emitActivity(
   win: BrowserWindow | null,
-  source: 'CHAT' | 'HERMES' | 'CODE' | 'INDEXER' | 'MEMORY' | 'RESEARCH',
+  source: 'CHAT' | 'HERMES' | 'CODE' | 'INDEXER' | 'MEMORY' | 'RESEARCH' | 'KIMI',
   message: string
 ) {
   const payload: ActivityEntry = { source, message, timestamp: Date.now() }
@@ -414,7 +479,7 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   workspace_startup: { key: 'workspace_startup', kind: 'select', defaultValue: 'last', options: ['last', 'global'] },
   workspace_confirm_destructive: { key: 'workspace_confirm_destructive', kind: 'boolean', defaultValue: 'true' },
   workspace_panel_hints: { key: 'workspace_panel_hints', kind: 'boolean', defaultValue: 'true' },
-  agent_default: { key: 'agent_default', kind: 'select', defaultValue: 'codex', options: ['codex', 'claudecode', 'hermes'] },
+  agent_default: { key: 'agent_default', kind: 'select', defaultValue: 'codex', options: ['codex', 'claudecode', 'hermes', 'kimi'] },
   agent_save_outputs_to_knowledge: { key: 'agent_save_outputs_to_knowledge', kind: 'boolean', defaultValue: 'true' },
   agent_show_advanced_logs: { key: 'agent_show_advanced_logs', kind: 'boolean', defaultValue: 'false' },
   searxng_url: { key: 'searxng_url', kind: 'string', defaultValue: 'http://localhost:8080' },
@@ -424,9 +489,18 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   editor_tab_size: { key: 'editor_tab_size', kind: 'number', defaultValue: '2' },
   editor_word_wrap: { key: 'editor_word_wrap', kind: 'boolean', defaultValue: 'true' },
   terminal_start_dir: { key: 'terminal_start_dir', kind: 'select', defaultValue: 'project', options: ['project', 'app'] },
+  notify_sound_enabled: { key: 'notify_sound_enabled', kind: 'boolean', defaultValue: 'true' },
   browser_persist_session: { key: 'browser_persist_session', kind: 'boolean', defaultValue: 'false' },
   keyboard_shortcuts: { key: 'keyboard_shortcuts', kind: 'string', defaultValue: '' },
   ollama_cloud_key: { key: 'ollama_cloud_key', kind: 'secret', defaultValue: '', secret: true },
+  // Kimi Code API key, stored exactly like ollama_cloud_key above (plaintext
+  // app_meta — this app has no encrypted secret storage anywhere). Passed to
+  // `kimi acp` as an env var at spawn time when the API-key auth method is
+  // selected; see resolveKimiAuthEnv() / kimi.ts getKimiApiKey().
+  kimi_api_key: { key: 'kimi_api_key', kind: 'secret', defaultValue: '', secret: true },
+  // Set when the user dismisses the wizard's "local looks slow" suggestion, so
+  // the nudge never returns for someone who has already said no.
+  ollama_slow_hint_dismissed: { key: 'ollama_slow_hint_dismissed', kind: 'boolean', defaultValue: 'false' },
 }
 
 function readMeta(key: string): string | null {
@@ -448,6 +522,37 @@ function deleteMeta(key: string): void {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+// Translate raw fetch/stream failures from a chat turn into something a user
+// can act on. Undici reports everything from "Ollama isn't running" to "the
+// model stalled for 5 minutes" as a bare TypeError('fetch failed'); the real
+// signal hides in err.cause.code.
+function friendlyChatError(err: unknown, opts: { cloud: boolean; model: string }): string {
+  const raw = errorMessage(err)
+  const cause = (err as { cause?: { code?: string; name?: string } })?.cause
+  // The stream's idle-timeout aborts with a bare DOMException('TimeoutError')
+  // thrown directly (no .cause wrapper), so consult the top-level name too.
+  const topName = (err as { name?: string })?.name ?? ''
+  const code = cause?.code ?? cause?.name ?? topName
+  const target = opts.cloud ? 'Ollama Cloud' : 'Ollama'
+
+  if (/UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|TimeoutError/i.test(code) || /timed? ?out/i.test(raw)) {
+    return `${opts.model} stopped responding before finishing (timed out). Local models running on CPU can take minutes per reply — consider a smaller or cloud model, then retry.`
+  }
+  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code) || /fetch failed/i.test(raw)) {
+    return opts.cloud
+      ? 'Could not reach Ollama Cloud — check your internet connection, then retry.'
+      : 'Lost the connection to Ollama. Make sure the Ollama server is running (`ollama serve`), then retry.'
+  }
+  const status = raw.match(/error: (\d{3})/)?.[1]
+  if (status === '401' || status === '403') {
+    return `${target} rejected the request (HTTP ${status}). Check the API key in the model picker.`
+  }
+  if (status === '404') {
+    return `${target} doesn't know the model "${opts.model}" (HTTP 404). Pull it or pick a different model.`
+  }
+  return raw
 }
 
 // Per-project "is this a git repo?" cache. The Navigator polls git status on a
@@ -558,11 +663,20 @@ async function buildDiagnosticsReport(): Promise<SettingsDiagnostics> {
 
 export function registerIpc(): void {
   // ---- filesystem (Phase D: Navigator file tree) ----
+  // FsEntry[] carries no error channel and this handler already collapses every
+  // failure (missing dir, EACCES) to an empty list, so a denial matches its
+  // existing contract. Widening the shape would mean changing the IPC type and
+  // both callers; the console.warn is what makes a denial diagnosable.
   ipcMain.handle('fs:readDir', (_e, dirPath: string): FsEntry[] => {
+    const scoped = resolveWithinRoots(dirPath, allowedFsRoots(), 'folder')
+    if ('error' in scoped) {
+      console.warn('[fs] readDir denied (outside allowed roots):', dirPath)
+      return []
+    }
     try {
-      return readdirSync(dirPath, { withFileTypes: true })
+      return readdirSync(scoped.target, { withFileTypes: true })
         .filter(e => !FS_IGNORE.has(e.name) && !e.name.endsWith('.map'))
-        .map(e => ({ name: e.name, isDir: e.isDirectory(), path: join(dirPath, e.name) }))
+        .map(e => ({ name: e.name, isDir: e.isDirectory(), path: join(scoped.target, e.name) }))
         .sort((a, b) => {
           if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
           return a.name.localeCompare(b.name)
@@ -574,10 +688,12 @@ export function registerIpc(): void {
 
   // Phase E: read/write files for the Editor panel
   ipcMain.handle('fs:readFile', (_e, filePath: string): FsReadFileResponse => {
+    const scoped = resolveWithinRoots(filePath, allowedFsRoots(), 'file')
+    if ('error' in scoped) return { error: scoped.error }
     try {
-      const stat = statSync(filePath)
+      const stat = statSync(scoped.target)
       if (stat.size > 500 * 1024) return { error: 'File too large (>500KB)' }
-      const buf = readFileSync(filePath)
+      const buf = readFileSync(scoped.target)
       const checkLen = Math.min(512, buf.length)
       for (let i = 0; i < checkLen; i++) {
         if (buf[i] === 0) return { error: 'Binary file' }
@@ -589,8 +705,10 @@ export function registerIpc(): void {
   })
 
   ipcMain.handle('fs:writeFile', (_e, filePath: string, content: string): FsWriteFileResponse => {
+    const scoped = resolveWithinRoots(filePath, allowedFsRoots(), 'file')
+    if ('error' in scoped) return { error: scoped.error }
     try {
-      writeFileSync(filePath, content, 'utf-8')
+      writeFileSync(scoped.target, content, 'utf-8')
       return { success: true }
     } catch (e: unknown) {
       return { error: errorMessage(e) }
@@ -603,10 +721,24 @@ export function registerIpc(): void {
       properties: ['openFile'],
       filters: [{ name: 'All Files', extensions: ['*'] }]
     })
-    return result.canceled ? null : result.filePaths[0]
+    if (result.canceled || !result.filePaths[0]) return null
+    // The user picked this file in a native dialog — a gesture main can trust.
+    // Record it so files:read will serve it even from outside a project root.
+    grantPickedFile(result.filePaths[0])
+    return result.filePaths[0]
   })
 
   ipcMain.handle('files:read', async (_e, filePath: string): Promise<FileAttachment> => {
+    // Attachments come from two gestures: the native picker (granted above) and
+    // drag-and-drop, which main cannot corroborate — hence the user content
+    // folders. Anything else is refused by throwing: this handler's contract is
+    // already reject-by-throw (see the size check), and the renderer surfaces the
+    // message as a toast.
+    const scoped = isPickedFileGranted(filePath)
+      ? { target: resolve(filePath) }
+      : resolveWithinRoots(filePath, [...allowedFsRoots(), ...attachmentRoots()], 'file')
+    if ('error' in scoped) throw new Error(scoped.error)
+    filePath = scoped.target
     const stats = statSync(filePath)
     if (stats.size > 10 * 1024 * 1024) throw new Error('File too large (max 10MB)')
     const ext = extname(filePath).toLowerCase()
@@ -745,6 +877,9 @@ export function registerIpc(): void {
       return { success: false, error: errorMessage(err) }
     }
   })
+  // Evidence-based "is local inference painfully slow here?" — never throws;
+  // 'unknown' means stay quiet rather than assume the worst.
+  ipcMain.handle('models:speedProbe', (_e, force?: boolean): Promise<LocalSpeedProbe> => probeLocalSpeed(Boolean(force)))
   ipcMain.handle('ollama:status', (): Promise<OllamaStatus> => ollamaStatus())
   // One-shot, non-streaming completion (offline-tolerant; returns null if the
   // host/model is unavailable). Routed through ollama.ts like all model access —
@@ -825,7 +960,7 @@ export function registerIpc(): void {
   // loads the Electron-ABI better-sqlite3). The Extensions quick-add uses this
   // instead of hardcoding `node`, which would load a mismatched native binary.
   ipcMain.handle('mcp:getKnowledgeServerConfig', (): McpServerConfig =>
-    knowledgeMcpLaunchConfig(join(app.getAppPath(), 'out', 'mcp', 'server.cjs'), app.getPath('userData'))
+    bundledMcpServers()['ai-workspace-knowledge']
   )
 
   // On-disk path of the bundled browser-control MCP server (Extensions quick-add).
@@ -837,7 +972,7 @@ export function registerIpc(): void {
   // control server's loopback port baked into the env). The Extensions quick-add
   // uses this instead of hardcoding a config.
   ipcMain.handle('mcp:getBrowserServerConfig', (): McpServerConfig =>
-    browserMcpLaunchConfig(join(app.getAppPath(), 'out', 'mcp', 'browser-server.cjs'), browserControlPort(), browserControlIdentityToken)
+    bundledMcpServers()['ai-workspace-browser']
   )
 
   // ---- sessions / chat ----
@@ -1073,8 +1208,8 @@ export function registerIpc(): void {
       const controller = new AbortController()
       chatAborts.set(args.sessionId, controller)
       let full = ''
+      const isCloud = args.model.startsWith('cloud:')
       try {
-        const isCloud = args.model.startsWith('cloud:')
         if (isCloud) {
           const cloudModel = args.model.slice(6)
           const keyRow = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('ollama_cloud_key') as { value: string } | undefined
@@ -1096,8 +1231,10 @@ export function registerIpc(): void {
         // (persisted below) and finish cleanly instead of reporting an error.
         if (!controller.signal.aborted) {
           chatAborts.delete(args.sessionId)
-          const payload: ChatErrorEvent = { sessionId: args.sessionId, error: errorMessage(err) }
+          const friendly = friendlyChatError(err, { cloud: isCloud, model: isCloud ? args.model.slice(6) : args.model })
+          const payload: ChatErrorEvent = { sessionId: args.sessionId, error: friendly }
           win?.webContents.send('chat:error', payload)
+          emitActivity(win, 'CHAT', `Response failed: ${friendly}`)
           return null
         }
       } finally {
@@ -1261,6 +1398,10 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // process; the renderer provides only project identity, prompt, and sandbox.
   ipcMain.handle('codex:check', (): Promise<CodexCheck> => checkCodex())
 
+  // Model catalog for the Codex picker — from the CLI's own models_cache.json
+  // (see agentModels.ts), or a deterministic fake list under E2E_FAKE_CODEX.
+  ipcMain.handle('codex:listModels', (): AgentModelInfo[] => listCodexModels())
+
   ipcMain.handle('codex:messages', (_e, sessionId: string): Message[] =>
     getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId) as Message[]
   )
@@ -1336,10 +1477,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       const run = await runCodex({
         projectPath: project.path,
         prompt: args.prompt,
+        systemInstruction: BUILT_IN_PREVIEW_AGENT_INSTRUCTION,
         sandbox: args.sandbox,
         skipGitRepoCheck: args.skipGitRepoCheck,
         model: args.model,
+        effort: args.effort,
+        speed: args.speed,
         imagePaths: args.imagePaths,
+        // Expose the bundled knowledge + browser MCP servers to this session as
+        // per-spawn `-c mcp_servers.*` overrides (Codex ignores
+        // claude_desktop_config.json).
+        mcpServers: bundledMcpServers(),
         signal: controller.signal,
         threadId: sessionRow?.codex_thread_id ?? undefined,
         onEvent: (e) => {
@@ -1410,6 +1558,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // ---- Claude Code (M5) ----
   // Is the CLI installed/usable? (Login state is only knowable from a real run.)
   ipcMain.handle('claudecode:check', (): Promise<ClaudeCodeCheck> => checkClaudeCode())
+
+  // Model catalog for the Claude Code picker — core verified list plus the
+  // CLI's own additionalModelOptionsCache (see agentModels.ts); deterministic
+  // fake list under E2E_FAKE_CLAUDE_CODE.
+  ipcMain.handle('claudecode:listModels', (): AgentModelInfo[] => listClaudeCodeModels())
 
   // Track in-flight Claude Code runs so a Stop can kill the child process.
   const ccAborts = new Map<string, AbortController>()
@@ -1484,9 +1637,10 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         if (block) prompt = `${block}\n\n---\n\nTask:\n${args.prompt}`
       }
 
-      // Effort → the CLI's native `--effort` levels. "normal" omits the flag to
-      // preserve the default; "high"/"max" map straight onto CLI effort levels.
-      const effort = args.effort === 'high' ? 'high' : args.effort === 'max' ? 'max' : undefined
+      // Effort → the CLI's native `--effort` levels (low|medium|high|xhigh|max),
+      // passed through verbatim. 'default' (and the legacy 'normal') omit the
+      // flag to preserve the CLI default.
+      const effort = args.effort && args.effort !== 'default' && args.effort !== 'normal' ? args.effort : undefined
 
       // Checkpoint the project folder before Claude Code can touch it, so the
       // user can roll back this task's file changes. Only recorded against a
@@ -1512,9 +1666,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       const run = await runClaudeCode({
         projectPath: project.path,
         prompt,
+        systemInstruction: BUILT_IN_PREVIEW_AGENT_INSTRUCTION,
         model: args.model,
         effort,
         thinking: args.thinking,
+        permissionMode: args.permissionMode,
+        // Expose the bundled knowledge + browser MCP servers to this session.
+        // Without this the CLI runs with no MCP tools at all (it never reads
+        // claude_desktop_config.json).
+        mcpServers: bundledMcpServers(),
         signal: controller.signal,
         onEvent: (e) => {
           const payload: ClaudeCodeIpcEvent = { sessionId: args.sessionId, event: e }
@@ -1729,6 +1889,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         sessionId: args.sessionId,
         projectPath: project?.path ?? process.cwd(),
         prompt,
+        systemInstruction: BUILT_IN_PREVIEW_AGENT_INSTRUCTION,
         mcpServers,
         signal: controller.signal,
         onEvent: (e) => {
@@ -1794,6 +1955,187 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     }
   )
 
+  // ---- Kimi (ACP over local stdio) ----
+  // `kimi acp` runs directly on Windows (no WSL/SSH — plain PATH binary), so
+  // this is simpler than the Hermes wiring above: no distro/mode plumbing.
+
+  ipcMain.handle('kimi:check', (): Promise<KimiCheck> => checkKimi())
+  // Model catalog for the Kimi picker — parsed from ~/.kimi-code/config.toml
+  // [models.*] entries (see agentModels.ts); deterministic fake list under
+  // E2E_FAKE_KIMI.
+  ipcMain.handle('kimi:listModels', (): AgentModelInfo[] => listKimiModels())
+  ipcMain.handle('kimi:health', (): { ok: boolean } => ({ ok: kimiConnected() }))
+  ipcMain.handle('kimi:connect', async (): Promise<{ connected: boolean; version?: string; error?: string }> => {
+    const { env } = await resolveKimiMcpAndAuth()
+    return connectKimi([], env)
+  })
+
+  ipcMain.handle('kimi:getPermissionMode', (): KimiPermissionMode => getKimiPermissionMode())
+  ipcMain.handle('kimi:setPermissionMode', (_e, mode: KimiPermissionMode): MutationResponse => {
+    setKimiPermissionMode(mode)
+    return { success: true }
+  })
+  ipcMain.handle('kimi:getPlanMode', (): boolean => getKimiPlanMode())
+  ipcMain.handle('kimi:setPlanMode', (_e, on: boolean): MutationResponse => {
+    setKimiPlanMode(Boolean(on))
+    return { success: true }
+  })
+  ipcMain.handle('kimi:respondPermission', (_e, args: KimiRespondPermissionRequest): MutationResponse => {
+    if (args.approved && args.alwaysAllowSession && args.actionKind) {
+      bumpKimiSessionOverride(args.sessionId, args.actionKind)
+    }
+    const handled = respondKimiPermission(args.requestId, args.approved)
+    return { success: handled }
+  })
+
+  ipcMain.handle('kimi:getAuthMethod', (): KimiAuthMethod => getKimiAuthMethod())
+  ipcMain.handle('kimi:setAuthMethod', (_e, method: KimiAuthMethod): MutationResponse => {
+    setKimiAuthMethod(method)
+    disconnectKimi() // auth changed; force a fresh ACP process on next send
+    return { success: true }
+  })
+  ipcMain.handle('kimi:getAuthStatus', (): KimiAuthStatus => checkKimiAuth())
+  ipcMain.handle('kimi:setApiKey', (_e, key: string): MutationResponse => {
+    setKimiApiKey(key)
+    return { success: true }
+  })
+  ipcMain.handle('kimi:login', async (event): Promise<{ success: boolean; error?: string }> => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return runKimiLogin((e: KimiLoginEvent) => win?.webContents.send('kimi:loginEvent', e))
+  })
+
+  const kimiAborts = new Map<string, AbortController>()
+  ipcMain.handle('kimi:abort', (_e, sessionId: string): void => {
+    kimiAborts.get(sessionId)?.abort()
+  })
+
+  ipcMain.handle(
+    'kimi:send',
+    async (event, args: KimiSendRequest): Promise<string | null> => {
+      const db = getDb()
+      const win = BrowserWindow.fromWebContents(event.sender)
+      if (isGlobalProjectId(args.projectId)) {
+        const payload: KimiDoneEvent = {
+          sessionId: args.sessionId,
+          ok: false,
+          error: 'Kimi needs a project folder. Open a project workspace to use it.'
+        }
+        win?.webContents.send('kimi:done', payload)
+        return null
+      }
+      const insertMsg = (role: string, content: string, model: string | null) => {
+        const ts = Date.now()
+        db
+          .prepare(`INSERT INTO messages (id, session_id, role, content, model, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+          .run(randomUUID(), args.sessionId, role, content, model, ts)
+        db.prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`).run(ts, args.sessionId)
+      }
+
+      const prior = db
+        .prepare(`SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND role = 'user'`)
+        .get(args.sessionId) as { n: number }
+      if (!args.regenerateMessageId) insertMsg('user', args.prompt, null)
+      if (prior.n === 0) {
+        const title = args.prompt.trim().replace(/\s+/g, ' ').slice(0, 50) || 'New task'
+        db.prepare(`UPDATE sessions SET title = ? WHERE id = ?`).run(title, args.sessionId)
+      }
+
+      const project = db
+        .prepare(`SELECT path FROM projects WHERE id = ?`)
+        .get(args.projectId) as { path: string } | undefined
+
+      let prompt = args.prompt
+      if (args.injectMemory) {
+        const block = knowledge.formatProjectContext(knowledge.getProjectContext(args.projectId))
+        if (block) prompt = `${block}\n\n---\n\nTask:\n${args.prompt}`
+      }
+
+      const { mcpServers, env } = await resolveKimiMcpAndAuth()
+
+      const controller = new AbortController()
+      kimiAborts.set(args.sessionId, controller)
+      const transcript: Array<{ kind: 'text'; text: string } | { kind: 'activity'; activity: KimiActivity }> = []
+      const appendTranscriptEvent = (e: KimiEvent) => {
+        if (e.kind === 'text') {
+          const last = transcript[transcript.length - 1]
+          if (last?.kind === 'text') last.text += e.text
+          else transcript.push({ kind: 'text', text: e.text })
+        } else if (e.kind === 'activity') {
+          transcript.push({ kind: 'activity', activity: e.activity })
+        }
+      }
+
+      const run = await runKimiPrompt({
+        sessionId: args.sessionId,
+        projectPath: project?.path ?? process.cwd(),
+        prompt,
+        systemInstruction: BUILT_IN_PREVIEW_AGENT_INSTRUCTION,
+        model: args.model,
+        configValues: args.configValues,
+        mcpServers,
+        authEnv: env,
+        signal: controller.signal,
+        onEvent: (e) => {
+          appendTranscriptEvent(e)
+          const payload: KimiIpcEvent = { sessionId: args.sessionId, event: e }
+          win?.webContents.send('kimi:event', payload)
+          if (e.kind === 'usage') {
+            const usagePayload: KimiUsageEvent = { used: e.used, max: e.size }
+            win?.webContents.send('kimi:usage', usagePayload)
+          }
+          else if (e.kind === 'activity') emitActivity(win, 'KIMI', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
+          else if (e.kind === 'error') emitActivity(win, 'KIMI', `Kimi error: ${e.message.slice(0, 80)}`)
+          else if (e.kind === 'model') emitActivity(win, 'KIMI', `Kimi model: ${e.name}`)
+        }
+      })
+      kimiAborts.delete(args.sessionId)
+
+      let persistedTranscript = false
+      for (const segment of transcript) {
+        if (segment.kind === 'text') {
+          if (segment.text.trim()) {
+            insertMsg('assistant', segment.text, 'kimi')
+            persistedTranscript = true
+          }
+        } else {
+          insertMsg('tool', JSON.stringify([segment.activity]), 'kimi')
+          persistedTranscript = true
+        }
+      }
+      if (!run.ok && run.error && !run.text) {
+        insertMsg('assistant', run.error, 'kimi')
+        persistedTranscript = true
+      }
+      if (!persistedTranscript) insertMsg('assistant', run.text || run.error || '(no output)', 'kimi')
+
+      let memorySaved = false
+      if (run.ok || run.text) {
+        const { title, content } = summarizeKimiRun(args.prompt, run)
+        await knowledge.saveMemory({
+          projectId: args.projectId,
+          type: 'task',
+          title,
+          content,
+          source: 'kimi',
+          tags: ['kimi']
+        })
+        memorySaved = true
+        const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
+        win?.webContents.send('index:updated', payload)
+      }
+
+      recordUsage('kimi', (args.prompt.length + (run.text || '').length) / 4)
+      const donePayload: KimiDoneEvent = {
+        sessionId: args.sessionId,
+        ok: run.ok,
+        memorySaved,
+        error: run.ok ? undefined : run.error
+      }
+      win?.webContents.send('kimi:done', donePayload)
+      return run.text || null
+    }
+  )
+
   // ---- Hermes skills (Extensions panel Skills tab) ----
   // Talks to the Hermes dashboard HTTP API (port 9119) from the main process;
   // the renderer's CSP blocks direct fetches, same as the MCP registry proxy.
@@ -1853,6 +2195,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     pty.onData((data: string) => {
       const payload: TerminalDataEvent = { id, data }
       win?.webContents.send('terminal:data', payload)
+      noteTerminalOutput(cwd, data)
     })
     pty.onExit(() => {
       ptyMap.delete(id)
@@ -1989,6 +2332,25 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   ipcMain.handle('browser:closeTab', (_e, tabId: string): void => closeBrowserTab(tabId))
   ipcMain.handle('browser:setActiveTab', (_e, tabId: string): void => setActiveBrowserTab(tabId))
   ipcMain.handle('browser:navigate', (_e, tabId: string, url: string): void => navigateBrowserTab(tabId, url))
+  ipcMain.handle('browser:navigatePreview', (_e, tabId: string, url: string): void => navigatePreviewTab(tabId, url))
+  ipcMain.handle('browser:setPreviewMode', (_e, tabId: string, enabled: boolean): void =>
+    setBrowserPreviewMode(tabId, Boolean(enabled))
+  )
+  ipcMain.handle('browser:detectPreview', async (_e, projectId: string): Promise<BrowserPreviewDetectionResult> => {
+    if (!projectId || isGlobalProjectId(projectId)) {
+      return { urls: [], suggestions: [], signals: [], probedPorts: [], timeoutMs: 450, error: 'Select a project workspace first.' }
+    }
+    const project = getDb().prepare('SELECT path FROM projects WHERE id = ?').get(projectId) as { path: string } | undefined
+    if (!project?.path || !existsSync(project.path)) {
+      return { urls: [], suggestions: [], signals: [], probedPorts: [], timeoutMs: 450, error: 'Project folder is unavailable.' }
+    }
+    try {
+      return await detectProjectPreview(project.path)
+    } catch (err) {
+      return { urls: [], suggestions: [], signals: [], probedPorts: [], timeoutMs: 450, error: errorMessage(err) }
+    }
+  })
+  ipcMain.handle('browser:inspectPreview', (_e, tabId: string): Promise<BrowserPreviewInspection> => inspectPreviewTab(tabId))
   ipcMain.handle('browser:goBack', (_e, tabId: string): void => browserGoBack(tabId))
   ipcMain.handle('browser:goForward', (_e, tabId: string): void => browserGoForward(tabId))
   ipcMain.handle('browser:reload', (_e, tabId: string): void => reloadBrowserTab(tabId))
@@ -1997,11 +2359,31 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     setBrowserViewBounds(tabId, bounds)
   )
   ipcMain.handle('browser:hideAll', (): void => hideAllBrowserViews())
+  ipcMain.handle('browser:parkForDrag', (): void => parkAllForDrag())
+  ipcMain.handle('browser:restoreAfterDrag', (): void => restoreAfterDrag())
   ipcMain.handle('browser:listTabs', (): BrowserTabListResponse => listBrowserTabs())
   ipcMain.handle('browser:getDownloads', (): BrowserDownloadStatus[] => agentGetDownloads())
   ipcMain.handle('browser:reloadSessions', (e): void => {
     const win = BrowserWindow.fromWebContents(e.sender)
     if (win) reloadBrowserSessions(win)
+  })
+
+  // ---- Preview panel (read-only, user-only live viewer) -----------------------
+  // A second, isolated WebContentsView surface — see previewPanel.ts. It has no
+  // MCP exposure and is not registered with the browser-control server.
+  ipcMain.handle('preview:navigate', (_e, url: string): void => navigatePreviewUrl(url))
+  ipcMain.handle('preview:reload', (): void => reloadPreview())
+  ipcMain.handle('preview:stop', (): void => stopPreview())
+  ipcMain.handle('preview:setBounds', (_e, bounds: BrowserBounds): void => setPreviewBounds(bounds))
+  ipcMain.handle('preview:hideAll', (): void => hidePreviewView())
+  ipcMain.handle('preview:parkForDrag', (): void => parkPreviewForDrag())
+  ipcMain.handle('preview:restoreAfterDrag', (): void => restorePreviewAfterDrag())
+  ipcMain.handle('preview:getState', (): PreviewPanelState => getPreviewState())
+  ipcMain.handle('preview:getDetectedUrl', (_e, projectId: string): string | null => {
+    if (!projectId || isGlobalProjectId(projectId)) return null
+    const project = getDb().prepare('SELECT path FROM projects WHERE id = ?').get(projectId) as { path: string } | undefined
+    if (!project?.path) return null
+    return getLastDetectedDevServerUrl(project.path)
   })
 
   // Application-level approval queue. This is deliberately outside Hermes so
@@ -2425,10 +2807,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   // ---- Instruction file editor ----
+  // Instruction files live either in a project (CLAUDE.md/HERMES.md/CODEX.md/AI.md)
+  // or next to the app (the 'app' agent's own CLAUDE.md) — exactly the roots
+  // instructions:getPath below can produce, so scoping to them costs nothing.
   ipcMain.handle('instructions:read', async (_e, filePath: string): Promise<InstructionsReadResponse> => {
+    const scoped = resolveWithinRoots(filePath, allowedFsRoots(), 'instruction file')
+    if ('error' in scoped) return { exists: false, content: '', error: scoped.error }
     try {
-      if (!existsSync(filePath)) return { exists: false, content: '' }
-      const content = readFileSync(filePath, 'utf-8')
+      if (!existsSync(scoped.target)) return { exists: false, content: '' }
+      const content = readFileSync(scoped.target, 'utf-8')
       return { exists: true, content }
     } catch (err) {
       return { exists: false, content: '', error: String(err) }
@@ -2436,9 +2823,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   })
 
   ipcMain.handle('instructions:write', async (_e, filePath: string, content: string): Promise<InstructionsWriteResponse> => {
+    const scoped = resolveWithinRoots(filePath, allowedFsRoots(), 'instruction file')
+    if ('error' in scoped) return { success: false, error: scoped.error }
     try {
-      mkdirSync(dirname(filePath), { recursive: true })
-      writeFileSync(filePath, content, 'utf-8')
+      mkdirSync(dirname(scoped.target), { recursive: true })
+      writeFileSync(scoped.target, content, 'utf-8')
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -2533,12 +2922,101 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     if (process.platform === 'win32') win.flashFrame(true)
     else app.setBadgeCount(1)
   })
+
+  ipcMain.handle('window:notifyApproval', (event, payload: { source: 'browser' | 'hermes' | 'kimi'; summary: string; panelActive?: boolean }): void => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) return
+    if (win.isFocused() && payload.panelActive) return
+    showNotification(win, {
+      title: payload.source === 'hermes' ? 'Hermes needs approval' : payload.source === 'kimi' ? 'Kimi needs approval' : 'Browser approval needed',
+      body: payload.summary
+    })
+  })
 }
 
 // ---- MCP server path resolution --------------------------------------------
 // Builds the mcpServers array for session/new so Hermes can reach the knowledge
 // MCP server. Resolves paths lazily (once per send that needs them); errors are
 // non-fatal (Hermes still works without MCP, just without shared memory).
+/**
+ * The two bundled MCP servers this app ships, keyed by name, built from the
+ * single source-of-truth launch configs in mcp.ts. This is the config handed to
+ * a Claude Code / Codex spawn so the session actually has knowledge_* and
+ * browser_* tools (neither CLI reads claude_desktop_config.json). The Hermes ACP
+ * path builds its own variant — see resolveHermesMcpServers — because it must
+ * run the servers Windows-side via WSL interop.
+ */
+function bundledMcpServers(): Record<string, McpServerConfig> {
+  return {
+    'ai-workspace-knowledge': knowledgeMcpLaunchConfig(
+      join(app.getAppPath(), 'out', 'mcp', 'server.cjs'),
+      app.getPath('userData')
+    ),
+    'ai-workspace-browser': browserMcpLaunchConfig(
+      join(app.getAppPath(), 'out', 'mcp', 'browser-server.cjs'),
+      browserControlPort(),
+      browserControlIdentityToken
+    )
+  }
+}
+
+// Kimi runs Windows-side directly (plain PATH binary, no WSL/SSH). Verified
+// against the real installed binary (kimi-code CLI 0.27.0, confirmed via
+// `kimi acp --help` / `kimi --version`): `kimi acp` takes only `--login`/`-h`
+// — there is no `--mcp-config-file` (or any other) flag, and no fixed-path
+// mcp.json that `kimi doctor` recognizes (it only checks config.toml and
+// tui.toml). The real, protocol-native mechanism is the ACP `session/new`
+// request's `mcpServers` array param — already wired through
+// runKimiPrompt()/newSession() in kimi.ts.
+//
+// CAVEAT (also verified against the real binary): `initialize`'s
+// `agentCapabilities.mcpCapabilities` on this build reports only
+// `{ http: true, sse: true }` — no `stdio` key. A live test (spawning
+// `kimi acp` directly and passing our stdio ai-workspace-knowledge server via
+// `session/new.mcpServers`) confirmed this is not just an advertisement gap:
+// the session started without error, but the server's tools never appeared
+// in Kimi's tool list — only Kimi's own built-ins did. Our bundled servers
+// (server.cjs / browser-server.cjs) only implement StdioServerTransport, so
+// there is currently no working transport between them and this Kimi build.
+// We still pass the array (correct per-protocol, harmless, and forward
+// compatible if a future Kimi build adds stdio support) but tool calls
+// through Kimi should not be expected to work until either Kimi adds stdio
+// support or our servers grow an http/sse transport.
+function kimiMcpServersArray(): object[] {
+  const active = getActiveMcpServers()
+  const all = bundledMcpServers()
+  const names = Object.keys(all).filter((name) => active[name])
+  return names.map((name) => {
+    const cfg = all[name]
+    return {
+      name,
+      command: cfg.command,
+      args: cfg.args ?? [],
+      env: Object.entries(cfg.env ?? {}).map(([k, v]) => ({ name: k, value: v }))
+    }
+  })
+}
+
+/**
+ * Resolves per-send Kimi extras: the ACP-native mcpServers array (see above)
+ * plus the API-key auth env var when the API-key auth method is selected.
+ * The API-key env-var fallback remains best-effort/unverified — Kimi's docs
+ * describe config-file-based alternative providers but don't confirm an
+ * env-var override works against a real `kimi acp` process.
+ */
+async function resolveKimiMcpAndAuth(): Promise<{ mcpServers: object[]; env?: Record<string, string> }> {
+  const mcpServers = kimiMcpServersArray()
+
+  let env: Record<string, string> | undefined
+  if (getKimiAuthMethod() === 'apikey') {
+    const row = getDb().prepare('SELECT value FROM app_meta WHERE key = ?').get('kimi_api_key') as
+      | { value: string }
+      | undefined
+    if (row?.value) env = { MOONSHOT_API_KEY: row.value, KIMI_API_KEY: row.value }
+  }
+  return { mcpServers, env }
+}
+
 async function resolveHermesMcpServers(): Promise<object[]> {
   if (process.platform !== 'win32') return []
   // Remote mode: Hermes runs on a native Linux machine over SSH, not WSL2.

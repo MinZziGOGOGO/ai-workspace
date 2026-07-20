@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
   ActivityEntry,
+  BrowserPreviewOpenRequest,
   BrowserTabCreatedEvent,
   BrowserTabClosedEvent,
   BrowserTabState,
@@ -24,9 +25,19 @@ import type {
   HermesRespondPermissionRequest,
   HermesSendRequest,
   HermesUsageEvent,
+  KimiActionKind,
+  KimiAuthMethod,
+  KimiDoneEvent,
+  KimiIpcEvent,
+  KimiLoginEvent,
+  KimiRespondPermissionRequest,
+  KimiSendRequest,
+  KimiUsageEvent,
   IndexUpdatedEvent,
   IpcApi,
   MemorySavedEvent,
+  PreviewDevServerDetectedEvent,
+  PreviewPanelState,
   ResearchProgress,
   ResearchStartRequest,
   TerminalDataEvent,
@@ -57,7 +68,8 @@ const api: IpcApi = {
   },
   models: {
     list: () => ipcRenderer.invoke('models:list'),
-    listCloud: () => ipcRenderer.invoke('models:listCloud')
+    listCloud: () => ipcRenderer.invoke('models:listCloud'),
+    speedProbe: (force?: boolean) => ipcRenderer.invoke('models:speedProbe', force)
   },
   ollama: {
     status: () => ipcRenderer.invoke('ollama:status'),
@@ -131,6 +143,7 @@ const api: IpcApi = {
     messages: (sessionId: string) => ipcRenderer.invoke('codex:messages', sessionId),
     abort: (sessionId: string) => ipcRenderer.invoke('codex:abort', sessionId),
     send: (args: CodexSendRequest & { sandbox?: CodexSandboxMode }) => ipcRenderer.invoke('codex:send', args),
+    listModels: () => ipcRenderer.invoke('codex:listModels'),
     onEvent: (cb: (d: CodexIpcEvent) => void) => onPayload('codex:event', cb),
     onDone: (cb: (d: CodexDoneEvent) => void) => onPayload('codex:done', cb)
   },
@@ -139,6 +152,7 @@ const api: IpcApi = {
     messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
     send: (args: ClaudeCodeSendRequest) => ipcRenderer.invoke('claudecode:send', args),
     abort: (sessionId: string) => ipcRenderer.invoke('claudecode:abort', sessionId),
+    listModels: () => ipcRenderer.invoke('claudecode:listModels'),
     onEvent: (cb: (d: ClaudeCodeIpcEvent) => void) => onPayload('claudecode:event', cb),
     onDone: (cb: (d: ClaudeCodeDoneEvent) => void) => onPayload('claudecode:done', cb),
     onCheckpoint: (cb: (d: CheckpointEvent) => void) => onPayload('claudecode:checkpoint', cb)
@@ -187,6 +201,31 @@ const api: IpcApi = {
     onEvent: (cb: (d: HermesIpcEvent) => void) => onPayload('hermes:event', cb),
     onDone: (cb: (d: HermesDoneEvent) => void) => onPayload('hermes:done', cb),
     onUsage: (cb: (d: HermesUsageEvent) => void) => onPayload('hermes:usage', cb)
+  },
+  // Kimi — ACP over local stdio (plain PATH binary, no WSL/SSH).
+  kimi: {
+    check: () => ipcRenderer.invoke('kimi:check'),
+    health: () => ipcRenderer.invoke('kimi:health'),
+    connect: () => ipcRenderer.invoke('kimi:connect'),
+    messages: (sessionId: string) => ipcRenderer.invoke('messages:list', sessionId),
+    abort: (sessionId: string) => ipcRenderer.invoke('kimi:abort', sessionId),
+    send: (args: KimiSendRequest) => ipcRenderer.invoke('kimi:send', args),
+    listModels: () => ipcRenderer.invoke('kimi:listModels'),
+    getPermissionMode: () => ipcRenderer.invoke('kimi:getPermissionMode'),
+    setPermissionMode: (mode: number) => ipcRenderer.invoke('kimi:setPermissionMode', mode),
+    getPlanMode: () => ipcRenderer.invoke('kimi:getPlanMode'),
+    setPlanMode: (on: boolean) => ipcRenderer.invoke('kimi:setPlanMode', on),
+    respondPermission: (args: KimiRespondPermissionRequest & { actionKind?: KimiActionKind }) =>
+      ipcRenderer.invoke('kimi:respondPermission', args),
+    getAuthMethod: () => ipcRenderer.invoke('kimi:getAuthMethod'),
+    setAuthMethod: (method: KimiAuthMethod) => ipcRenderer.invoke('kimi:setAuthMethod', method),
+    getAuthStatus: () => ipcRenderer.invoke('kimi:getAuthStatus'),
+    setApiKey: (key: string) => ipcRenderer.invoke('kimi:setApiKey', key),
+    login: () => ipcRenderer.invoke('kimi:login'),
+    onEvent: (cb: (d: KimiIpcEvent) => void) => onPayload('kimi:event', cb),
+    onDone: (cb: (d: KimiDoneEvent) => void) => onPayload('kimi:done', cb),
+    onUsage: (cb: (d: KimiUsageEvent) => void) => onPayload('kimi:usage', cb),
+    onLoginEvent: (cb: (d: KimiLoginEvent) => void) => onPayload('kimi:loginEvent', cb)
   },
   // Hermes dashboard skills API (Extensions panel Skills tab).
   hermesSkills: {
@@ -237,6 +276,10 @@ const api: IpcApi = {
     closeTab: (tabId: string) => ipcRenderer.invoke('browser:closeTab', tabId),
     setActiveTab: (tabId: string) => ipcRenderer.invoke('browser:setActiveTab', tabId),
     navigate: (tabId: string, url: string) => ipcRenderer.invoke('browser:navigate', tabId, url),
+    navigatePreview: (tabId: string, url: string) => ipcRenderer.invoke('browser:navigatePreview', tabId, url),
+    setPreviewMode: (tabId: string, enabled: boolean) => ipcRenderer.invoke('browser:setPreviewMode', tabId, enabled),
+    detectPreview: (projectId: string) => ipcRenderer.invoke('browser:detectPreview', projectId),
+    inspectPreview: (tabId: string) => ipcRenderer.invoke('browser:inspectPreview', tabId),
     goBack: (tabId: string) => ipcRenderer.invoke('browser:goBack', tabId),
     goForward: (tabId: string) => ipcRenderer.invoke('browser:goForward', tabId),
     reload: (tabId: string) => ipcRenderer.invoke('browser:reload', tabId),
@@ -244,12 +287,31 @@ const api: IpcApi = {
     setBounds: (tabId: string, bounds: { x: number; y: number; width: number; height: number }) =>
       ipcRenderer.invoke('browser:setBounds', tabId, bounds),
     hideAll: () => ipcRenderer.invoke('browser:hideAll'),
+    parkForDrag: () => ipcRenderer.invoke('browser:parkForDrag'),
+    restoreAfterDrag: () => ipcRenderer.invoke('browser:restoreAfterDrag'),
     listTabs: () => ipcRenderer.invoke('browser:listTabs'),
     getDownloads: () => ipcRenderer.invoke('browser:getDownloads'),
     reloadSessions: () => ipcRenderer.invoke('browser:reloadSessions'),
     onTabUpdated: (cb: (d: BrowserTabState) => void) => onPayload('browser:tabUpdated', cb),
     onTabCreated: (cb: (d: BrowserTabCreatedEvent) => void) => onPayload('browser:tabCreated', cb),
-    onTabClosed: (cb: (d: BrowserTabClosedEvent) => void) => onPayload('browser:tabClosed', cb)
+    onTabClosed: (cb: (d: BrowserTabClosedEvent) => void) => onPayload('browser:tabClosed', cb),
+    onPreviewRequested: (cb: (d: BrowserPreviewOpenRequest) => void) => onPayload('browser:previewRequested', cb)
+  },
+  // Preview panel — a second, isolated WebContentsView surface for the user to
+  // watch their own dev server. No agent/MCP tool ever calls these.
+  preview: {
+    navigate: (url: string) => ipcRenderer.invoke('preview:navigate', url),
+    reload: () => ipcRenderer.invoke('preview:reload'),
+    stop: () => ipcRenderer.invoke('preview:stop'),
+    setBounds: (bounds: { x: number; y: number; width: number; height: number }) =>
+      ipcRenderer.invoke('preview:setBounds', bounds),
+    hideAll: () => ipcRenderer.invoke('preview:hideAll'),
+    parkForDrag: () => ipcRenderer.invoke('preview:parkForDrag'),
+    restoreAfterDrag: () => ipcRenderer.invoke('preview:restoreAfterDrag'),
+    getState: () => ipcRenderer.invoke('preview:getState'),
+    getDetectedUrl: (projectId: string) => ipcRenderer.invoke('preview:getDetectedUrl', projectId),
+    onUpdated: (cb: (d: PreviewPanelState) => void) => onPayload('preview:updated', cb),
+    onDevServerDetected: (cb: (d: PreviewDevServerDetectedEvent) => void) => onPayload('preview:devServerDetected', cb)
   },
   approvals: {
     list: () => ipcRenderer.invoke('approvals:list'),
@@ -291,7 +353,9 @@ const api: IpcApi = {
   // Background-completion notification: pings the main process for a taskbar
   // cue (flashFrame on Windows, badge count elsewhere) when unfocused.
   window: {
-    notifyActivity: () => ipcRenderer.invoke('window:notifyActivity')
+    notifyActivity: () => ipcRenderer.invoke('window:notifyActivity'),
+    notifyApproval: (payload: { source: 'browser' | 'hermes' | 'kimi'; summary: string; panelActive?: boolean }) =>
+      ipcRenderer.invoke('window:notifyApproval', payload)
   },
   // Contextual tips: simple usage stats + a shown/dismissed ledger so a tip
   // never displays more than once (see src/renderer/src/tips.ts).
@@ -301,6 +365,9 @@ const api: IpcApi = {
     markShown: (tipId: string) => ipcRenderer.invoke('tips:markShown', tipId),
     dismiss: (tipId: string) => ipcRenderer.invoke('tips:dismiss', tipId),
     markHandoffUsed: () => ipcRenderer.invoke('tips:markHandoffUsed')
+  },
+  app: {
+    resetAndRestart: () => ipcRenderer.invoke('app:resetAndRestart')
   }
 }
 

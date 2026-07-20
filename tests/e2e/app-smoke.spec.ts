@@ -411,6 +411,400 @@ test('Chat user messages use the same feed column as agent messages', async ({},
   }
 })
 
+test('chat surfaces a waiting note, retryable errors, and a clickable activity badge', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Chat Feedback Project')
+
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+
+    // Busy with no tokens yet → the transcript itself shows a waiting note
+    // (not just the header chip), so slow models don't look dead. The
+    // transcript only exists once a session is active, so seed one first.
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'wait-session', project_id: 'test', mode: 'chat', title: 'Waiting chat', created_at: now },
+          messages: [
+            { id: 'wait-user', session_id: 'wait-session', role: 'user', content: 'Long question.', model: null, created_at: now },
+          ],
+        },
+      }))
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: true, streaming: '', thinking: '' },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-waiting-note')).toBeVisible()
+
+    // A running agent surfaces the topbar badge; clicking it opens the unified
+    // activity popover listing the running task. (Jump behaviour has its own
+    // test; here we just confirm the badge → popover surface, then close it.)
+    await expect(page.getByTestId('topbar-activity-badge')).toBeVisible()
+    await expect(page.getByTestId('topbar-activity-badge')).toContainText('1 active')
+    await page.getByTestId('topbar-activity-badge').click()
+    const popover = page.getByTestId('activity-popover')
+    await expect(popover).toBeVisible()
+    await expect(popover.getByTestId('activity-pop-running')).toContainText('Chat')
+    await expect(popover.getByTestId('activity-pop-row').filter({ hasText: 'Waiting chat' })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(popover).toHaveCount(0)
+    await expect(chatPanel).toBeVisible()
+
+    // First token arrived → the waiting note yields to real streaming text.
+    await page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: true, streaming: 'Partial answer', thinking: '' },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-waiting-note')).toHaveCount(0)
+
+    // Failed turn → error bar with a Retry button that resends the last user
+    // message through the regenerate path (no duplicate user turn).
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'retry-session', project_id: 'test', mode: 'chat', title: 'Retry chat', created_at: now },
+          messages: [
+            { id: 'retry-user', session_id: 'retry-session', role: 'user', content: 'Say something.', model: null, created_at: now },
+          ],
+          error: 'Lost the connection to Ollama. Make sure the Ollama server is running (`ollama serve`), then retry.',
+        },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-error-bar')).toContainText('Lost the connection to Ollama')
+    await chatPanel.getByTestId('chat-error-retry').click()
+    await expect(chatPanel.getByTestId('chat-error-bar')).toHaveCount(0)
+    await expect(chatPanel.locator('.msg.assistant').last()).toContainText('Fake Chat', { timeout: 15000 })
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('slow chat turn shows elapsed time and an inline switch-model affordance', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Slow Turn Project')
+
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+
+    // Seed an active session and mark it busy with no tokens yet.
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'slow-session', project_id: 'test', mode: 'chat', title: 'Slow chat', created_at: now },
+          messages: [
+            { id: 'slow-user', session_id: 'slow-session', role: 'user', content: 'A slow question.', model: null, created_at: now },
+          ],
+        },
+      }))
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: true, streaming: '', thinking: '' },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-waiting-note')).toBeVisible()
+    // Below the visible-elapsed threshold, no seconds suffix and no wait hint.
+    await expect(chatPanel.getByTestId('chat-waiting-elapsed')).toHaveCount(0)
+    await expect(chatPanel.getByTestId('chat-wait-hint')).toHaveCount(0)
+
+    // Second dispatch (busy already true, so the per-turn timer isn't reset)
+    // rewinds the turn's start past the 30s threshold.
+    await page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: true, streaming: '', thinking: '', elapsedMs: 31000 },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-waiting-elapsed')).toBeVisible()
+    await expect(chatPanel.getByTestId('chat-waiting-elapsed')).toContainText('31s')
+
+    // The inline "still waiting" affordance appears with a switch and a dismiss.
+    const waitHint = chatPanel.getByTestId('chat-wait-hint')
+    await expect(waitHint).toBeVisible()
+    await expect(waitHint.getByTestId('chat-wait-hint-switch')).toBeVisible()
+    await waitHint.getByTestId('chat-wait-hint-dismiss').click()
+    await expect(chatPanel.getByTestId('chat-wait-hint')).toHaveCount(0)
+    // Dismiss is per-turn and inline — the waiting note itself stays.
+    await expect(chatPanel.getByTestId('chat-waiting-note')).toBeVisible()
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('a measured-slow local turn surfaces a dismissible Ollama Cloud nudge', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Cloud Nudge Project')
+
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+
+    // No slow turn yet → no cloud nudge (fast setups never see it).
+    await expect(chatPanel.getByTestId('chat-cloud-nudge')).toHaveCount(0)
+
+    // Inject the evidence that a live turn proved the local model too slow.
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'nudge-session', project_id: 'test', mode: 'chat', title: 'Nudge chat', created_at: now },
+          messages: [
+            { id: 'nudge-user', session_id: 'nudge-session', role: 'user', content: 'Slow one.', model: null, created_at: now },
+          ],
+        },
+      }))
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: false, streaming: '', thinking: '', slowTurnSeen: true },
+      }))
+    })
+
+    // Cloud is unconfigured and the hint isn't dismissed → the nudge shows.
+    const nudge = chatPanel.getByTestId('chat-cloud-nudge')
+    await expect(nudge).toBeVisible()
+    await expect(nudge).toContainText('may be slow for chat')
+
+    // Dismiss removes it and persists, so it stays gone after a reload.
+    await nudge.getByTestId('chat-cloud-nudge-dismiss').click()
+    await expect(chatPanel.getByTestId('chat-cloud-nudge')).toHaveCount(0)
+
+    const dismissed = await page.evaluate(() => (window as any).api.settings.get('ollama_slow_hint_dismissed'))
+    expect(dismissed).toBe('true')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('unified activity popover lists and jumps to a running agent session', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Activity Jump Project')
+
+    // Open Chat and mark a named session busy so it registers as a running task.
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-state', {
+        detail: {
+          model: 'e2e-chat-model',
+          session: { id: 'jump-session', project_id: 'test', mode: 'chat', title: 'Jump target chat', created_at: now },
+          messages: [
+            { id: 'jump-user', session_id: 'jump-session', role: 'user', content: 'Working on it.', model: null, created_at: now },
+          ],
+        },
+      }))
+      window.dispatchEvent(new CustomEvent('aiworkspace:test:set-chat-live-state', {
+        detail: { busy: true, streaming: '', thinking: '' },
+      }))
+    })
+    await expect(chatPanel.getByTestId('chat-waiting-note')).toBeVisible()
+    await expect(chatPanel.locator('.chat-header-title')).toContainText('Jump target chat')
+
+    // Navigate the visible Chat away to a different session (via the same
+    // selectSession path the app uses) while the task keeps running on
+    // jump-session — so "jump" has somewhere distinct to land.
+    await page.evaluate(() => {
+      const now = Date.now()
+      window.dispatchEvent(new CustomEvent('panel:selectSession', {
+        detail: { panel: 'chat', session: { id: 'other-session', project_id: 'test', mode: 'chat', title: 'Other chat', created_at: now } },
+      }))
+    })
+    await expect(chatPanel.locator('.chat-header-title')).toContainText('Other chat')
+
+    // The badge popover still lists the running task on jump-session; clicking
+    // it jumps the Chat panel back to that session (header title switches).
+    await page.getByTestId('topbar-activity-badge').click()
+    const popover = page.getByTestId('activity-popover')
+    await expect(popover).toBeVisible()
+    const row = popover.getByTestId('activity-pop-row').filter({ hasText: 'Jump target chat' })
+    await expect(row).toBeVisible()
+    await expect(popover.getByTestId('activity-pop-running')).toContainText('Running')
+    await row.click()
+    await expect(popover).toHaveCount(0)
+    await expect(chatPanel).toBeVisible()
+    await expect(chatPanel.locator('.chat-header-title')).toContainText('Jump target chat')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Editor panel supports multiple file tabs and tab bar controls', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    const projectParent = testInfo.outputPath('editor-tabs-projects')
+    await mkdir(projectParent, { recursive: true })
+    const project = await page.evaluate(async ({ parentDir }) => {
+      return await (window as any).api.projects.create('Editor Tabs Project', parentDir)
+    }, { parentDir: projectParent }) as { id: string; path: string }
+    await writeFile(path.join(project.path, 'alpha.ts'), 'export const alpha = 1\n')
+    await writeFile(path.join(project.path, 'beta.md'), '# Beta\n\nSecond open file.\n')
+    for (let i = 0; i < 8; i++) {
+      await writeFile(path.join(project.path, `extra-${i}.py`), `def extra_${i}():\n    return ${i}\n`)
+    }
+
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByRole('button', { name: /Editor Tabs Project/ }).click()
+    await expect(page.getByText('Editor Tabs Project').first()).toBeVisible()
+    await page.getByTestId('workspace-tool-navigator').click()
+
+    const navigatorPanel = page.getByTestId('workspace-panel-navigator')
+    await expect(navigatorPanel.getByTestId('navigator-project-files')).toBeVisible()
+    await navigatorPanel.getByRole('button', { name: /alpha\.ts/ }).click()
+
+    const editorPanel = page.getByTestId('workspace-panel-editor')
+    await expect(editorPanel).toBeVisible()
+    await expect(editorPanel.getByTestId('editor-tabbar')).toBeVisible()
+    await expect(editorPanel.getByTestId('editor-tab-alpha.ts')).toHaveAttribute('aria-selected', 'true')
+    await expect(editorPanel.locator('.editor-textarea')).toHaveValue('export const alpha = 1\n')
+
+    // Guards the explicit grammar registration in syntax.ts. An unregistered
+    // language is not a loud failure — Prism renders the text with no tokens at
+    // all — so assert that highlighting actually produced tokens rather than
+    // just that the file's text is present. Counted rather than checked for
+    // visibility: the layer sits behind a transparent textarea.
+    await expect
+      .poll(async () => editorPanel.getByTestId('editor-highlight-layer').locator('span.token').count())
+      .toBeGreaterThan(0)
+
+    await navigatorPanel.getByRole('button', { name: /beta\.md/ }).click()
+    await expect(editorPanel.getByTestId('editor-file-tab')).toHaveCount(2)
+    await expect(editorPanel.getByTestId('editor-tab-beta.md')).toHaveAttribute('aria-selected', 'true')
+    await expect(editorPanel.locator('.editor-textarea')).toHaveValue('# Beta\n\nSecond open file.\n')
+
+    await editorPanel.getByTestId('editor-tab-alpha.ts').click()
+    await expect(editorPanel.getByTestId('editor-tab-alpha.ts')).toHaveAttribute('aria-selected', 'true')
+    await editorPanel.locator('.editor-textarea').fill('export const alpha = 42\n')
+    await expect(editorPanel.locator('.editor-file-tab.dirty').filter({ hasText: 'alpha.ts' })).toBeVisible()
+    await expect(editorPanel).toContainText('Unsaved')
+
+    await editorPanel.getByTestId('editor-tab-beta.md').click()
+    await expect(editorPanel.locator('.editor-textarea')).toHaveValue('# Beta\n\nSecond open file.\n')
+    await expect(editorPanel.locator('.editor-file-tab.dirty').filter({ hasText: 'alpha.ts' })).toBeVisible()
+
+    await editorPanel.getByTestId('editor-tab-close-beta.md').click()
+    await expect(editorPanel.getByTestId('editor-file-tab')).toHaveCount(1)
+    await expect(editorPanel.getByTestId('editor-tab-alpha.ts')).toHaveAttribute('aria-selected', 'true')
+
+    await expect(editorPanel.getByTestId('editor-line-gutter')).toBeVisible()
+    await expect(editorPanel.getByTestId('editor-line-gutter').locator('span').first()).toHaveText('1')
+    await expect(editorPanel.getByTestId('editor-highlight-layer')).toBeVisible()
+    await expect.poll(() => editorPanel.locator('.editor-textarea').evaluate((el) => {
+      const styles = getComputedStyle(el)
+      return styles.webkitTextFillColor || styles.color
+    })).not.toContain('rgba(0, 0, 0, 0)')
+
+    for (let i = 0; i < 8; i++) {
+      await navigatorPanel.getByRole('button', { name: new RegExp(`extra-${i}\\.py`) }).click()
+    }
+    await expect(editorPanel.getByTestId('editor-tabs-overflow')).toBeVisible()
+    await expect(editorPanel.getByTestId('editor-tabs-overflow')).toContainText('More')
+    const tabOverflow = await editorPanel.getByTestId('editor-tabs').evaluate((el) => ({
+      clientWidth: el.clientWidth,
+      scrollWidth: el.scrollWidth,
+      overflowX: getComputedStyle(el).overflowX,
+    }))
+    expect(tabOverflow.overflowX).toBe('hidden')
+    expect(tabOverflow.scrollWidth).toBeLessThanOrEqual(tabOverflow.clientWidth + 2)
+
+    await editorPanel.getByTestId('editor-tabs-overflow').click()
+    await expect(editorPanel.getByTestId('editor-tabs-overflow-menu')).toBeVisible()
+    await editorPanel.getByTestId('editor-tabs-overflow-menu').getByText('extra-0.py').click()
+    await expect(editorPanel.locator('.editor-textarea')).toHaveValue('def extra_0():\n    return 0\n')
+    if (await editorPanel.getByTestId('editor-tab-alpha.ts').count() === 0) {
+      await editorPanel.getByTestId('editor-tabs-overflow').click()
+      await editorPanel.getByTestId('editor-tabs-overflow-menu').getByText('alpha.ts').click()
+    } else {
+      await editorPanel.getByTestId('editor-tab-alpha.ts').click()
+    }
+    await expect(editorPanel.locator('.editor-textarea')).toHaveValue('export const alpha = 42\n')
+
+    await editorPanel.getByTestId('editor-tabbar-collapse').click()
+    await expect(editorPanel.getByTestId('editor-tabbar-collapsed')).toBeVisible()
+    await expect(editorPanel.getByTestId('editor-tabbar-collapsed')).toContainText('9 open, 1 unsaved')
+    await editorPanel.getByTestId('editor-tabbar-expand').click()
+    await expect(editorPanel.getByTestId('editor-tabbar')).toBeVisible()
+
+    await page.waitForTimeout(350)
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByRole('button', { name: /Editor Tabs Project/ }).click()
+    await expect(page.getByText('Editor Tabs Project').first()).toBeVisible()
+    await page.getByTestId('workspace-tool-editor').click()
+    const restoredEditorPanel = page.getByTestId('workspace-panel-editor')
+    await expect(restoredEditorPanel).toBeVisible()
+    await expect(restoredEditorPanel.getByTestId('editor-tab-alpha.ts')).toHaveAttribute('aria-selected', 'true')
+    await expect(restoredEditorPanel.locator('.editor-textarea')).toHaveValue('export const alpha = 42\n')
+    await expect(restoredEditorPanel.getByTestId('editor-tabs-overflow')).toBeVisible()
+
+    const confirmMessage = await page.evaluate(() => {
+      const originalConfirm = window.confirm
+      let message = ''
+      window.confirm = (text?: string) => {
+        message = String(text ?? '')
+        window.confirm = originalConfirm
+        return false
+      }
+      document.querySelector<HTMLButtonElement>('[data-testid="editor-tab-close-alpha.ts"]')?.click()
+      return message
+    })
+    expect(confirmMessage).toContain('unsaved changes')
+    await expect(restoredEditorPanel.getByTestId('editor-tab-alpha.ts')).toHaveAttribute('aria-selected', 'true')
+
+    await restoredEditorPanel.getByTitle('Save (Ctrl+S)').click()
+    await expect(restoredEditorPanel.locator('.editor-file-tab.dirty')).toHaveCount(0)
+    await expect.poll(async () => readFile(path.join(project.path, 'alpha.ts'), 'utf8')).toBe('export const alpha = 42\n')
+
+    for (const theme of ['dark', 'light'] as const) {
+      await page.evaluate((nextTheme) => {
+        if (nextTheme === 'dark') document.documentElement.dataset.theme = 'dark'
+        else document.documentElement.removeAttribute('data-theme')
+      }, theme)
+      const colors = await restoredEditorPanel.getByTestId('editor-tab-alpha.ts').evaluate((el) => {
+        const tab = el.closest('.editor-file-tab') as HTMLElement
+        const layer = document.querySelector('[data-testid="editor-highlight-layer"]') as HTMLElement
+        const styles = getComputedStyle(tab)
+        const layerStyles = getComputedStyle(layer)
+        return { bg: styles.backgroundColor, fg: styles.color, layerBg: layerStyles.backgroundColor, layerFg: layerStyles.color }
+      })
+      expect(colors.bg).not.toBe(colors.fg)
+      expect(colors.layerBg).not.toBe(colors.layerFg)
+    }
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
 test('execute-mode handoff sends a generated prompt to Codex', async ({}, testInfo) => {
   const electronApp = await launchSmokeApp(testInfo, {
     E2E_FAKE_OLLAMA: '1',
@@ -499,6 +893,453 @@ test('Claude Code creates checkpoints and can roll back fake file changes', asyn
   }
 })
 
+test('Claude Code model picker lists catalog models, persists selection, and sends --model/--effort', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CLAUDE_CODE: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Claude Model Picker Project')
+
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await expect(claudePanel).toBeVisible()
+    await expect(page.getByTestId('claude-code-send')).toBeEnabled()
+
+    // Picker opens with the deterministic fake catalog: small-caps "Models"
+    // title, numbered main rows, badge chip, checkmark on the selected row.
+    // Older (extra) models live under the "More models ›" submenu.
+    await page.getByTestId('claude-code-model').click()
+    await expect(page.getByTestId('claude-code-model-list')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-list')).toContainText('Models')
+    await expect(page.getByTestId('claude-code-model-option-default')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-fable')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-sonnet')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-opus')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-legacy')).toHaveCount(0)
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-fable')).toContainText('Included until July 19')
+    await expect(page.getByTestId('claude-code-model-option-default').locator('.model-picker-option-index')).toHaveText('1')
+    await expect(page.getByTestId('claude-code-model-option-default').locator('.model-picker-option-check')).toBeVisible()
+    await expect(page.getByTestId('claude-code-effort-pill')).toBeVisible()
+
+    // Number-key jump select: 3 → Fake Sonnet (1=Default, 2=Fable, 3=Sonnet).
+    await page.getByTestId('claude-code-model').press('3')
+    await expect(page.getByTestId('claude-code-model-list')).toHaveCount(0)
+    await expect(page.getByTestId('claude-code-model')).toContainText('Fake Sonnet')
+    expect(await page.evaluate(() => localStorage.getItem('claude-code-preferred-model'))).toBe('claude-fake-sonnet')
+
+    // Effort pill opens the Faster/Smarter slider; click a stop, then arrow
+    // left one stop.
+    await expect(page.getByTestId('claude-code-effort-pill')).toContainText('Default')
+    await page.getByTestId('claude-code-effort-pill').click()
+    await expect(page.getByTestId('claude-code-effort-list')).toBeVisible()
+    await expect(page.getByTestId('claude-code-effort-list')).toContainText('Effort Default')
+    await expect(page.getByTestId('claude-code-effort-list')).toContainText('Faster')
+    await expect(page.getByTestId('claude-code-effort-list')).toContainText('Smarter')
+    await page.getByTestId('claude-code-effort-stop-high').click()
+    await expect(page.getByTestId('claude-code-effort-stop-high')).toHaveClass(/active/)
+    await page.getByTestId('claude-code-effort-slider').press('ArrowLeft')
+    await expect(page.getByTestId('claude-code-effort-stop-medium')).toHaveClass(/active/)
+    await expect(page.getByTestId('claude-code-effort-pill')).toContainText('Medium')
+    expect(await page.evaluate(() => localStorage.getItem('claude-code-preferred-effort'))).toBe('medium')
+    await page.getByTestId('claude-code-effort-slider').press('Escape')
+    await expect(page.getByTestId('claude-code-effort-list')).toHaveCount(0)
+
+    // Run — the fake CLI echoes what it received.
+    await page.getByTestId('claude-code-composer').fill('Say hi with the fake model')
+    await page.getByTestId('claude-code-send').click()
+    await expect(claudePanel).toContainText('Fake Claude Code completed: Say hi with the fake model')
+    await expect(claudePanel).toContainText('model=claude-fake-sonnet effort=medium')
+
+    // The context meter picked up the run's real usage event.
+    await expect(page.getByTestId('context-meter-claude-code')).toHaveText('27%')
+    await page.getByTestId('context-meter-claude-code').click()
+    await expect(page.getByTestId('context-meter-claude-code-popover')).toContainText('Context window')
+    await expect(page.getByTestId('context-meter-claude-code-popover')).toContainText('54.2k / 200.0k (27%)')
+    await page.getByTestId('context-meter-claude-code').click()
+
+    // "More models ›" submenu: older models + a custom-id input row.
+    await page.getByTestId('claude-code-model').click()
+    await page.getByTestId('claude-code-model-more').click()
+    await expect(page.getByTestId('claude-code-model-back')).toBeVisible()
+    await expect(page.getByTestId('claude-code-model-option-claude-fake-legacy')).toBeVisible()
+    await page.getByTestId('claude-code-model-custom').click()
+    await page.getByTestId('claude-code-model-custom-input').fill('my-claude-model')
+    await page.getByTestId('claude-code-model-custom-input').press('Enter')
+    await expect(page.getByTestId('claude-code-model')).toContainText('my-claude-model')
+    expect(await page.evaluate(() => localStorage.getItem('claude-code-preferred-model'))).toBe('my-claude-model')
+
+    // Selection + effort survive a reload (custom id renders as its own label).
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByRole('button', { name: /Claude Model Picker Project/ }).click()
+    await page.getByTestId('workspace-tool-claudecode').click()
+    await expect(page.getByTestId('claude-code-model')).toContainText('my-claude-model')
+    await expect(page.getByTestId('claude-code-effort-pill')).toContainText('Medium')
+    await page.getByTestId('claude-code-effort-pill').click()
+    await expect(page.getByTestId('claude-code-effort-stop-medium')).toHaveClass(/active/)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Claude Code autonomy control drives permission mode, gates Full access, and persists Thinking', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CLAUDE_CODE: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    const project = await createAndSelectProject(page, testInfo, 'Claude Autonomy Project')
+
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await expect(claudePanel).toBeVisible()
+    await expect(page.getByTestId('claude-code-send')).toBeEnabled()
+
+    // The autonomy control defaults to Accept edits (preserves prior behavior).
+    await expect(page.getByTestId('claude-code-permission-acceptEdits')).toHaveClass(/active/)
+
+    // Plan mode is read-only: the fake CLI (mirroring the real binary) makes no
+    // file edit and echoes permissionMode=plan.
+    await page.getByTestId('claude-code-permission-plan').click()
+    await expect(page.getByTestId('claude-code-permission-plan')).toHaveClass(/active/)
+    await page.getByTestId('claude-code-composer').fill('map out an approach')
+    await page.getByTestId('claude-code-send').click()
+    await expect(claudePanel).toContainText('Fake Claude Code plan (read-only) for: map out an approach')
+    await expect(claudePanel).toContainText('permissionMode=plan')
+    expect(await pathExists(path.join(project.path, 'e2e-claude-output.txt'))).toBe(false)
+
+    // Full access (bypassPermissions) is gated behind a confirm dialog.
+    await page.getByTestId('claude-code-permission-bypassPermissions').click()
+    await expect(page.getByTestId('claude-code-danger-enable')).toBeVisible()
+    await page.getByTestId('claude-code-danger-cancel').click()
+    // Cancelling leaves the mode unchanged (still Plan from above).
+    await expect(page.getByTestId('claude-code-permission-plan')).toHaveClass(/active/)
+    await page.getByTestId('claude-code-permission-bypassPermissions').click()
+    await page.getByTestId('claude-code-danger-enable').click()
+    await expect(page.getByTestId('claude-code-permission-bypassPermissions')).toHaveClass(/active/)
+    expect(await page.evaluate(() => localStorage.getItem('claude-code-permission-mode'))).toBe('bypassPermissions')
+
+    // Thinking toggle now persists (previously it reset each session).
+    await expect(page.getByTestId('context-bar-claude-code')).toContainText('Full access')
+    const thinkingBtn = claudePanel.locator('.composer-text-toggle')
+    await thinkingBtn.click()
+    await expect(thinkingBtn).toHaveClass(/on/)
+    expect(await page.evaluate(() => localStorage.getItem('claude-code-thinking'))).toBe('true')
+
+    // Permission mode + Thinking survive a reload.
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-navigator').click()
+    await page.getByRole('button', { name: /Claude Autonomy Project/ }).click()
+    await page.getByTestId('workspace-tool-claudecode').click()
+    await expect(page.getByTestId('claude-code-permission-bypassPermissions')).toHaveClass(/active/)
+    await expect(claudePanel.locator('.composer-text-toggle')).toHaveClass(/on/)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Codex model picker lists catalog with per-model efforts and sends model/effort overrides', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CODEX: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Codex Model Picker Project')
+
+    await page.locator('.topbar-group-btn').filter({ hasText: /^AI/ }).click()
+    await page.locator('.topbar-dropdown-item').filter({ hasText: 'Codex' }).click()
+    const codexPanel = page.getByTestId('workspace-panel-codex')
+    await expect(codexPanel).toBeVisible()
+    await expect(page.getByTestId('codex-model')).toBeVisible()
+
+    // Fresh profile: the legacy default 'gpt-5.5' is not in the fake catalog,
+    // so the combined pill shows just the model and the popover has no
+    // effort/speed rows (no dead UI).
+    await expect(page.getByTestId('codex-model')).toContainText('gpt-5.5')
+    await page.getByTestId('codex-model').click()
+    await expect(page.getByTestId('codex-model-list')).toBeVisible()
+    await expect(page.getByTestId('codex-model-row-model')).toBeVisible()
+    await expect(page.getByTestId('codex-model-row-effort')).toHaveCount(0)
+    await expect(page.getByTestId('codex-model-row-speed')).toHaveCount(0)
+
+    // Models submenu: back row, badge chip, appended unknown row, Custom… row.
+    await page.getByTestId('codex-model-row-model').click()
+    await expect(page.getByTestId('codex-model-back')).toBeVisible()
+    await expect(page.getByTestId('codex-model-option-gpt-fake-pro')).toBeVisible()
+    await expect(page.getByTestId('codex-model-option-gpt-fake-mini')).toBeVisible()
+    await expect(page.getByTestId('codex-model-option-gpt-fake-pro')).toContainText('Fast tier available')
+    await expect(page.getByTestId('codex-model-option-gpt-5-5')).toBeVisible()
+    await expect(page.getByTestId('codex-model-option--custom-')).toBeVisible()
+
+    // Select the fake frontier model — effort resets to its catalog default.
+    await page.getByTestId('codex-model-option-gpt-fake-pro').click()
+    await expect(page.getByTestId('codex-model')).toContainText('GPT-Fake-Pro · Low')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-model'))).toBe('gpt-fake-pro')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-effort'))).toBe('low')
+
+    // Effort + speed rows appear for the fast-tier catalog model.
+    await page.getByTestId('codex-model').click()
+    await expect(page.getByTestId('codex-model-row-effort')).toBeVisible()
+    await expect(page.getByTestId('codex-model-row-effort')).toContainText('Low')
+    await expect(page.getByTestId('codex-model-row-speed')).toBeVisible()
+    await expect(page.getByTestId('codex-model-row-speed')).toContainText('Standard')
+
+    // Effort submenu lists the model's real levels.
+    await page.getByTestId('codex-model-row-effort').click()
+    await expect(page.getByTestId('codex-model-effort-low')).toBeVisible()
+    await expect(page.getByTestId('codex-model-effort-low').locator('.model-picker-option-check')).toBeVisible()
+    await page.getByTestId('codex-model-effort-high').click()
+    await expect(page.getByTestId('codex-model')).toContainText('GPT-Fake-Pro · High')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-effort'))).toBe('high')
+
+    // Speed submenu: the Fast row carries the real service-tier description.
+    await page.getByTestId('codex-model').click()
+    await page.getByTestId('codex-model-row-speed').click()
+    await expect(page.getByTestId('codex-model-speed-standard')).toBeVisible()
+    await expect(page.getByTestId('codex-model-speed-priority')).toBeVisible()
+    await expect(page.getByTestId('codex-model-speed-priority')).toContainText('1.5x speed, increased usage')
+    await page.getByTestId('codex-model-speed-priority').click()
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-speed'))).toBe('priority')
+
+    // Switching models resets effort AND speed to that model's defaults, and
+    // the speed row disappears for a model without a fast tier.
+    await page.getByTestId('codex-model').click()
+    await page.getByTestId('codex-model-row-model').click()
+    await page.getByTestId('codex-model-option-gpt-fake-mini').click()
+    await expect(page.getByTestId('codex-model')).toContainText('GPT-Fake-Mini · Medium')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-effort'))).toBe('medium')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-speed'))).toBe('standard')
+    await page.getByTestId('codex-model').click()
+    await expect(page.getByTestId('codex-model-row-effort')).toBeVisible()
+    await expect(page.getByTestId('codex-model-row-speed')).toHaveCount(0)
+    await page.getByTestId('codex-model').click()
+
+    // The fake CLI echoes the model/effort/speed overrides it received.
+    await page.getByTestId('codex-composer').fill('Build a hello file')
+    await page.getByTestId('codex-send').click()
+    await expect(codexPanel).toContainText('model=gpt-fake-mini effort=medium speed=standard')
+
+    // The context meter shows the run's usage plus the plan rate-limit windows.
+    await expect(page.getByTestId('context-meter-codex')).toHaveText('66%')
+    await page.getByTestId('context-meter-codex').click()
+    await expect(page.getByTestId('context-meter-codex-popover')).toContainText('169.8k / 258.4k (66%)')
+    await expect(page.getByTestId('context-meter-codex-popover')).toContainText('Plan usage limits · Plus')
+    await expect(page.getByTestId('context-meter-codex-plan-secondary')).toContainText('5-hour limit')
+    await expect(page.getByTestId('context-meter-codex-plan-secondary')).toContainText('Resets in 10 min')
+    await expect(page.getByTestId('context-meter-codex-plan-secondary')).toContainText('99%')
+    await expect(page.getByTestId('context-meter-codex-plan-primary')).toContainText('Weekly')
+    await expect(page.getByTestId('context-meter-codex-plan-primary')).toContainText('18%')
+    await page.getByTestId('context-meter-codex').click()
+
+    // Custom model flow: the Custom… row in the models submenu swaps to the
+    // free-text input.
+    await page.getByTestId('codex-model').click()
+    await page.getByTestId('codex-model-row-model').click()
+    await page.getByTestId('codex-model-option--custom-').click()
+    await page.getByTestId('codex-model-custom-input').fill('my-custom-model')
+    await page.getByTestId('codex-model-custom-input').press('Enter')
+    await expect(page.getByTestId('codex-model')).toContainText('my-custom-model')
+    expect(await page.evaluate(() => localStorage.getItem('codex-preferred-model'))).toBe('my-custom-model')
+
+    // Recently used custom models appear as options on reopen.
+    await page.getByTestId('codex-model').click()
+    await page.getByTestId('codex-model-row-model').click()
+    await expect(page.getByTestId('codex-model-option-my-custom-model')).toBeVisible()
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Kimi tab opens, connects (fake ACP), and approves a fake permission request', async ({}, testInfo) => {
+  // Kimi is not installed in this environment and the real `kimi` binary
+  // cannot be authenticated or executed by an automated agent (no remote
+  // installer execution, no interactive OAuth). This test exercises the fake
+  // ACP round-trip (E2E_FAKE_KIMI) end to end: tab open, connect, permission
+  // request reaching the shared approval card, and approve/deny — the same
+  // level of coverage the Hermes fake-session test above provides.
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_KIMI: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Kimi Permission Project')
+    await page.getByTestId('workspace-tool-kimi').click()
+    const kimiPanel = page.getByTestId('workspace-panel-kimi')
+    await expect(kimiPanel).toBeVisible()
+    await expect(page.getByTestId('kimi-composer')).toBeVisible({ timeout: 10_000 })
+    await page.getByTestId('kimi-permission-mode').selectOption('1')
+    await expect(page.getByTestId('kimi-permission-mode')).toHaveValue('1')
+
+    await page.getByTestId('kimi-composer').fill('deny this permission request')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-card')).toContainText('Run command `npm test`')
+    await expect(page.getByTestId('kimi-permission-deny')).toBeVisible()
+    await expect(page.getByTestId('kimi-permission-allow-once')).toBeVisible()
+    await expect(page.getByTestId('kimi-permission-allow-session')).toBeVisible()
+    await page.getByTestId('kimi-permission-deny').click()
+    await expect(page.getByTestId('kimi-permission-card')).toHaveCount(0)
+    await expect(kimiPanel).toContainText('Fake Kimi permission denied')
+
+    await page.getByTestId('kimi-composer').fill('allow this permission once')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-card')).toBeVisible()
+    await page.getByTestId('kimi-permission-allow-once').click()
+    await expect(page.getByTestId('kimi-permission-card')).toHaveCount(0)
+    await expect(kimiPanel).toContainText('Fake Kimi approved and completed: allow this permission once')
+    await expect(page.getByTestId('kimi-send')).toBeEnabled()
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Kimi model picker lists catalog models and passes the selection to ACP', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_KIMI: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Kimi Model Picker Project')
+    await page.getByTestId('workspace-tool-kimi').click()
+    const kimiPanel = page.getByTestId('workspace-panel-kimi')
+    await expect(kimiPanel).toBeVisible()
+    await expect(page.getByTestId('kimi-composer')).toBeVisible({ timeout: 10_000 })
+
+    // Picker opens with the deterministic fake catalog; ids containing '/'
+    // are sanitized in testids. Kimi rows are flat label + description with a
+    // right checkmark — no number chips (reference UI), no effort control
+    // (ACP does not expose effort).
+    await expect(page.getByTestId('kimi-model')).toBeVisible()
+    await page.getByTestId('kimi-model').click()
+    await expect(page.getByTestId('kimi-model-list')).toBeVisible()
+    await expect(page.getByTestId('kimi-model-option-kimi-fake-coding')).toBeVisible()
+    await expect(page.getByTestId('kimi-model-option-kimi-fake-coding-highspeed')).toBeVisible()
+    await expect(page.getByTestId('kimi-model-option-kimi-fake-k3')).toBeVisible()
+    await expect(page.getByTestId('kimi-model-option-kimi-fake-coding')).toContainText('Default coding model')
+    await expect(page.getByTestId('kimi-model-option-kimi-fake-coding-highspeed')).toContainText('Highspeed variant')
+    await expect(page.getByTestId('kimi-model-list').locator('.model-picker-option-index')).toHaveCount(0)
+    // Config-select rows (thinking effort etc.) come only from real ACP
+    // session data, so before the first run there are none.
+    await expect(page.getByTestId('kimi-model-config-thinking-effort')).toHaveCount(0)
+    // Permission-mode select stays untouched next to the picker.
+    await expect(page.getByTestId('kimi-permission-mode')).toBeVisible()
+
+    await page.getByTestId('kimi-model-option-kimi-fake-k3').click()
+    await expect(page.getByTestId('kimi-model')).toContainText('Fake K3')
+    expect(await page.evaluate(() => localStorage.getItem('kimi-preferred-model'))).toBe('kimi-fake/k3')
+
+    // Send — the fake ACP run echoes the model it was asked to use.
+    await page.getByTestId('kimi-composer').fill('allow this permission once')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-allow-once')).toBeVisible()
+    await page.getByTestId('kimi-permission-allow-once').click()
+    await expect(kimiPanel).toContainText('Fake Kimi approved and completed: allow this permission once')
+    await expect(kimiPanel).toContainText('model=kimi-fake/k3')
+
+    // The context meter shows the run's usage against the catalog context size.
+    await expect(page.getByTestId('context-meter-kimi')).toHaveText('12%')
+    await page.getByTestId('context-meter-kimi').click()
+    await expect(page.getByTestId('context-meter-kimi-popover')).toContainText('32.0k / 262.1k (12%)')
+    await page.getByTestId('context-meter-kimi').click()
+
+    // The run reported the session's ACP config selects — the picker now
+    // shows them as drill-in rows (reference UI: Thinking effort ›, then a
+    // submenu with a back row and a checkmark on the current value).
+    await page.getByTestId('kimi-model').click()
+    await expect(page.getByTestId('kimi-model-config-thinking-effort')).toContainText('Thinking effort')
+    await expect(page.getByTestId('kimi-model-config-thinking-effort')).toContainText('Max')
+    await expect(page.getByTestId('kimi-model-config-conversation-capacity')).toContainText('Conversation capacity')
+    await expect(page.getByTestId('kimi-model-config-conversation-capacity')).toContainText('Standard')
+    await page.getByTestId('kimi-model-config-thinking-effort').click()
+    await expect(page.getByTestId('kimi-model-back')).toBeVisible()
+    await expect(page.getByTestId('kimi-model-config-thinking-effort-option-max').locator('.model-picker-option-check')).toBeVisible()
+    await page.getByTestId('kimi-model-config-thinking-effort-option-medium').click()
+    await expect(page.getByTestId('kimi-model-list')).toHaveCount(0)
+    expect(await page.evaluate(() => localStorage.getItem('kimi-config-values'))).toContain('"thinking_effort":"medium"')
+
+    // The chosen value rides the next send (fake echoes applied config).
+    await page.getByTestId('kimi-composer').fill('run with medium effort')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-allow-once')).toBeVisible()
+    await page.getByTestId('kimi-permission-allow-once').click()
+    await expect(kimiPanel).toContainText('thinking_effort=medium')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Kimi Plan mode drives native read-only planning and Compact frees context', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_KIMI: '1',
+    E2E_FAKE_OLLAMA: '1'
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+    await createAndSelectProject(page, testInfo, 'Kimi Plan Mode Project')
+    await page.getByTestId('workspace-tool-kimi').click()
+    const kimiPanel = page.getByTestId('workspace-panel-kimi')
+    await expect(kimiPanel).toBeVisible()
+    await expect(page.getByTestId('kimi-composer')).toBeVisible({ timeout: 10_000 })
+
+    // The permission control offers Plan (native read-only) plus the five
+    // autonomy tiers. It defaults to a tier, not Plan.
+    const permission = page.getByTestId('kimi-permission-mode')
+    await expect(permission).not.toHaveValue('plan')
+
+    // Selecting Plan drives Kimi's native ACP mode: the fake ACP run does
+    // read-only planning with NO blocking permission request (matches the real
+    // binary, where only ExitPlanMode is ever surfaced).
+    await permission.selectOption('plan')
+    await expect(permission).toHaveValue('plan')
+    await expect(page.getByTestId('kimi-mode-control')).toHaveClass(/plan-active/)
+
+    await page.getByTestId('kimi-composer').fill('add a caching layer')
+    await page.getByTestId('kimi-send').click()
+    await expect(kimiPanel).toContainText('Fake Kimi plan (read-only): add a caching layer')
+    await expect(kimiPanel).toContainText('nativeMode=plan')
+    // Read-only: no permission prompt was raised.
+    await expect(page.getByTestId('kimi-permission-allow-once')).toHaveCount(0)
+
+    // Compact runs the real /compact command (honored as a prompt by the ACP
+    // server) to free context. It's available once connected.
+    const compact = page.getByTestId('kimi-compact')
+    await expect(compact).toBeVisible()
+    await compact.click()
+    await expect(kimiPanel).toContainText('Compaction completed')
+
+    // Switching to a tier turns Plan off and restores the approval flow.
+    await permission.selectOption('3')
+    await expect(permission).toHaveValue('3')
+    await expect(page.getByTestId('kimi-mode-control')).not.toHaveClass(/plan-active/)
+    await page.getByTestId('kimi-composer').fill('now actually build it')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-allow-once')).toBeVisible()
+    await page.getByTestId('kimi-permission-allow-once').click()
+    await expect(kimiPanel).toContainText('Fake Kimi approved and completed: now actually build it')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
 test('Hermes ask mode renders permission approvals for deny, allow once, and allow for session', async ({}, testInfo) => {
   const electronApp = await launchSmokeApp(testInfo, {
     E2E_FAKE_HERMES: '1',
@@ -531,6 +1372,10 @@ test('Hermes ask mode renders permission approvals for deny, allow once, and all
     await page.getByTestId('hermes-permission-allow-once').click()
     await expect(page.getByTestId('hermes-permission-card')).toHaveCount(0)
     await expect(hermesPanel).toContainText('Fake Hermes approved and completed: allow this permission once')
+    // The completion text can appear in the live segment just before the final
+    // persisted message list replaces it. Wait for the run to settle so the
+    // expandable card is not unmounted between click and assertion.
+    await expect(page.getByTestId('hermes-send')).toBeEnabled()
     const firstTool = hermesPanel.getByTestId('hermes-tool-summary').filter({ hasText: 'npm test' }).first()
     await expect(firstTool).toBeVisible()
     await firstTool.click()
@@ -730,11 +1575,12 @@ test('dark mode menus and topbar hover stay readable and calm', async ({}, testI
     await page.getByTestId('open-settings').click()
     await expect(page.locator('.settings-shell')).toBeVisible()
     await page.getByRole('button', { name: 'Appearance' }).click()
+    await page.locator('.settings-control .card-select-trigger').first().click()
     const selectStyles = await page.evaluate(() => {
-      const select = document.querySelector('.settings-control select')
-      const option = select?.querySelector('option')
-      if (!select || !option) throw new Error('Missing settings select')
-      const selectComputed = getComputedStyle(select)
+      const trigger = document.querySelector('.settings-control .card-select-trigger')
+      const option = document.querySelector('.settings-control .card-select-option')
+      if (!trigger || !option) throw new Error('Missing settings card select')
+      const selectComputed = getComputedStyle(trigger)
       const optionComputed = getComputedStyle(option)
       return {
         selectBackground: selectComputed.backgroundColor,
@@ -1428,20 +2274,34 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('knowledge-detail')).toContainText('extractor')
     await expect(page.getByTestId('knowledge-detail-content')).toContainText('Full detail inspection text only appears after opening the knowledge item.')
     await expect(page.locator('.memory-edit')).toHaveCount(0)
-    const detailOffset = await page.getByTestId('knowledge-detail').evaluate((el) => {
+    const detailPlacement = await page.getByTestId('knowledge-detail').evaluate((el) => {
       const rect = el.getBoundingClientRect()
+      const scrollRegion = el.parentElement
+      if (!scrollRegion) throw new Error('Knowledge detail is missing its scroll region')
+      const scrollRect = scrollRegion.getBoundingClientRect()
       return {
-        x: Math.abs(rect.left + rect.width / 2 - window.innerWidth / 2),
-        y: Math.abs(rect.top + rect.height / 2 - window.innerHeight / 2)
+        position: window.getComputedStyle(el).position,
+        parentTestId: scrollRegion.getAttribute('data-testid'),
+        scrollTop: scrollRegion.scrollTop,
+        insideHorizontally: rect.left >= scrollRect.left && rect.right <= scrollRect.right,
+        hasBackdrop: document.querySelector('.knowledge-detail-backdrop') !== null
       }
     })
-    expect(detailOffset.x).toBeLessThanOrEqual(12)
-    expect(detailOffset.y).toBeLessThanOrEqual(12)
+    expect(detailPlacement.position).toBe('sticky')
+    expect(detailPlacement.parentTestId).toBe('knowledge-list-scroll')
+    expect(detailPlacement.scrollTop).toBe(0)
+    expect(detailPlacement.insideHorizontally).toBe(true)
+    expect(detailPlacement.hasBackdrop).toBe(false)
+    await expect.poll(() => page.getByTestId('knowledge-detail').evaluate((el) => {
+      const scrollRegion = el.parentElement
+      if (!scrollRegion) throw new Error('Knowledge detail is missing its scroll region')
+      return Math.abs(el.getBoundingClientRect().top - scrollRegion.getBoundingClientRect().top)
+    })).toBeLessThanOrEqual(2)
     await expect(page.getByTestId('knowledge-detail-copy')).toBeVisible()
     await page.getByTestId('knowledge-detail-edit').click()
-    await page.getByTestId('knowledge-detail-editor').fill(`${extractedSmokeContent}\nEdited inside the detail window only.`)
+    await page.getByTestId('knowledge-detail-editor').fill(`${extractedSmokeContent}\nEdited inside the inline detail card only.`)
     await page.getByTestId('knowledge-detail-save-edit').click()
-    await expect(page.getByTestId('knowledge-detail-content')).toContainText('Edited inside the detail window only.')
+    await expect(page.getByTestId('knowledge-detail-content')).toContainText('Edited inside the inline detail card only.')
     await expect(page.getByTestId('knowledge-detail')).toContainText('Uses')
     await page.getByTestId('knowledge-detail-stale').click()
     await expect(page.getByTestId('knowledge-detail')).toContainText('Stale since')
@@ -1449,9 +2309,20 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(page.getByTestId('knowledge-detail')).toHaveCount(0)
     await page.getByTestId('knowledge-review-low-quality').click()
     await expect(page.getByText(thinCandidateTitle)).toBeVisible()
-    await page.evaluate(() => { window.confirm = () => true })
+    // Bulk delete uses an in-app typed-phrase modal (window.prompt doesn't
+    // exist in Electron): confirm stays disabled until the phrase matches.
+    await page.getByTestId('knowledge-delete-low-quality').click()
+    await expect(page.getByTestId('knowledge-bulk-delete-modal')).toBeVisible()
+    await expect(page.getByTestId('knowledge-bulk-delete-confirm')).toBeDisabled()
+    await page.getByTestId('knowledge-bulk-delete-input').fill('wrong phrase')
+    await expect(page.getByTestId('knowledge-bulk-delete-confirm')).toBeDisabled()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('knowledge-bulk-delete-modal')).toHaveCount(0)
     await page.getByTestId('knowledge-item').filter({ hasText: thinCandidateTitle }).click()
     await expect(page.getByTestId('knowledge-quality-note')).toContainText('thin-content')
+    // Two-step destructive confirm: first click arms the button, second deletes.
+    await page.getByTestId('knowledge-detail-delete').click()
+    await expect(page.getByTestId('knowledge-detail-delete')).toContainText('Click again to confirm')
     await page.getByTestId('knowledge-detail-delete').click()
     await expect(page.getByText(thinCandidateTitle)).toHaveCount(0)
     await page.getByTestId('workspace-panel-close-knowledge').click()
@@ -1837,7 +2708,12 @@ test('global workspace UI smoke path', async ({}, testInfo) => {
     await expect(claudePanel.locator('.empty-state-heading')).toBeVisible()
     await expect(page.getByTestId('claude-code-composer')).toBeVisible()
     await expect(page.getByTestId('claude-code-send')).toBeVisible()
+    // Effort lives inside the model picker dropdown now (legacy testid kept).
+    await page.getByTestId('claude-code-model').click()
+    await expect(page.getByTestId('claude-code-model-list')).toBeVisible()
     await expect(page.getByTestId('claude-code-effort-pill')).toBeVisible()
+    await page.getByTestId('claude-code-model').click()
+    await expect(page.getByTestId('claude-code-model-list')).toHaveCount(0)
     await page.getByTestId('workspace-panel-close-claudecode').click()
 
     await page.getByTestId('workspace-tool-hermes').click()
@@ -2203,6 +3079,38 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     await expect(page.getByTestId('settings-section-web')).toContainText('disabled by default')
     await expect(page.getByTestId('settings-section-web')).toContainText('does not expose Terminal')
 
+    // --- Number settings use the custom stepper and stay anchored while saving ---
+    await page.getByTestId('settings-nav-editor').click()
+    await expect(page.getByTestId('settings-section-editor')).toBeVisible()
+    const fontSizeStepper = page.getByTestId('settings-number-editor_font_size')
+    await expect(fontSizeStepper.getByTestId('settings-number-editor_font_size-value')).toHaveText('13')
+    const beforeStepBox = await fontSizeStepper.boundingBox()
+    if (!beforeStepBox) throw new Error('Missing editor font size stepper geometry')
+    await fontSizeStepper.getByTestId('settings-number-editor_font_size-increment').click()
+    await expect(fontSizeStepper.getByTestId('settings-number-editor_font_size-value')).toHaveText('14')
+    const afterClickStepBox = await fontSizeStepper.boundingBox()
+    if (!afterClickStepBox) throw new Error('Missing clicked editor font size stepper geometry')
+    expect(Math.abs(afterClickStepBox.x - beforeStepBox.x)).toBeLessThanOrEqual(1)
+    expect(Math.abs(afterClickStepBox.x + afterClickStepBox.width - (beforeStepBox.x + beforeStepBox.width))).toBeLessThanOrEqual(1)
+    await page.evaluate(() => {
+      const stepper = document.querySelector('[data-testid="settings-number-editor_font_size"]')
+      const control = stepper?.parentElement
+      if (!stepper || !control) throw new Error('Missing editor font size stepper for layout probe')
+      const saving = document.createElement('span')
+      saving.className = 'settings-saving'
+      saving.dataset.testid = 'settings-saving-layout-probe'
+      saving.textContent = 'Saving...'
+      control.insertBefore(saving, stepper)
+    })
+    await expect(page.getByTestId('settings-saving-layout-probe')).toBeVisible()
+    const savingStepBox = await fontSizeStepper.boundingBox()
+    if (!savingStepBox) throw new Error('Missing saving editor font size stepper geometry')
+    expect(Math.abs(savingStepBox.x - afterClickStepBox.x)).toBeLessThanOrEqual(1)
+    expect(Math.abs(savingStepBox.x + savingStepBox.width - (afterClickStepBox.x + afterClickStepBox.width))).toBeLessThanOrEqual(1)
+    await fontSizeStepper.getByTestId('settings-number-editor_font_size-value').focus()
+    await page.keyboard.press('ArrowDown')
+    await expect(fontSizeStepper.getByTestId('settings-number-editor_font_size-value')).toHaveText('13')
+
     // --- Shortcuts editor records custom keys ---
     await page.getByTestId('settings-nav-shortcuts').click()
     await expect(page.getByTestId('shortcuts-editor')).toBeVisible()
@@ -2221,19 +3129,39 @@ test('settings control center opens, navigates, searches, saves, and reports dia
     await page.getByTestId('settings-nav-appearance').click()
     await expect(page.getByTestId('settings-section-appearance')).toBeVisible()
 
+    // Theme uses the custom card list and applies immediately.
+    await page.getByTestId('settings-select-ui_theme').click()
+    await page.getByTestId('settings-select-ui_theme-option-light').click()
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe('light')
+    await page.getByTestId('settings-select-ui_theme').click()
+    await expect(page.getByTestId('settings-select-ui_theme-list')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('settings-select-ui_theme-list')).toBeHidden()
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe('light')
+    await page.getByTestId('settings-select-ui_theme').click()
+    await expect(page.getByTestId('settings-select-ui_theme-list')).toBeVisible()
+    await page.getByTestId('settings-search').click()
+    await expect(page.getByTestId('settings-select-ui_theme-list')).toBeHidden()
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe('light')
+    await page.getByTestId('settings-select-ui_theme').click()
+    await page.getByTestId('settings-select-ui_theme-option-dark').click()
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe('dark')
+
     // Motion mode is fully wired and updates the document-level motion guard.
-    await page.getByRole('combobox', { name: 'Motion' }).selectOption('off')
+    await page.getByTestId('settings-select-ui_motion_mode').click()
+    await page.getByTestId('settings-select-ui_motion_mode-option-off').click()
     await expect.poll(() => page.evaluate(() => document.documentElement.dataset.motion)).toBe('off')
-    await expect(page.getByRole('combobox', { name: 'App font' }).locator('option')).toHaveCount(27)
+    await page.getByTestId('settings-select-ui_font_family').click()
+    await expect(page.getByTestId('settings-select-ui_font_family-list').getByRole('option')).toHaveCount(27)
     await expect
       .poll(() =>
         page
-          .getByRole('combobox', { name: 'App font' })
-          .locator('option[value="palatino"]')
-          .evaluate((option) => (option as HTMLOptionElement).style.fontFamily)
+          .getByTestId('settings-select-ui_font_family-option-palatino')
+          .locator('.card-select-option-label')
+          .evaluate((option) => (option as HTMLElement).style.fontFamily)
       )
       .toContain('Palatino')
-    await page.getByRole('combobox', { name: 'App font' }).selectOption('georgia')
+    await page.getByTestId('settings-select-ui_font_family-option-georgia').click()
     await expect.poll(() => page.evaluate(() => document.documentElement.dataset.fontFamily)).toBe('georgia')
     await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--font-sans'))).toContain('Georgia')
     // Save feedback appears briefly
@@ -2323,7 +3251,7 @@ test('setup wizard runs on first launch and stays dismissed after completion', a
     await page.getByTestId('setup-wizard-next').click()
     await expect(page.getByTestId('setup-wizard-step-3')).toBeVisible()
     await expect(page.getByTestId('setup-result-codex')).toContainText('npm install -g @openai/codex')
-    await expect(page.getByTestId('setup-result-hermes')).toContainText('github.com/nouresearch/hermes')
+    await expect(page.getByTestId('setup-result-hermes')).toContainText('github.com/NousResearch/hermes-agent')
     await expect(page.getByTestId('setup-result-claudeCode')).toContainText('1.2.3')
 
     // Back returns to the detection step, results retained.
@@ -2401,6 +3329,24 @@ test('Browser panel opens with working chrome and closes cleanly', async ({}, te
     await expect(browserPanel.getByTestId('browser-url-input')).toBeVisible()
     await expect(browserPanel.getByTestId('browser-new-tab')).toBeVisible()
     await expect(browserPanel.getByTestId('browser-persist-toggle')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-mode-browse')).toHaveAttribute('aria-pressed', 'true')
+
+    // Preview is part of this same Browser panel and has a clear no-project state
+    // in the Global workspace.
+    await browserPanel.getByTestId('browser-mode-preview').click()
+    await expect(browserPanel.getByTestId('browser-preview-tools')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-status')).toContainText('Select a project workspace')
+    await expect(browserPanel.getByTestId('browser-preview-detect')).toBeDisabled()
+    await expect(browserPanel.getByTestId('browser-preview-menu-trigger')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-copy-url')).toHaveCount(0)
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+    await expect(browserPanel.getByTestId('browser-preview-menu')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-preset-5173')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-copy-url')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-open-external')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-persist-toggle')).toBeVisible()
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+    await browserPanel.getByTestId('browser-mode-browse').click()
 
     // A first tab is created automatically; a second can be added and selected.
     await expect.poll(() => browserPanel.getByTestId('browser-tab').count()).toBeGreaterThanOrEqual(1)
@@ -2438,6 +3384,267 @@ test('Browser panel opens with working chrome and closes cleanly', async ({}, te
   }
 })
 
+test('Preview panel shows an empty state and loads a manually entered URL, isolated from the agent Browser panel', async ({}, testInfo) => {
+  const pagePort = 18990
+  const localPage = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end('<!doctype html><html><head><title>Preview panel fixture</title></head><body><main>Live preview panel fixture</main></body></html>')
+  })
+  await new Promise<void>((resolve) => localPage.listen(pagePort, '127.0.0.1', resolve))
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    // Default closed in all workspaces.
+    await expect(page.getByTestId('workspace-panel-preview')).toHaveCount(0)
+    const browserTabsBefore = (await page.evaluate(() => window.api.browser.listTabs())).tabs.length
+
+    // Opens from the Tools group, separate from the Browser panel entry.
+    await page.getByTestId('workspace-tool-preview').click()
+    const previewPanel = page.getByTestId('workspace-panel-preview')
+    await expect(previewPanel).toBeVisible()
+
+    // No dev server detected yet: a clear empty state with manual URL entry.
+    await expect(previewPanel.getByTestId('preview-empty-state')).toBeVisible()
+    await expect(previewPanel.getByTestId('preview-empty-state')).toContainText('No dev server detected')
+    await expect(previewPanel.getByTestId('preview-open-detected')).toHaveCount(0)
+    await expect(previewPanel.getByTestId('preview-url-input')).toBeVisible()
+
+    // Manually entering a URL loads it. The loaded page itself is a native
+    // WebContentsView above the DOM, so verify through the isolated preview
+    // IPC surface rather than the page's rendered content.
+    const localUrl = `http://127.0.0.1:${pagePort}`
+    await previewPanel.getByTestId('preview-url-input').fill(localUrl)
+    await previewPanel.getByTestId('preview-go').click()
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.preview.getState())
+      return state.url
+    }).toBe(`${localUrl}/`)
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.preview.getState())
+      return { loading: state.isLoading, error: state.navigationError }
+    }).toEqual({ loading: false, error: null })
+    await expect(previewPanel.getByTestId('preview-empty-state')).toHaveCount(0)
+
+    // This is a separate, isolated surface from the agent-controlled Browser
+    // panel: loading a page here never creates or touches a Browser tab.
+    const browserTabsAfter = (await page.evaluate(() => window.api.browser.listTabs())).tabs
+    expect(browserTabsAfter).toHaveLength(browserTabsBefore)
+    expect(browserTabsAfter.every((tab) => tab.url === 'about:blank')).toBe(true)
+
+    // Closing the panel unmounts the chrome; the native view (and its live
+    // connection) is never torn down, so reopening still shows the loaded URL.
+    await page.getByTestId('workspace-panel-close-preview').click()
+    await expect(page.getByTestId('workspace-panel-preview')).toHaveCount(0)
+    await page.getByTestId('workspace-tool-preview').click()
+    await expect(page.getByTestId('workspace-panel-preview').getByTestId('preview-url-input')).toHaveValue(`${localUrl}/`)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+    await new Promise<void>((resolve) => localPage.close(() => resolve()))
+  }
+})
+
+test('Browser Preview mode detects project metadata and safely loads a local server', async ({}, testInfo) => {
+  const pagePort = 18977
+  const unusedProbePort = 18978
+  let previewRequestCount = 0
+  const localPage = createServer((req, res) => {
+    previewRequestCount++
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end(req.url === '/blank'
+      ? '<!doctype html><html><head><title>Blank preview fixture</title></head><body></body></html>'
+      : '<!doctype html><html><head><title>Preview fixture</title></head><body><main>Live preview fixture</main></body></html>')
+  })
+  await new Promise<void>((resolve) => localPage.listen(pagePort, '127.0.0.1', resolve))
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_PREVIEW_PROBE_PORTS: String(unusedProbePort),
+    E2E_FAKE_CODEX: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    const project = await createAndSelectProject(page, testInfo, 'Preview Fixture')
+    await writeFile(path.join(project.path, 'package.json'), JSON.stringify({
+      packageManager: 'npm@10.0.0',
+      scripts: { dev: 'vite', start: 'vite --port 3000' },
+    }, null, 2))
+    await writeFile(path.join(project.path, 'vite.config.ts'), 'export default {}\n')
+
+    // A previewable project advertises the shared live preview directly in an
+    // agent panel. Clicking it opens/focuses the existing Browser panel in
+    // Preview mode and runs the same bounded project detection.
+    await page.getByTestId('workspace-tool-codex').click()
+    const codexPanel = page.getByTestId('workspace-panel-codex')
+    await expect(codexPanel.getByTestId('open-live-preview-codex')).toBeVisible({ timeout: 5_000 })
+    await codexPanel.getByTestId('open-live-preview-codex').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-mode-preview')).toHaveAttribute('aria-pressed', 'true')
+    await expect(browserPanel.getByTestId('browser-preview-tools')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-url-input')).toHaveAttribute('aria-label', 'Preview URL')
+    await expect(browserPanel.getByTestId('browser-back')).toHaveCount(0)
+    await expect(browserPanel.getByTestId('browser-forward')).toHaveCount(0)
+
+    // The primary bar stays compact; secondary actions live in one menu.
+    await expect(browserPanel.getByTestId('browser-reload')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-detect')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-copy-url')).toHaveCount(0)
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+    await expect(browserPanel.getByTestId('browser-preview-preset-5173')).toContainText('Vite')
+    await expect(browserPanel.getByTestId('browser-preview-preset-3000')).toContainText('React / Next')
+    await expect(browserPanel.getByTestId('browser-preview-preset-4173')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-preset-5174')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-copy-url')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-open-external')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-open-terminal')).toBeVisible()
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+
+    // Detection is bounded and returns a deterministic no-server state while
+    // still surfacing commands from the project's actual package.json.
+    await browserPanel.getByTestId('browser-preview-detect').click()
+    await expect(browserPanel.getByTestId('browser-preview-status')).toContainText('No dev server detected', { timeout: 5_000 })
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+    await expect(browserPanel.getByTestId('browser-preview-command-dev')).toContainText('npm run dev')
+    await expect(browserPanel.getByTestId('browser-preview-command-start')).toContainText('npm run start')
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+
+    // Manual loopback navigation reaches a controlled local fixture.
+    const localUrl = `http://127.0.0.1:${pagePort}`
+    await browserPanel.getByTestId('browser-url-input').fill(localUrl)
+    await browserPanel.getByTestId('browser-go').click()
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.browser.listTabs())
+      return state.tabs.find((tab) => tab.id === state.activeTabId)?.url
+    }).toBe(`${localUrl}/`)
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.browser.listTabs())
+      const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId)
+      return { loading: tab?.isLoading, error: tab?.navigationError ?? null, preview: tab?.previewMode }
+    }).toEqual({ loading: false, error: null, preview: true })
+    await expect(browserPanel.getByTestId('browser-preview-status')).toContainText('Preview loaded')
+
+    // A web-relevant agent edit refreshes one time after the debounce window;
+    // streamed text alone never participates in this event path.
+    const requestsBeforeEdit = previewRequestCount
+    await page.evaluate((projectId) => window.dispatchEvent(new CustomEvent('preview:webFilesChanged', { detail: { projectId, path: 'src/App.tsx' } })), project.id)
+    await expect.poll(() => previewRequestCount, { timeout: 4_000 }).toBeGreaterThan(requestsBeforeEdit)
+    await expect(browserPanel.getByTestId('browser-preview-status')).toContainText('Preview refreshed after agent edits')
+
+    // Preview mode refuses external navigation in main and keeps the local page.
+    await browserPanel.getByTestId('browser-url-input').fill('https://example.com')
+    await browserPanel.getByTestId('browser-go').click()
+    await expect(browserPanel.getByTestId('browser-navigation-error')).toContainText('blocks non-local URLs')
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.browser.listTabs())
+      return state.tabs.find((tab) => tab.id === state.activeTabId)?.url
+    }).toBe(`${localUrl}/`)
+
+    // Successfully loaded but empty pages get an integrated troubleshooting
+    // state with the requested recovery actions.
+    await browserPanel.getByTestId('browser-url-input').fill(`${localUrl}/blank`)
+    await browserPanel.getByTestId('browser-go').click()
+    await expect(browserPanel.getByTestId('browser-preview-help')).toContainText('Preview looks blank', { timeout: 5_000 })
+    await expect(browserPanel.getByTestId('browser-preview-help-refresh')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-help-external')).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-preview-help-terminal')).toBeVisible()
+
+    // Preview chrome remains readable in both themes.
+    for (const theme of ['dark', 'light'] as const) {
+      await page.evaluate((nextTheme) => {
+        if (nextTheme === 'dark') document.documentElement.dataset.theme = 'dark'
+        else document.documentElement.removeAttribute('data-theme')
+      }, theme)
+      const colors = await browserPanel.getByTestId('browser-preview-tools').evaluate((el) => {
+        const styles = getComputedStyle(el)
+        return { bg: styles.backgroundColor, fg: styles.color }
+      })
+      const menuButtonColors = await browserPanel.getByTestId('browser-preview-menu-trigger').evaluate((el) => {
+        const styles = getComputedStyle(el)
+        return { bg: styles.backgroundColor, fg: styles.color }
+      })
+      expect(colors.bg).not.toBe(colors.fg)
+      expect(menuButtonColors.bg).not.toBe(menuButtonColors.fg)
+    }
+  } finally {
+    await electronApp.close().catch(() => undefined)
+    await new Promise<void>((resolve) => localPage.close(() => resolve()))
+  }
+})
+
+test('agent local preview requests open the built-in Preview panel without external fallback', async ({}, testInfo) => {
+  const controlPort = 18979
+  const pagePort = 18980
+  const localPage = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end('<!doctype html><html><head><title>Agent preview</title></head><body><main>Agent preview route</main></body></html>')
+  })
+  await new Promise<void>((resolve) => localPage.listen(pagePort, '127.0.0.1', resolve))
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_BROWSER_CONTROL: '1',
+    E2E_FAKE_CODEX: '1',
+    AIWORKSPACE_BROWSER_CONTROL_PORT: String(controlPort),
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-panel-browser')).toHaveCount(0)
+
+    // Keep this assertion process-local: the explicit Browser button below is
+    // allowed to call shell.openExternal, but agent routing must never do so.
+    await electronApp.evaluate(({ shell }) => {
+      const marker = globalThis as typeof globalThis & { __aiwExternalOpenCount?: number }
+      marker.__aiwExternalOpenCount = 0
+      shell.openExternal = async () => { marker.__aiwExternalOpenCount = (marker.__aiwExternalOpenCount ?? 0) + 1 }
+    })
+
+    const controlToken = (await page.evaluate(() => window.api.mcp.getBrowserServerConfig()))
+      .env!.AIWORKSPACE_BROWSER_CONTROL_TOKEN
+    const headers = {
+      'content-type': 'application/json',
+      'x-aiw-agent-id': 'e2e-codex-preview',
+      'x-aiw-agent-name': 'Codex E2E',
+      'x-aiw-identity-source': 'app-launch',
+      'x-aiw-control-token': controlToken,
+    }
+    await expect.poll(async () => {
+      try { return (await fetch(`http://127.0.0.1:${controlPort}/__ready`, { headers })).status } catch { return 0 }
+    }).toBe(404)
+
+    const localUrl = `http://127.0.0.1:${pagePort}/small-preview.html`
+    const response = await fetch(`http://127.0.0.1:${controlPort}/browser/tabs`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: localUrl }),
+    })
+    expect(response.status).toBe(200)
+    const result = await response.json() as { result?: { tabId?: string } }
+    expect(result.result?.tabId).toBeTruthy()
+
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+    await expect(browserPanel.getByTestId('browser-mode-preview')).toHaveAttribute('aria-pressed', 'true')
+    await expect(browserPanel.getByTestId('browser-url-input')).toHaveValue(localUrl)
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.api.browser.listTabs())
+      const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId)
+      return { url: tab?.url, previewMode: tab?.previewMode, error: tab?.navigationError ?? null }
+    }).toEqual({ url: localUrl, previewMode: true, error: null })
+    await expect(browserPanel.getByTestId('browser-preview-status')).toContainText('Preview loaded')
+    expect(await electronApp.evaluate(() => (globalThis as typeof globalThis & { __aiwExternalOpenCount?: number }).__aiwExternalOpenCount ?? 0)).toBe(0)
+
+    // The only external-browser transition in this workflow is an explicit
+    // human click on the existing Browser Preview action.
+    await browserPanel.getByTestId('browser-preview-menu-trigger').click()
+    await browserPanel.getByTestId('browser-preview-open-external').click()
+    await expect.poll(() => electronApp.evaluate(() => (globalThis as typeof globalThis & { __aiwExternalOpenCount?: number }).__aiwExternalOpenCount ?? 0)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+    await new Promise<void>((resolve) => localPage.close(() => resolve()))
+  }
+})
+
 test('Browser MCP navigation uses the shared approval card and parks native content', async ({}, testInfo) => {
   const port = 18973
   const pagePort = 18974
@@ -2450,21 +3657,41 @@ test('Browser MCP navigation uses the shared approval card and parks native cont
     E2E_BROWSER_CONTROL: '1',
     AIWORKSPACE_BROWSER_CONTROL_PORT: String(port),
   })
-  const headers = {
-    'content-type': 'application/json',
-    'x-aiw-agent-id': 'e2e-codex',
-    'x-aiw-agent-name': 'Codex E2E',
-    'x-aiw-identity-source': 'app-launch',
-  }
   try {
     const page = await electronApp.firstWindow()
     await page.waitForLoadState('domcontentloaded')
     await page.getByTestId('workspace-tool-browser').click()
     await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).activeTabId).not.toBeNull()
     const tabId = (await page.evaluate(() => window.api.browser.listTabs())).activeTabId!
+
+    // The control token is what makes a caller "verified"; without it every
+    // request is pinned to ask-before-everything. Real MCP clients receive it in
+    // their launch env, so the test reads it back through the same config the
+    // app hands them rather than hardcoding a value.
+    const controlToken = (await page.evaluate(() => window.api.mcp.getBrowserServerConfig()))
+      .env!.AIWORKSPACE_BROWSER_CONTROL_TOKEN
+    expect(controlToken).toBeTruthy()
+    const headers = {
+      'content-type': 'application/json',
+      'x-aiw-agent-id': 'e2e-codex',
+      'x-aiw-agent-name': 'Codex E2E',
+      'x-aiw-identity-source': 'app-launch',
+      'x-aiw-control-token': controlToken,
+    }
+
+    // Readiness probe: an unrouted path 404s without entering the approval queue,
+    // so it can't be mistaken for the approval assertions below.
     await expect.poll(async () => {
-      try { return (await fetch(`http://127.0.0.1:${port}/browser/state`, { headers })).status } catch { return 0 }
-    }).toBe(200)
+      try { return (await fetch(`http://127.0.0.1:${port}/__ready`, { headers })).status } catch { return 0 }
+    }).toBe(404)
+
+    // Reads now prompt at the default mode. Grant browser.read for the session
+    // once so the state/snapshot reads this test uses as scaffolding stay quiet,
+    // while navigation and typing still prompt as asserted below.
+    const firstRead = fetch(`http://127.0.0.1:${port}/browser/state`, { headers })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await page.getByTestId('browser-approval-session').click()
+    expect((await firstRead).status).toBe(200)
 
     const deniedFetch = fetch(`http://127.0.0.1:${port}/browser/tabs/${encodeURIComponent(tabId)}/navigate`, {
       method: 'POST', headers: { ...headers, 'x-aiw-request-id': 'deny-navigation' }, body: JSON.stringify({ url: 'https://example.com/denied' })
@@ -2520,5 +3747,58 @@ test('Browser MCP navigation uses the shared approval card and parks native cont
   } finally {
     await electronApp.close().catch(() => undefined)
     await new Promise<void>((resolve) => localPage.close(() => resolve()))
+  }
+})
+
+test('Browser control server gates reads and unverified callers regardless of permission mode', async ({}, testInfo) => {
+  const port = 18975
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_BROWSER_CONTROL: '1',
+    AIWORKSPACE_BROWSER_CONTROL_PORT: String(port),
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-browser').click()
+    await expect.poll(async () => (await page.evaluate(() => window.api.browser.listTabs())).activeTabId).not.toBeNull()
+
+    const controlToken = (await page.evaluate(() => window.api.mcp.getBrowserServerConfig()))
+      .env!.AIWORKSPACE_BROWSER_CONTROL_TOKEN
+    const verified = {
+      'x-aiw-agent-id': 'e2e-verified',
+      'x-aiw-agent-name': 'Verified E2E',
+      'x-aiw-identity-source': 'app-launch',
+      'x-aiw-control-token': controlToken,
+    }
+    // Same claimed identity, no token — i.e. any other local process that found
+    // the port open and copied the headers.
+    const spoofed = { ...verified, 'x-aiw-control-token': 'not-the-real-token' }
+
+    await expect.poll(async () => {
+      try { return (await fetch(`http://127.0.0.1:${port}/__ready`, { headers: verified })).status } catch { return 0 }
+    }).toBe(404)
+
+    // Reading page content is gated at the default mode (3): it can lift
+    // authenticated session content, so it must not auto-approve.
+    const readAtDefault = fetch(`http://127.0.0.1:${port}/browser/state`, { headers: verified })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await page.getByTestId('browser-approval-deny').click()
+    expect((await readAtDefault).status).toBe(403)
+
+    // Mode 5 is the user extending trust to their own agents: a verified caller
+    // now reads without prompting...
+    await page.evaluate(() => window.api.hermes.setPermissionMode(5))
+    expect((await fetch(`http://127.0.0.1:${port}/browser/state`, { headers: verified })).status).toBe(200)
+    await expect(page.getByTestId('browser-approval-card')).toHaveCount(0)
+
+    // ...but that trust must not extend to an unverified caller wearing the same
+    // agent id. It still prompts, even at the most permissive mode.
+    const spoofedRead = fetch(`http://127.0.0.1:${port}/browser/state`, { headers: spoofed })
+    await expect(page.getByTestId('browser-approval-card')).toBeVisible()
+    await expect(page.getByTestId('browser-approval-card')).toContainText('Verified E2E')
+    await page.getByTestId('browser-approval-deny').click()
+    expect((await spoofedRead).status).toBe(403)
+  } finally {
+    await electronApp.close().catch(() => undefined)
   }
 })

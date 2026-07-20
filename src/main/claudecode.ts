@@ -1,7 +1,9 @@
 import { spawn } from 'child_process'
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
 import { join } from 'path'
 import { isE2EFakeEnabled } from './e2e'
+import type { McpServerConfig } from './mcp'
 
 // Milestone 5 — Claude Code launcher.
 //
@@ -45,7 +47,11 @@ export interface ActivityEntry {
   diff?: FileDiff // set for file write/edit tools once the tool completes successfully
 }
 
+export interface CCModelUsage { model: string; used: number; contextWindow?: number }
+export interface CCUsage { used: number; total: number | null; perModel: CCModelUsage[] }
+
 export type CCEvent =
+  | { kind: 'usage'; usage: CCUsage }
   | { kind: 'system'; summary: string; model?: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; id: string; name: string; summary: string }
@@ -170,6 +176,7 @@ export function checkClaudeCode(): Promise<CCCheck> {
 export function runClaudeCode(opts: {
   projectPath: string
   prompt: string
+  systemInstruction?: string
   // Model picker → `--model`. Effort → the CLI's native `--effort` flag
   // (low|medium|high|xhigh|max); omit for "normal" so the default is preserved.
   // Thinking toggle → MAX_THINKING_TOKENS in the child env, the supported way to
@@ -177,10 +184,37 @@ export function runClaudeCode(opts: {
   model?: string
   effort?: string
   thinking?: boolean
+  // Autonomy control → the CLI's native `--permission-mode`. This app runs
+  // Claude Code headless (`-p`) with no interactive approval channel, so only
+  // the three modes that behave meaningfully headlessly are ever passed
+  // (verified against the real binary): 'plan' (read-only, edits blocked),
+  // 'acceptEdits' (auto-accept edits — the default) and 'bypassPermissions'
+  // (run everything). The interactive modes 'manual'/'auto' are NOT used here:
+  // headless, they ask for an approval that can never arrive, so edits silently
+  // never happen. Defaults to 'acceptEdits' to preserve prior behavior.
+  permissionMode?: 'plan' | 'acceptEdits' | 'bypassPermissions'
+  // MCP servers to expose to this session, keyed by server name. The CLI never
+  // reads claude_desktop_config.json, so without this every spawn runs with zero
+  // MCP tools. We serialize this to a temp JSON file and pass it via
+  // --mcp-config (+ --strict-mcp-config). Built by the caller from the
+  // source-of-truth launch configs in mcp.ts.
+  mcpServers?: Record<string, McpServerConfig>
   onEvent: (e: CCEvent) => void
   signal?: AbortSignal
 }): Promise<RunResult> {
   if (isFakeClaudeCode()) {
+    const permissionMode = opts.permissionMode ?? 'acceptEdits'
+    opts.onEvent({ kind: 'system', summary: 'Fake Claude Code session started', model: opts.model })
+    // Plan mode is read-only: mirror the real binary (verified) — no file write.
+    if (permissionMode === 'plan') {
+      const result = `Fake Claude Code plan (read-only) for: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=plan`
+      opts.onEvent({ kind: 'text', text: result })
+      opts.onEvent({
+        kind: 'usage',
+        usage: { used: 12_000, total: 200_000, perModel: [{ model: opts.model ?? 'claude-fake-sonnet', used: 12_000, contextWindow: 200_000 }] },
+      })
+      return Promise.resolve({ ok: true, result, activity: [] })
+    }
     const activity: ActivityEntry[] = [{ name: 'Write', summary: 'e2e-claude-output.txt', ok: true }]
     const before = existsSync(join(opts.projectPath, 'e2e-claude-output.txt'))
       ? readFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), 'utf8')
@@ -188,34 +222,82 @@ export function runClaudeCode(opts: {
     const after = `Fake Claude Code modified files for: ${opts.prompt}\n`
     writeFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), after, 'utf8')
     activity[0].diff = { path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after }
-    opts.onEvent({ kind: 'system', summary: 'Fake Claude Code session started', model: opts.model })
     opts.onEvent({ kind: 'tool', id: 'fake-write', name: 'Write', summary: 'e2e-claude-output.txt' })
     opts.onEvent({ kind: 'tool-result', id: 'fake-write', ok: true, summary: 'wrote e2e-claude-output.txt' })
     opts.onEvent({ kind: 'file_diff', toolCallId: 'fake-write', path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after })
-    const result = `Fake Claude Code completed: ${opts.prompt}`
+    const result = `Fake Claude Code completed: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=${permissionMode}`
     opts.onEvent({ kind: 'text', text: result })
+  const fakeModel = opts.model ?? 'claude-fake-sonnet'
+  opts.onEvent({
+    kind: 'usage',
+    usage: { used: 54_200, total: 200_000, perModel: [{ model: fakeModel, used: 54_200, contextWindow: 200_000 }] },
+  })
     return Promise.resolve({ ok: true, result, activity })
   }
   return new Promise((resolve) => {
     const bin = resolveClaudeBin()
+    const agentPrompt = opts.systemInstruction ? `${opts.prompt}\n\n${opts.systemInstruction}` : opts.prompt
     const direct = isDirectExe(bin)
+    // Autonomy mode (see the permissionMode doc on the opts type). Default keeps
+    // the prior 'acceptEdits' behavior: auto-approve file edits so headless tasks
+    // can write, while still not auto-running riskier tools. 'plan' is read-only;
+    // 'bypassPermissions' runs everything (gated behind a confirm in the UI).
+    const permissionMode = opts.permissionMode ?? 'acceptEdits'
     const baseArgs = [
       '--output-format',
       'stream-json',
       '--verbose',
-      // Auto-approve file creation/edits so headless tasks can actually write,
-      // while still surfacing (and not auto-running) anything riskier.
       '--permission-mode',
-      'acceptEdits'
+      permissionMode
     ]
     if (opts.model) baseArgs.push('--model', opts.model)
     if (opts.effort) baseArgs.push('--effort', opts.effort)
+
+    // Wire MCP servers for this session. The CLI does NOT read
+    // claude_desktop_config.json, so registration there is invisible to it; the
+    // only mechanism that reaches a headless spawn is --mcp-config. Write the
+    // combined config to a fresh temp file per spawn (avoids stale config if the
+    // launch configs change mid-session) and delete it once the child exits.
+    // --strict-mcp-config makes these the *only* servers the session sees:
+    // the app fully owns this invocation and wants deterministic tools, with no
+    // dependence on whatever else might be configured on the machine.
+    let mcpConfigPath: string | undefined
+    const mcpServerNames = opts.mcpServers ? Object.keys(opts.mcpServers) : []
+    if (mcpServerNames.length > 0) {
+      try {
+        const p = join(tmpdir(), `aiworkspace-mcp-${process.pid}-${Date.now()}.json`)
+        writeFileSync(p, JSON.stringify({ mcpServers: opts.mcpServers }), 'utf8')
+        mcpConfigPath = p
+        // Two gates must both be opened for the tools to actually run headlessly:
+        //   1. --mcp-config makes the servers *exist* for the session.
+        //   2. --allowedTools pre-approves them, or every call is auto-denied with
+        //      "requested permissions … but you haven't granted it yet" (the
+        //      acceptEdits mode only auto-approves file edits, not MCP tools).
+        // We scope the allow-list to exactly these app-owned servers (`mcp__<name>`
+        // allows all of a server's tools) — NOT --dangerously-skip-permissions, so
+        // Bash and other tools stay governed by acceptEdits as before.
+        baseArgs.push('--allowedTools', ...mcpServerNames.map((n) => `mcp__${n}`))
+        baseArgs.push('--mcp-config', p, '--strict-mcp-config')
+      } catch {
+        // If we can't stage the config, run without MCP rather than fail the task.
+        mcpConfigPath = undefined
+      }
+    }
+    const cleanupMcpConfig = () => {
+      if (!mcpConfigPath) return
+      try {
+        unlinkSync(mcpConfigPath)
+      } catch {
+        /* already gone / unwritable temp — the OS temp dir reaps it eventually */
+      }
+      mcpConfigPath = undefined
+    }
 
     // Prefer passing the prompt as a real argv arg when we can spawn the exe
     // directly (no shell ⇒ no injection). For the shell fallbacks (npm .cmd /
     // bare `claude` on Windows) feed the prompt over stdin so it never touches
     // a command line.
-    const args = direct ? ['-p', opts.prompt, ...baseArgs] : ['-p', ...baseArgs]
+    const args = direct ? ['-p', agentPrompt, ...baseArgs] : ['-p', ...baseArgs]
 
     const activity: ActivityEntry[] = []
     // Tool calls that write a file: keyed by tool_use id so the matching
@@ -225,6 +307,7 @@ export function runClaudeCode(opts: {
     const pendingDiffs = new Map<string, { path: string; before: string | null; entry: ActivityEntry }>()
     let streamedText = ''
     let resultText = ''
+    let initModel: string | undefined
     let cost: number | undefined
     let sawResult = false
     let ok = false
@@ -242,6 +325,7 @@ export function runClaudeCode(opts: {
     } catch (e: any) {
       const message = `Failed to launch Claude Code: ${e?.message ?? e}`
       opts.onEvent({ kind: 'error', message })
+      cleanupMcpConfig()
       resolve({ ok: false, result: '', activity, error: message })
       return
     }
@@ -272,6 +356,7 @@ export function runClaudeCode(opts: {
       switch (msg.type) {
         case 'system':
           if (msg.subtype === 'init') {
+            if (typeof msg.model === 'string') initModel = msg.model
             opts.onEvent({
               kind: 'system',
               model: msg.model,
@@ -287,7 +372,7 @@ export function runClaudeCode(opts: {
               detectLogin(b.text)
               opts.onEvent({ kind: 'text', text: b.text })
             } else if (b.type === 'tool_use') {
-              const summary = summarizeToolInput(b.name, b.input)
+              const summary = summarizeToolInput(b.name, b.input, opts.projectPath)
               const entry: ActivityEntry = { name: b.name, summary }
               activity.push(entry)
               opts.onEvent({ kind: 'tool', id: b.id ?? '', name: b.name, summary })
@@ -347,6 +432,29 @@ export function runClaudeCode(opts: {
           resultText = typeof msg.result === 'string' ? msg.result : streamedText
           ok = msg.subtype === 'success' && !msg.is_error
           detectLogin(resultText)
+          if (msg.modelUsage && typeof msg.modelUsage === 'object') {
+            const perModel: NonNullable<CCUsage['perModel']> = []
+            for (const [model, raw] of Object.entries(msg.modelUsage as Record<string, unknown>)) {
+              if (!raw || typeof raw !== 'object') continue
+              const entry = raw as Record<string, unknown>
+              const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+              const used =
+                num(entry.inputTokens) + num(entry.cacheReadInputTokens) + num(entry.cacheCreationInputTokens)
+              const contextWindow = num(entry.contextWindow)
+              perModel.push({ model, used, contextWindow })
+            }
+            if (perModel.length > 0) {
+              const current = perModel.find((entry) => entry.model === initModel) ?? perModel[0]
+              opts.onEvent({
+                kind: 'usage',
+                usage: {
+                  used: current.used,
+                  total: current.contextWindow && current.contextWindow > 0 ? current.contextWindow : null,
+                  perModel,
+                },
+              })
+            }
+          }
           if (Array.isArray(msg.permission_denials)) {
             for (const d of msg.permission_denials) {
               const tool = d?.tool_name ?? d?.name ?? 'tool'
@@ -372,10 +480,12 @@ export function runClaudeCode(opts: {
           ? 'Claude Code CLI was not found. Install it, then run `claude login`.'
           : `Claude Code failed to start: ${e?.message ?? e}`
       opts.onEvent({ kind: 'error', message })
+      cleanupMcpConfig()
       resolve({ ok: false, result: '', activity, error: message })
     })
 
     child.on('close', (code) => {
+      cleanupMcpConfig()
       if (stdoutBuf.trim()) handleLine(stdoutBuf)
       detectLogin(stderr)
 
@@ -407,7 +517,7 @@ export function runClaudeCode(opts: {
 
     // Provide the prompt (stdin for shell fallbacks) and always close stdin so
     // the CLI doesn't wait ~3s for piped input that isn't coming.
-    if (!direct) child.stdin?.write(opts.prompt)
+    if (!direct) child.stdin?.write(agentPrompt)
     child.stdin?.end()
   })
 }
@@ -440,10 +550,23 @@ export function summarizeRun(prompt: string, run: RunResult): { title: string; c
 }
 
 // ---- helpers ---------------------------------------------------------------
-function summarizeToolInput(name: string, input: any): string {
+// Paths inside the project read as project-relative in the activity log; the
+// absolute prefix (userData temp dirs, deep folder trees) is pure noise there.
+export function relativizeToProject(p: string, projectPath: string): string {
+  if (!projectPath) return p
+  const norm = (s: string) => s.replace(/\//g, '\\').replace(/\\+$/, '')
+  const abs = norm(p)
+  const root = norm(projectPath)
+  if (abs.toLowerCase().startsWith(root.toLowerCase() + '\\')) {
+    return abs.slice(root.length + 1)
+  }
+  return p
+}
+
+function summarizeToolInput(name: string, input: any, projectPath: string): string {
   if (!input || typeof input !== 'object') return name
-  if (input.file_path) return String(input.file_path)
-  if (input.path) return String(input.path)
+  if (input.file_path) return relativizeToProject(String(input.file_path), projectPath)
+  if (input.path) return relativizeToProject(String(input.path), projectPath)
   if (input.command) return clip(String(input.command), 140)
   if (input.pattern) return String(input.pattern)
   if (input.url) return String(input.url)

@@ -1,35 +1,65 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
 import { diffLines } from 'diff'
-import type { Project, Session, Message, CCActivityEntry, CCFileDiff, CCEvent, Checkpoint } from '../types'
+import type { Project, Session, Message, CCActivityEntry, CCFileDiff, CCEvent, CCUsage, Checkpoint, AgentModelInfo, ClaudeCodePermissionMode } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import VoiceInputButton from './VoiceInputButton'
 import { useToast } from './ToastContext'
-import { useAgentActivity } from '../AgentActivityContext'
+import { useAgentTaskReporter } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { fallbackTitleFromText, isGenericSessionTitle } from '../../../shared/sessionTitles'
 import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import InstructionsEditor from './InstructionsEditor'
+import { ClaudeModelPicker } from './ModelPicker'
+import ContextMeter from './ContextMeter'
 import ToolSyntaxBlock from './ToolSyntaxBlock'
 import anime, { AnimatedScaleBar, prefersReducedMotion, stopMotion, usePressMotion, type MotionHandle } from '../motion'
 import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
+import LivePreviewAffordance, { notifyPreviewFileChanged } from './LivePreviewAffordance'
 
 type Check = { installed: boolean; version?: string; bin?: string; error?: string }
 type SlashCommand = { name: string; desc: string }
 
-const MODELS = [
-  { id: 'claude-opus-4-8', label: 'Opus 4.8' },
-  { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5', label: 'Haiku 4.5' }
-] as const
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+// Static fallback so the picker never renders empty before the IPC catalog
+// arrives; the authoritative list comes from claudecode:listModels.
+const FALLBACK_MODELS: AgentModelInfo[] = [
+  { id: 'default', label: 'Default', description: "Recommended — uses the CLI's default model" },
+  { id: 'claude-sonnet-5', label: 'Sonnet 5', description: 'Everyday coding default' },
+  { id: 'claude-opus-4-8', label: 'Opus 4.8', description: 'Most capable Opus-tier model' },
+  { id: 'claude-haiku-4-5', label: 'Haiku 4.5', description: 'Fastest, for lightweight tasks' }
+]
+const MODEL_PREF_KEY = 'claude-code-preferred-model'
+const EFFORT_PREF_KEY = 'claude-code-preferred-effort'
+const PERMISSION_PREF_KEY = 'claude-code-permission-mode'
+const THINKING_PREF_KEY = 'claude-code-thinking'
+function loadPref(key: string, fallback: string): string {
+  try { return localStorage.getItem(key) ?? fallback } catch { return fallback }
+}
+function savePref(key: string, value: string) {
+  try { localStorage.setItem(key, value) } catch { /* ignore */ }
+}
+
+// Autonomy modes for the headless (`-p`) composer. Only these three behave
+// meaningfully — verified against the real binary: 'plan' is read-only (edits
+// blocked), 'acceptEdits' auto-accepts edits (the default), 'bypassPermissions'
+// runs everything. The interactive Desktop modes 'manual'/'auto' are omitted:
+// with no interactive approval channel here they ask for a permission that can
+// never arrive, so edits silently never happen (see src/main/claudecode.ts).
+const PERMISSION_META: Record<ClaudeCodePermissionMode, { label: string; title: string; tone: 'neutral' | 'error' }> = {
+  plan: { label: 'Plan', title: 'Read-only: Claude explores and proposes a plan, but makes no edits.', tone: 'neutral' },
+  acceptEdits: { label: 'Accept edits', title: 'Auto-accept file edits so headless tasks can write; riskier tools stay ungranted.', tone: 'neutral' },
+  bypassPermissions: { label: 'Full access', title: 'Runs every tool without gating, including commands. Use only in folders you trust.', tone: 'error' },
+}
+const PERMISSION_ORDER: ClaudeCodePermissionMode[] = ['plan', 'acceptEdits', 'bypassPermissions']
+function loadPermissionMode(): ClaudeCodePermissionMode {
+  const v = loadPref(PERMISSION_PREF_KEY, 'acceptEdits')
+  return v === 'plan' || v === 'bypassPermissions' ? v : 'acceptEdits'
+}
 const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.claudecode.pinned'
 function loadPinned(): Set<string> {
@@ -43,12 +73,9 @@ const CLAUDECODE_EMPTY_HEADINGS = [
   'Describe the task — Claude Code takes it from here.',
 ]
 
-function labelForModel(model: string): string {
-  return MODELS.find((m) => m.id === model)?.label ?? model
+function labelForModel(list: AgentModelInfo[], model: string): string {
+  return list.find((m) => m.id === model)?.label ?? model
 }
-
-const EFFORTS = ['normal', 'high', 'max'] as const
-type Effort = (typeof EFFORTS)[number]
 
 const FALLBACK_COMMANDS: SlashCommand[] = [
   { name: '/bug', desc: 'Report a bug to Anthropic' },
@@ -338,7 +365,6 @@ interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge: () => void; active?: boolean }) {
   const { addToast } = useToast()
-  const { setActive: setAgentActive } = useAgentActivity()
   const [check, setCheck] = useState<Check | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
@@ -353,9 +379,13 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const [error, setError] = useState('')
   const [loginRequired, setLoginRequired] = useState(false)
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>(FALLBACK_COMMANDS)
-  const [model, setModel] = useState<string>(DEFAULT_MODEL)
-  const [effort, setEffort] = useState<Effort>('normal')
-  const [thinking, setThinking] = useState(false)
+  const [models, setModels] = useState<AgentModelInfo[]>(FALLBACK_MODELS)
+  const [model, setModel] = useState<string>(() => loadPref(MODEL_PREF_KEY, 'default'))
+  const [effort, setEffort] = useState<string>(() => loadPref(EFFORT_PREF_KEY, 'default'))
+  const [permissionMode, setPermissionMode] = useState<ClaudeCodePermissionMode>(() => loadPermissionMode())
+  const [dangerConfirmOpen, setDangerConfirmOpen] = useState(false)
+  const [contextUsage, setContextUsage] = useState<CCUsage | null>(null)
+  const [thinking, setThinking] = useState<boolean>(() => loadPref(THINKING_PREF_KEY, 'false') === 'true')
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashDismissed, setSlashDismissed] = useState(false)
   const [contextMenu, setContextMenu] = useState<CtxMenu | null>(null)
@@ -429,12 +459,14 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     })
   }
 
-  // Publish start/stop only (not per event) so the topbar activity badge
-  // doesn't re-render on every streamed chunk.
-  useEffect(() => {
-    setAgentActive('claudecode', running)
-    return () => setAgentActive('claudecode', false)
-  }, [running, setAgentActive])
+  // Publish start/stop only (not per event) so the topbar activity badge and
+  // activity popover don't re-render on every streamed chunk.
+  useAgentTaskReporter('claudecode', {
+    running,
+    session,
+    title: session?.summary || session?.title,
+    failed: Boolean(error)
+  })
 
   async function loadSlashCommands() {
     try {
@@ -445,6 +477,22 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   }
 
   useEffect(() => { if (active) window.api.models.list().then(setOllamaModels) }, [active])
+
+  // Real model catalog from the main process (CLI caches + verified core list).
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
+    window.api.claudeCode.listModels()
+      .then((list) => { if (!cancelled && Array.isArray(list) && list.length > 0) setModels(list) })
+      .catch(() => { /* keep fallback */ })
+    return () => { cancelled = true }
+  }, [active])
+
+  // A restored preference that is absent from the fetched catalog is still
+  // shown (appended as a plain option) so restoration never lies.
+  useEffect(() => {
+    setModels((prev) => (model && !prev.some((m) => m.id === model) ? [...prev, { id: model, label: model }] : prev))
+  }, [model])
 
   useAutoSessionSummary(session, messages, ollamaModels[0], (sessionId, summary) => {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, summary } : s)))
@@ -525,6 +573,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     setRenderOffset(0)
     tokenTimestamps.current = []; setTokPerSec(0)
     setCheckpoints({})
+    setContextUsage(null)
   }, [session])
 
   // Persisted checkpoints for this session (created before past tasks), keyed
@@ -570,8 +619,12 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
       if (e.kind === 'text') { setOutput((o) => o + e.text); tokenTimestamps.current.push(Date.now()) }
       else if (e.kind === 'tool') setActivity((a) => [...a, { id: e.id, name: e.name, summary: e.summary }])
       else if (e.kind === 'tool-result') setActivity((a) => markLastPending(a, e.ok))
-      else if (e.kind === 'file_diff') setActivity((a) => attachDiff(a, e.toolCallId, { path: e.path, before: e.before, after: e.after }))
+      else if (e.kind === 'file_diff') {
+        setActivity((a) => attachDiff(a, e.toolCallId, { path: e.path, before: e.before, after: e.after }))
+        notifyPreviewFileChanged(props.project.id, e.path)
+      }
       else if (e.kind === 'system') setNote(e.summary)
+      else if (e.kind === 'usage') setContextUsage(e.usage)
       else if (e.kind === 'error') setError(e.message)
     })
     const offDone = window.api.claudeCode.onDone(async (d) => {
@@ -696,7 +749,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     setError(''); setLoginRequired(false); setRunning(true); setOutput(''); setActivity([]); setNote('')
     setInput('')
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: prompt, model: null, created_at: Date.now() }])
-    window.api.claudeCode.send({ sessionId: s.id, projectId: props.project.id, prompt, injectMemory, model, effort, thinking })
+    window.api.claudeCode.send({ sessionId: s.id, projectId: props.project.id, prompt, injectMemory, model: model === 'default' ? undefined : model, effort: effort === 'default' ? undefined : effort, thinking, permissionMode })
     setInjectMemory(false)
   }
 
@@ -711,7 +764,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     setSession(s)
     setError(''); setLoginRequired(false); setRunning(true); setOutput(''); setActivity([]); setNote('')
     setMessages((m) => [...m, { id: `tmp-${Date.now()}`, session_id: s!.id, role: 'user', content: detail.prompt, model: null, created_at: Date.now() }])
-    window.api.claudeCode.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, injectMemory: false, model, effort, thinking })
+    window.api.claudeCode.send({ sessionId: s.id, projectId: props.project.id, prompt: detail.prompt, injectMemory: false, model: model === 'default' ? undefined : model, effort: effort === 'default' ? undefined : effort, thinking, permissionMode })
   }
   handoffRef.current = (detail) => { void handoffSend(detail) }
 
@@ -814,8 +867,8 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const ccResend = useCallback((content: string, regenerateMessageId: string) => {
     if (!session || running || !check?.installed) return
     setError(''); setLoginRequired(false); setRunning(true); setOutput(''); setActivity([]); setNote('')
-    window.api.claudeCode.send({ sessionId: session.id, projectId: props.project.id, prompt: content, injectMemory: false, model, effort, thinking, regenerateMessageId })
-  }, [session, running, check, model, effort, thinking, props.project.id])
+    window.api.claudeCode.send({ sessionId: session.id, projectId: props.project.id, prompt: content, injectMemory: false, model: model === 'default' ? undefined : model, effort: effort === 'default' ? undefined : effort, thinking, permissionMode, regenerateMessageId })
+  }, [session, running, check, model, effort, thinking, permissionMode, props.project.id])
 
   const fetchCcMessages = useCallback((sid: string) => window.api.claudeCode.messages(sid), [])
 
@@ -907,9 +960,23 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   function selectSlash(cmd: SlashCommand) { executeSlash(cmd.name); textareaRef.current?.focus() }
   function setVoiceInput(value: string) { setInput(value); setSlashIndex(0); setSlashDismissed(false) }
 
-  const modelLabel = labelForModel(model)
+  function selectModel(id: string) { setModel(id); savePref(MODEL_PREF_KEY, id) }
+  function selectEffort(value: string) { setEffort(value); savePref(EFFORT_PREF_KEY, value) }
+  function toggleThinking() { setThinking((v) => { const next = !v; savePref(THINKING_PREF_KEY, String(next)); return next }) }
+  function applyPermissionMode(value: ClaudeCodePermissionMode) { setPermissionMode(value); savePref(PERMISSION_PREF_KEY, value) }
+  // Full access (bypassPermissions) is gated behind a confirm the first time,
+  // mirroring the Codex tab's danger-full-access overlay.
+  function selectPermissionMode(value: ClaudeCodePermissionMode) {
+    if (value === 'bypassPermissions' && permissionMode !== 'bypassPermissions') {
+      setDangerConfirmOpen(true)
+      return
+    }
+    applyPermissionMode(value)
+  }
+
+  const modelLabel = labelForModel(models, model)
   const contextStatus = running ? 'Running' : check?.installed ? 'Ready' : 'Checking'
-  const contextMode = `Claude Code · ${effort}${thinking ? ' · thinking' : ''}`
+  const contextMode = `Claude Code · ${PERMISSION_META[permissionMode].label} · ${effort}${thinking ? ' · thinking' : ''}`
 
   const ctxSession = contextMenu ? [...sessions, ...archivedSessions].find(s => s.id === contextMenu.sessionId) : null
   const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
@@ -963,12 +1030,19 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
         <div className="composer-bar">
           <div className="composer-bar-left">
             <button className="composer-icon-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>＋</button>
-            <div className="mode-pill-toggle" role="group" aria-label="Effort" data-testid="claude-code-effort-pill">
-              {EFFORTS.map((ef) => (
-                <button key={ef} className={effort === ef ? 'active' : ''} onClick={() => setEffort(ef)} disabled={running} title={`Effort: ${ef}${ef === 'normal' ? ' (default turn budget)' : ''}`} style={{ textTransform: 'capitalize' }}>{ef}</button>
+            <div className={`mode-pill-toggle claude-permission-toggle${permissionMode === 'bypassPermissions' ? ' danger' : ''}`} role="group" aria-label="Claude Code autonomy" data-testid="claude-code-permission" title="Autonomy for this task (--permission-mode)">
+              {PERMISSION_ORDER.map((m) => (
+                <button
+                  key={m}
+                  className={permissionMode === m ? 'active' : ''}
+                  data-testid={`claude-code-permission-${m}`}
+                  disabled={running}
+                  onClick={() => selectPermissionMode(m)}
+                  title={PERMISSION_META[m].title}
+                >{PERMISSION_META[m].label}</button>
               ))}
             </div>
-            <button className={`composer-text-toggle ${thinking ? 'on' : ''}`} onClick={() => setThinking((v) => !v)} disabled={running} title="Enable extended thinking for the next task">✦ Thinking{thinking ? ' on' : ''}</button>
+            <button className={`composer-text-toggle ${thinking ? 'on' : ''}`} onClick={toggleThinking} disabled={running} title="Enable extended thinking for the next task">✦ Thinking{thinking ? ' on' : ''}</button>
           </div>
           <div className="composer-bar-right">
             {running && tokPerSec > 0 && (
@@ -979,12 +1053,15 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
                 <span className="token-flow-label">{Math.round(tokPerSec)} tok/s</span>
               </div>
             )}
-            <div className="model-select model-picker-plain" title="Model passed to Claude Code (--model)">
-              <select value={model} onChange={(e) => setModel(e.target.value)} disabled={running}>
-                {MODELS.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-              </select>
-              <span className="model-select-chevron">⌄</span>
-            </div>
+            <ClaudeModelPicker
+              models={models}
+              model={model}
+              onModelChange={selectModel}
+              effort={effort}
+              onEffortChange={selectEffort}
+              disabled={running}
+            />
+            <ContextMeter testId="context-meter-claude-code" used={contextUsage?.used} total={contextUsage?.total} />
             <VoiceInputButton testId="voice-input-claude-code" value={input} onChange={setVoiceInput} disabled={running} label="Voice input for Claude Code" />
             {running
               ? <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn stop" onClick={stopRun} title="Stop Claude Code">Stop</button>
@@ -992,6 +1069,18 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
           </div>
         </div>
       </div>
+      {dangerConfirmOpen && (
+        <div className="codex-confirm-overlay" onPointerDown={() => setDangerConfirmOpen(false)}>
+          <div className="codex-confirm-dialog" role="alertdialog" aria-label="Confirm full access" onPointerDown={(e) => e.stopPropagation()}>
+            <h3>⚠ Enable full access?</h3>
+            <p className="muted">Claude Code will run every tool without gating, including terminal commands, with no approval step. Use only in folders you trust. Continue?</p>
+            <div className="codex-confirm-actions">
+              <button className="ghost" data-testid="claude-code-danger-cancel" onClick={() => setDangerConfirmOpen(false)}>Cancel</button>
+              <button className="danger" data-testid="claude-code-danger-enable" onClick={() => { applyPermissionMode('bypassPermissions'); setDangerConfirmOpen(false) }}>Enable</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   )
 
@@ -1046,7 +1135,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
           onRenameCancel={() => {}}
         />
         <section className="chat-main">
-          <AiContextBar testId="context-bar-claude-code" model={labelForModel(DEFAULT_MODEL)} mode="Claude Code" status="Project required" disabledReason="Open a project folder" />
+          <AiContextBar testId="context-bar-claude-code" model="Default" mode="Claude Code" status="Project required" disabledReason="Open a project folder" />
           <div className="empty center cc-setup" data-testid="claude-global-unavailable">
             <h2>Claude Code needs a project folder.</h2>
             <p className="muted">Claude Code needs a project folder. Open a project workspace to use it.</p>
@@ -1121,6 +1210,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
               </span>
               {emptyHeading}
             </h2>
+            <LivePreviewAffordance project={props.project} agent="claudecode" active={active} />
             {composerBlock}
           </div>
         ) : (
@@ -1137,7 +1227,9 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
               tone={running ? 'info' : check?.installed ? 'success' : 'warning'}
               running={running}
               detail={`${modelLabel} · ${effort}${thinking ? ' · thinking' : ''}`}
-            />
+            >
+              <LivePreviewAffordance project={props.project} agent="claudecode" active={active} />
+            </AgentStatusStrip>
 
             <div className="chat-scroll-shell">
             <div className="chat-scroll" ref={scrollRef}>

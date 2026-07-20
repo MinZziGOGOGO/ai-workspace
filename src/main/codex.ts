@@ -1,7 +1,9 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from 'child_process'
-import { existsSync, readdirSync } from 'fs'
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'fs'
 import { extname, join } from 'path'
 import { isE2EFakeEnabled } from './e2e'
+import { relativizeToProject } from './claudecode'
+import type { McpServerConfig } from './mcp'
 
 // Codex panel — drives the Codex CLI headless under the user's *ChatGPT*
 // subscription login (never API billing). Mirrors the Claude Code launcher
@@ -25,11 +27,22 @@ export interface CodexActivityEntry {
   ok?: boolean
 }
 
+// Real plan rate limits parsed from the CLI's rollout files
+// (~/.codex/sessions/**/rollout-*.jsonl, last token_count line):
+// primary = the weekly window, secondary = the 5-hour window when present.
+export interface CodexRateLimitWindow {
+  kind: 'primary' | 'secondary'
+  usedPercent: number
+  windowMinutes?: number
+  resetsAt?: number // unix seconds
+}
+export interface CodexPlanUsage { planType?: string; windows: CodexRateLimitWindow[] }
+
 export type CodexEvent =
   | { kind: 'system'; summary: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; name: string; summary: string }
-  | { kind: 'usage'; used: number }
+  | { kind: 'usage'; used: number; total?: number | null; plan?: CodexPlanUsage }
   | { kind: 'error'; message: string }
 
 export interface CodexCheck {
@@ -91,6 +104,27 @@ function executableExists(bin: string) {
 }
 function clip(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s
+}
+
+// Codex reports tool calls as an opaque arguments blob. Pull out the fields a
+// human actually scans for (paths relativized to the project, the command
+// line) and fall back to clipped JSON for everything else — mirrors
+// summarizeToolInput in claudecode.ts.
+function summarizeCodexToolArgs(args: unknown, projectPath: string): string {
+  if (args == null) return ''
+  let parsed: unknown = args
+  if (typeof args === 'string') {
+    try { parsed = JSON.parse(args) } catch { return clip(args, 140) }
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const o = parsed as Record<string, unknown>
+    const path = o.file_path ?? o.path ?? o.filename
+    if (typeof path === 'string' && path) return relativizeToProject(path, projectPath)
+    if (typeof o.command === 'string' && o.command) return clip(o.command, 140)
+    if (Array.isArray(o.command)) return clip(o.command.join(' '), 140)
+    if (typeof o.pattern === 'string' && o.pattern) return o.pattern
+  }
+  return clip(JSON.stringify(parsed), 140)
 }
 
 // ---- binary resolution -----------------------------------------------------
@@ -221,13 +255,112 @@ export function checkCodex(): Promise<CodexCheck> {
 }
 
 // ---- run -------------------------------------------------------------------
+// Read the CLI's own session rollout (jsonl transcript) for the given thread
+// and extract the last token_count record: model_context_window plus the
+// plan's rate-limit windows. Returns null when anything is missing/unreadable
+// — the meter simply shows the token count without a bar in that case.
+function parseCodexRollout(threadId: string): { total: number | null; plan?: CodexPlanUsage } | null {
+  try {
+    const home = process.env.USERPROFILE ?? process.env.HOME
+    if (!home) return null
+    const root = join(home, '.codex', 'sessions')
+    if (!existsSync(root)) return null
+    // Rollouts live under sessions/YYYY/MM/DD/rollout-*<threadId>.jsonl.
+    const candidates: { path: string; mtime: number }[] = []
+    const walk = (dir: string, depth: number) => {
+      if (depth > 3) return
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        const p = join(dir, e.name)
+        if (e.isDirectory()) walk(p, depth + 1)
+        else if (e.isFile() && e.name.startsWith('rollout-') && e.name.endsWith('.jsonl') && e.name.includes(threadId)) {
+          try {
+            candidates.push({ path: p, mtime: statSync(p).mtimeMs })
+          } catch {
+            /* vanished — skip */
+          }
+        }
+      }
+    }
+    walk(root, 0)
+    if (candidates.length === 0) return null
+    candidates.sort((a, b) => b.mtime - a.mtime)
+    const file = candidates[0].path
+    // token_count records are appended per turn — the tail is enough.
+    const size = statSync(file).size
+    const len = Math.min(size, 256 * 1024)
+    const buf = Buffer.alloc(len)
+    const fd = openSync(file, 'r')
+    try {
+      readSync(fd, buf, 0, len, size - len)
+    } finally {
+      closeSync(fd)
+    }
+    const lines = buf.toString('utf8').split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]
+      if (!line.includes('"type":"token_count"')) continue
+      try {
+        const parsed = JSON.parse(line)
+        const info = parsed?.info
+        const total =
+          info && typeof info.model_context_window === 'number' && info.model_context_window > 0
+            ? info.model_context_window
+            : null
+        const rl = parsed?.rate_limits
+        let plan: CodexPlanUsage | undefined
+        if (rl && typeof rl === 'object') {
+          const windows: CodexRateLimitWindow[] = []
+          for (const kind of ['primary', 'secondary'] as const) {
+            const w = rl[kind]
+            if (w && typeof w === 'object' && typeof w.used_percent === 'number') {
+              windows.push({
+                kind,
+                usedPercent: w.used_percent,
+                windowMinutes: typeof w.window_minutes === 'number' ? w.window_minutes : undefined,
+                resetsAt: typeof w.resets_at === 'number' ? w.resets_at : undefined,
+              })
+            }
+          }
+          plan = { planType: typeof rl.plan_type === 'string' ? rl.plan_type : undefined, windows }
+        }
+        return { total, plan }
+      } catch {
+        continue // truncated/partial line — try the previous one
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 export function runCodex(opts: {
   projectPath: string
   prompt: string
+  systemInstruction?: string
   sandbox?: CodexSandboxMode
   skipGitRepoCheck?: boolean
   model?: string
+  // Per-spawn reasoning effort, injected as a `-c model_reasoning_effort=…`
+  // TOML override (same mechanism as buildCodexMcpArgs). This intentionally
+  // overrides any global model_reasoning_effort in ~/.codex/config.toml for
+  // app-initiated runs so the picker value is deterministic.
+  effort?: string
+  // Per-spawn service tier: 'priority' injects `-c service_tier="priority"`
+  // (Codex fast mode). Anything else is the standard tier — no override.
+  speed?: string
   imagePaths?: string[]
+  // MCP servers to expose to this session, keyed by name. Codex has no
+  // --mcp-config file flag; instead each server is injected as ephemeral,
+  // per-spawn `-c mcp_servers.<name>.*` TOML overrides (see buildCodexMcpArgs).
+  // Built by the caller from the source-of-truth launch configs in mcp.ts.
+  mcpServers?: Record<string, McpServerConfig>
   onEvent: (e: CodexEvent) => void
   signal?: AbortSignal
   /** Thread id from a prior turn's `thread.started` event — resumes that Codex session instead of starting a fresh one. */
@@ -250,13 +383,26 @@ export function runCodex(opts: {
     const activity: CodexActivityEntry[] = [{ name: 'codex', summary: `sandbox: ${sandbox}`, ok: true }]
     opts.onEvent({ kind: 'tool', name: 'codex', summary: `sandbox: ${sandbox}` })
     fakeCodexRunCounter += 1
-    const text = `Fake Codex received: ${opts.prompt}\nFake Codex run #${fakeCodexRunCounter}\nsandbox=${sandbox} skipGitRepoCheck=${opts.skipGitRepoCheck === true}`
+    const text = `Fake Codex received: ${opts.prompt}\nFake Codex run #${fakeCodexRunCounter}\nsandbox=${sandbox} skipGitRepoCheck=${opts.skipGitRepoCheck === true} model=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} speed=${opts.speed ?? 'standard'}`
     opts.onEvent({ kind: 'text', text })
+    opts.onEvent({
+      kind: 'usage',
+      used: 169_800,
+      total: 258_400,
+      plan: {
+        planType: 'plus',
+        windows: [
+          { kind: 'secondary', usedPercent: 99, windowMinutes: 300, resetsAt: Math.floor(Date.now() / 1000) + 600 },
+          { kind: 'primary', usedPercent: 18, windowMinutes: 10_080, resetsAt: Math.floor(Date.now() / 1000) + 259_200 },
+        ],
+      },
+    })
     return Promise.resolve({ ok: true, result: text, activity })
   }
 
   return new Promise((resolve) => {
     const bin = resolveCodexBin()
+    const agentPrompt = opts.systemInstruction ? `${opts.prompt}\n\n${opts.systemInstruction}` : opts.prompt
     // Codex v0.139.0+ command format: codex exec --json -C <cwd> -s <sandbox> -m <model>
     // Prompt MUST be the last positional argument — never via stdin, including when -i flags are present.
     //
@@ -265,9 +411,23 @@ export function runCodex(opts: {
     // are in fact rejected by the `resume` subcommand).
     const args = opts.threadId ? ['exec', 'resume', opts.threadId, '--json'] : ['exec', '--json', '-C', opts.projectPath, '-s', sandbox]
     if (opts.model) args.push('-m', opts.model)
+    if (opts.effort) args.push('-c', `model_reasoning_effort=${tomlLiteral(opts.effort)}`)
+    // Approval policy: this app drives `codex exec` non-interactively, so there
+    // is no human to grant an escalation. Force `never` (Codex's own recommended
+    // value for non-interactive runs) so the model doesn't waste a turn asking
+    // for approval it can never receive — verified against the real binary that
+    // `on-request` under a read-only sandbox just burns a turn and still can't
+    // act. This does NOT loosen anything: the sandbox (`-s`) remains the sole
+    // real safety boundary; `never` only means "don't bother asking". The `-a`
+    // flag itself is rejected by `exec`, so this must go through `-c`.
+    args.push('-c', `approval_policy=${tomlLiteral('never')}`)
+    if (opts.speed === 'priority') args.push('-c', `service_tier=${tomlLiteral('priority')}`)
     if (opts.skipGitRepoCheck) args.push('--skip-git-repo-check')
+    // MCP servers as ephemeral `-c mcp_servers.*` overrides (Codex has no
+    // --mcp-config file flag). Additive on top of the user's ~/.codex/config.toml.
+    args.push(...buildCodexMcpArgs(opts.mcpServers))
     for (const imgPath of opts.imagePaths ?? []) args.push('-i', imgPath)
-    args.push(opts.prompt)
+    args.push(agentPrompt)
     const spawnSpec = buildSpawnArgs(bin, args)
     console.error(
       '[codex] spawning:',
@@ -332,7 +492,7 @@ export function runCodex(opts: {
             }
           } else if (item.type === 'tool_call') {
             const name = (item.name as string | undefined) ?? 'tool_call'
-            const summary = item.arguments != null ? clip(JSON.stringify(item.arguments), 140) : ''
+            const summary = summarizeCodexToolArgs(item.arguments, opts.projectPath)
             activity.push({ name, summary, ok: true })
             opts.onEvent({ kind: 'tool', name, summary })
           }
@@ -388,6 +548,16 @@ export function runCodex(opts: {
           streamedText = 'Codex finished without assistant output.'
           opts.onEvent({ kind: 'text', text: streamedText })
         }
+        // Final usage event with the real context window size + plan rate
+        // limits, read from the CLI's own rollout file for this thread.
+        if (threadId) {
+          const rollout = parseCodexRollout(threadId)
+          if (rollout) {
+            opts.onEvent({ kind: 'usage', used: usedTokens ?? 0, total: rollout.total, plan: rollout.plan })
+          } else if (usedTokens !== undefined) {
+            opts.onEvent({ kind: 'usage', used: usedTokens, total: null })
+          }
+        }
         finish({ ok: true, result: streamedText, activity, usedTokens, threadId })
       } else {
         const raw = (stderr || rawStdout).trim()
@@ -432,6 +602,41 @@ export function summarizeCodexRun(prompt: string, run: CodexRunResult): { title:
     title: `Codex: ${prompt.trim().slice(0, 56) || 'task'}`,
     content: lines.join('\n')
   }
+}
+
+// ---- MCP wiring ------------------------------------------------------------
+// Codex reads MCP servers from ~/.codex/config.toml ([mcp_servers.*]) or from
+// `-c` config overrides. There is no `--mcp-config <file>` flag. We inject the
+// bundled servers per-spawn via `-c mcp_servers.<name>.*` so nothing is written
+// to the user's persistent config. Each `-c` value is parsed by Codex as TOML.
+export function buildCodexMcpArgs(servers?: Record<string, McpServerConfig>): string[] {
+  if (!servers) return []
+  const out: string[] = []
+  for (const [name, cfg] of Object.entries(servers)) {
+    const base = `mcp_servers.${name}`
+    if (cfg.command) out.push('-c', `${base}.command=${tomlLiteral(cfg.command)}`)
+    if (cfg.args?.length) out.push('-c', `${base}.args=[${cfg.args.map(tomlLiteral).join(', ')}]`)
+    if (cfg.env && Object.keys(cfg.env).length > 0) {
+      const inline = Object.entries(cfg.env)
+        .map(([k, v]) => `${tomlBareKey(k)} = ${tomlLiteral(v)}`)
+        .join(', ')
+      out.push('-c', `${base}.env={ ${inline} }`)
+    }
+  }
+  return out
+}
+
+// TOML string value. Prefer a literal string (single quotes, no escape
+// processing) so Windows backslash paths survive verbatim; fall back to a basic
+// string only when the value itself contains a single quote.
+function tomlLiteral(s: string): string {
+  if (!s.includes("'") && !s.includes('\n')) return `'${s}'`
+  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"'
+}
+
+// Env var names are bare keys (A–Z, 0–9, _, -). Quote anything unexpected.
+function tomlBareKey(k: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(k) ? k : tomlLiteral(k)
 }
 
 function compareVersionsDesc(a: string, b: string): number {
