@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { SyntaxHighlighter, oneDark } from '../syntax'
 import anime, { stopMotion, prefersReducedMotion, type MotionHandle } from '../motion'
 
 // Shared rich-text renderer for assistant/agent messages across all three tabs
