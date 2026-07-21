@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { normalizeUrl } from '../src/main/browserPanel'
+import { isLocalPreviewUrl, normalizePreviewUrl } from '../src/main/browserPreview'
 import { clickScript, snapshotScript, typeScript } from '../src/main/browserAgentScript'
 import {
   BrowserApprovalService,
@@ -17,6 +18,8 @@ assert.equal(normalizeUrl(''), 'about:blank')
 assert.equal(normalizeUrl('example.com'), 'https://example.com')
 assert.equal(normalizeUrl('https://example.com/path'), 'https://example.com/path')
 assert.equal(normalizeUrl('localhost:5173/demo'), 'http://localhost:5173/demo')
+assert.equal(normalizeUrl('127.0.0.1:5174/demo'), 'http://127.0.0.1:5174/demo')
+assert.equal(normalizeUrl('[::1]:4173/demo'), 'http://[::1]:4173/demo')
 assert.equal(normalizeUrl('http://localhost:3000'), 'http://localhost:3000/')
 assert.equal(normalizeUrl('about:blank'), 'about:blank')
 assert.match(normalizeUrl('search words'), /^https:\/\/duckduckgo\.com\/\?q=search%20words$/)
@@ -25,6 +28,15 @@ assertThrowsMessage(() => normalizeUrl('file:///C:/secret.txt'), 'unsupported sc
 assertThrowsMessage(() => normalizeUrl('javascript:alert(1)'), 'unsupported scheme')
 assertThrowsMessage(() => normalizeUrl('data:text/html,hello'), 'unsupported scheme')
 assertThrowsMessage(() => normalizeUrl('about:config'), 'Only about:blank')
+
+assert.equal(normalizePreviewUrl('localhost:5173'), 'http://localhost:5173/')
+assert.equal(normalizePreviewUrl('http://127.0.0.1:3000/app'), 'http://127.0.0.1:3000/app')
+assert.equal(normalizePreviewUrl('http://[::1]:4173'), 'http://[::1]:4173/')
+assert.equal(isLocalPreviewUrl('https://localhost:5173'), true)
+assert.equal(isLocalPreviewUrl('http://127.0.0.2:5173'), false)
+assert.equal(isLocalPreviewUrl('http://192.168.1.2:5173'), false)
+assertThrowsMessage(() => normalizePreviewUrl('https://example.com'), 'blocks non-local URLs')
+assertThrowsMessage(() => normalizePreviewUrl('file:///C:/secret.txt'), 'only allows local HTTP or HTTPS')
 
 const snapshot = snapshotScript('snapshot-1')
 assert.match(snapshot, /data-aiw-snapshot-id/)
@@ -53,11 +65,11 @@ assert.equal(classifyBrowserTool('browser_scroll'), 'browser.interact')
 assert.equal(classifyBrowserTool('browser_type'), 'browser.type')
 assert.equal(isLoopbackUrl('http://localhost.test'), false)
 assert.equal(isLoopbackUrl('http://192.168.1.2'), false)
-assert.equal(browserRequiresApproval(3, 'browser.read'), false)
-assert.equal(browserRequiresApproval(3, 'browser.navigate.local'), false)
-assert.equal(browserRequiresApproval(3, 'browser.navigate.external'), true)
-assert.equal(browserRequiresApproval(3, 'browser.interact'), false)
-assert.equal(browserRequiresApproval(5, 'browser.sensitive'), true)
+assert.equal(browserRequiresApproval(3, 'browser.read', true), true)
+assert.equal(browserRequiresApproval(3, 'browser.navigate.local', true), false)
+assert.equal(browserRequiresApproval(3, 'browser.navigate.external', true), true)
+assert.equal(browserRequiresApproval(3, 'browser.interact', true), false)
+assert.equal(browserRequiresApproval(5, 'browser.sensitive', true), true)
 assert.equal(redactBrowserInput('super-secret', true), '[redacted 12 characters]')
 assert.equal(redactBrowserInput('hello', false), 'hello')
 
@@ -142,7 +154,7 @@ assert.deepEqual(order, ['one:start', 'one:end', 'two:start', 'two:end'])
 let concurrent = 0
 let peak = 0
 const readDraft = { ...draft, category: 'browser.read' as const, mutation: false }
-await Promise.all([1, 2].map(() => queueService.submit(identity, 3, readDraft, async () => {
+await Promise.all([1, 2].map(() => queueService.submit(identity, 4, readDraft, async () => {
   concurrent += 1
   peak = Math.max(peak, concurrent)
   await new Promise((resolve) => setTimeout(resolve, 10))

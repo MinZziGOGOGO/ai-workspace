@@ -16,6 +16,25 @@ async function panelRect(page: Page, panel: string): Promise<Rect> {
   }, panel)
 }
 
+/**
+ * WINDOW_DETACH_DESIGN.md §4.6: a detached panel gives up its dock slot
+ * outright — the pane is removed from the Allotment tree exactly as the header's
+ * Close button removes it, so there is no placeholder card left behind. The only
+ * main-window trace is the dot on the panel's topbar rack entry, which doubles
+ * as the secondary way back (the detached window's own header button is the
+ * primary one).
+ */
+async function expectPanelCollapsedWhileDetached(page: Page, panel: string) {
+  await expect(page.getByTestId(`workspace-panel-${panel}`)).toHaveCount(0)
+  await expect(page.locator(`.workspace-panel-head.panel-${panel}`)).toHaveCount(0)
+  await expect(page.getByTestId(`workspace-tool-${panel}-detached`)).toBeVisible()
+}
+
+async function expectPanelDockedAgain(page: Page, panel: string) {
+  await expect(page.getByTestId(`workspace-panel-${panel}`)).toBeVisible()
+  await expect(page.getByTestId(`workspace-tool-${panel}-detached`)).toHaveCount(0)
+}
+
 async function expectSingleContextBarWithinPanel(page: Page, panel: string, testId: string) {
   const panelLocator = page.getByTestId(`workspace-panel-${panel}`)
   const barLocator = panelLocator.getByTestId(testId)
@@ -3443,6 +3462,740 @@ test('Preview panel shows an empty state and loads a manually entered URL, isola
   } finally {
     await electronApp.close().catch(() => undefined)
     await new Promise<void>((resolve) => localPage.close(() => resolve()))
+  }
+})
+
+async function windowCount(electronApp: Awaited<ReturnType<typeof electron.launch>>): Promise<number> {
+  try {
+    return await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)
+  } catch {
+    return 0
+  }
+}
+
+test('dragging Browser beyond the main window detaches at the drop point, while re-entry keeps normal docking', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    const prepared = await electronApp.evaluate(({ BrowserWindow, screen }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      const area = screen.getPrimaryDisplay().workArea
+      const bounds = {
+        x: area.x + Math.min(160, Math.max(40, area.width - 760)),
+        y: area.y + 50,
+        width: Math.min(760, area.width - 80),
+        height: Math.min(620, area.height - 100),
+      }
+      win.setBounds(bounds)
+      return { id: win.id, bounds: win.getBounds() }
+    })
+    await expect.poll(() => page.evaluate(() => window.innerWidth)).toBeGreaterThan(600)
+
+    await page.getByTestId('workspace-tool-browser').click()
+    await page.getByTestId('workspace-tool-knowledge').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+    await expect(page.getByTestId('workspace-panel-knowledge')).toBeVisible()
+
+    // First cross the native boundary, then return before release. Detach
+    // feedback must clear and the original local docking resolver must win.
+    let browserHeader = await page.locator('.workspace-panel-head.panel-browser').boundingBox()
+    let knowledgeBox = await page.getByTestId('workspace-panel-knowledge').boundingBox()
+    if (!browserHeader || !knowledgeBox) throw new Error('Missing drag-to-detach geometry')
+    await page.mouse.move(browserHeader.x + browserHeader.width / 2, browserHeader.y + browserHeader.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, browserHeader.y + browserHeader.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toBeVisible()
+    await expect(page.locator('.snap-highlight, .local-drop-highlight')).toHaveCount(0)
+    await page.mouse.move(knowledgeBox.x + knowledgeBox.width - 40, knowledgeBox.y + knowledgeBox.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toHaveCount(0)
+    await page.mouse.up()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+    await expectPanelDockedAgain(page, 'browser')
+
+    const docked = await page.evaluate(() => {
+      const browser = document.querySelector('[data-testid="workspace-panel-browser"]')?.getBoundingClientRect()
+      const knowledge = document.querySelector('[data-testid="workspace-panel-knowledge"]')?.getBoundingClientRect()
+      if (!browser || !knowledge) return null
+      return {
+        browser: { x: browser.x, y: browser.y },
+        knowledge: { x: knowledge.x, y: knowledge.y },
+      }
+    })
+    expect(docked).not.toBeNull()
+    expect(Math.abs(docked!.browser.y - docked!.knowledge.y)).toBeLessThan(8)
+    expect(Math.abs(docked!.browser.x - docked!.knowledge.x)).toBeGreaterThan(100)
+
+    // Repeat the same gesture and release outside. The indicator records the
+    // exact final OS screen point used by main-process placement.
+    browserHeader = await page.locator('.workspace-panel-head.panel-browser').boundingBox()
+    if (!browserHeader) throw new Error('Missing Browser header after re-dock')
+    // §4.6: the freed slot must actually reflow into the surviving panel.
+    const knowledgeWidthBeforeDetach = (await panelRect(page, 'knowledge')).width
+    await page.mouse.move(browserHeader.x + browserHeader.width / 2, browserHeader.y + browserHeader.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, browserHeader.y + browserHeader.height / 2, { steps: 12 })
+    const indicator = page.getByTestId('workspace-drag-detach-indicator')
+    await expect(indicator).toBeVisible()
+    const dropPoint = {
+      x: Number(await indicator.getAttribute('data-screen-x')),
+      y: Number(await indicator.getAttribute('data-screen-y')),
+    }
+
+    const detachedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const detachedPage = await detachedWindowPromise
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-browser')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'browser')
+    // Knowledge, the only panel left docked, absorbs the whole freed slot.
+    await expect.poll(async () => (await panelRect(page, 'knowledge')).width)
+      .toBeGreaterThan(knowledgeWidthBeforeDetach + 100)
+
+    const placement = await electronApp.evaluate(({ BrowserWindow, screen }, args) => {
+      const detached = BrowserWindow.getAllWindows().find(win => win.id !== args.mainWindowId)
+      if (!detached) return null
+      const display = screen.getDisplayNearestPoint(args.dropPoint)
+      const area = display.workArea
+      const width = 1000
+      const height = 700
+      return {
+        actual: detached.getBounds(),
+        expected: {
+          x: Math.min(Math.max(args.dropPoint.x - 80, area.x), area.x + Math.max(0, area.width - width)),
+          y: Math.min(Math.max(args.dropPoint.y - 18, area.y), area.y + Math.max(0, area.height - height)),
+        },
+      }
+    }, { mainWindowId: prepared.id, dropPoint })
+    expect(placement).not.toBeNull()
+    // Windows can round native frame placement by one physical pixel.
+    expect(Math.abs(placement!.actual.x - placement!.expected.x)).toBeLessThanOrEqual(1)
+    expect(Math.abs(placement!.actual.y - placement!.expected.y)).toBeLessThanOrEqual(1)
+
+    await detachedPage.close()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+    // Closing the detached window re-opens the dock slot; Knowledge gives the
+    // space back.
+    await expectPanelDockedAgain(page, 'browser')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('dragging Preview beyond the main window uses the same detach gesture', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await electronApp.evaluate(({ BrowserWindow, screen }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      const area = screen.getPrimaryDisplay().workArea
+      win.setBounds({
+        x: area.x + Math.min(160, Math.max(40, area.width - 760)),
+        y: area.y + 50,
+        width: Math.min(760, area.width - 80),
+        height: Math.min(620, area.height - 100),
+      })
+    })
+    await expect.poll(() => page.evaluate(() => window.innerWidth)).toBeGreaterThan(600)
+
+    await page.getByTestId('workspace-tool-preview').click()
+    const previewPanel = page.getByTestId('workspace-panel-preview')
+    await expect(previewPanel).toBeVisible()
+    const header = await page.locator('.workspace-panel-head.panel-preview').boundingBox()
+    if (!header) throw new Error('Missing Preview drag geometry')
+
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Preview')
+
+    const detachedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const detachedPage = await detachedWindowPromise
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-preview')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'preview')
+
+    await detachedPage.close()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+    await expectPanelDockedAgain(page, 'preview')
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Claude Code detaches by button, keeps its session and draft, and owns approval cards until brought back', async ({}, testInfo) => {
+  const controlPort = 18980
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CLAUDE_CODE: '1',
+    E2E_FAKE_CLAUDE_CODE_DELAY_MS: '1200',
+    E2E_FAKE_OLLAMA: '1',
+    E2E_BROWSER_CONTROL: '1',
+    AIWORKSPACE_BROWSER_CONTROL_PORT: String(controlPort),
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    const project = await createAndSelectProject(page, testInfo, 'Detached Claude Code Project')
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await expect(claudePanel).toBeVisible()
+
+    await page.getByTestId('claude-code-composer').fill('Keep this transcript through detach')
+    await page.getByTestId('claude-code-send').click()
+    await expect(claudePanel).toContainText('Fake Claude Code session started')
+    await page.getByTestId('claude-code-composer').fill('Unsent draft survives ownership transfer')
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('claude-code-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-claudecode')).toBeVisible()
+    await expect(detachedPage.getByTestId('detached-claude-code-shell')).toBeVisible()
+    await expect(detachedPage.getByText('Fake Claude Code completed: Keep this transcript through detach').first()).toBeVisible()
+    await expect(detachedPage.getByTestId('claude-code-composer')).toHaveValue('Unsent draft survives ownership transfer')
+    await expectPanelCollapsedWhileDetached(page, 'claudecode')
+    await expect(page.getByTestId('claude-code-composer')).toHaveCount(0)
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    const controlToken = (await page.evaluate(() => window.api.mcp.getBrowserServerConfig()))
+      .env!.AIWORKSPACE_BROWSER_CONTROL_TOKEN
+    const headers = {
+      'x-aiw-agent-id': 'claudecode',
+      'x-aiw-agent-name': 'Claude Code',
+      'x-aiw-identity-source': 'app-launch',
+      'x-aiw-control-token': controlToken,
+    }
+    await expect.poll(async () => {
+      try { return (await fetch(`http://127.0.0.1:${controlPort}/__ready`, { headers })).status } catch { return 0 }
+    }).toBe(404)
+    const approvalRequest = fetch(`http://127.0.0.1:${controlPort}/browser/state`, { headers })
+    await expect(detachedPage.getByTestId('browser-approval-card')).toBeVisible()
+    await expect(detachedPage.getByTestId('browser-approval-card')).toContainText('Claude Code')
+    await expect(page.getByTestId('browser-approval-card')).toHaveCount(0)
+    await detachedPage.getByTestId('browser-approval-deny').click()
+    expect((await approvalRequest).status).toBe(403)
+
+    // Bring it back from the main window's only remaining affordance: the rack
+    // entry that carries the detached dot.
+    await page.getByTestId('workspace-tool-claudecode').click()
+    await expectPanelDockedAgain(page, 'claudecode')
+    await expect(claudePanel).toContainText('Fake Claude Code completed: Keep this transcript through detach')
+    await expect(claudePanel.getByTestId('claude-code-composer')).toHaveValue('Unsent draft survives ownership transfer')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+
+    const sessions = await page.evaluate((projectId) => window.api.sessions.list(projectId, 'claudecode'), project.id)
+    expect(sessions.some((session) => session.title.includes('Keep this transcript'))).toBe(true)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Claude Code uses the shared drag-out gesture and closing its detached window reattaches intact state', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CLAUDE_CODE: '1',
+    E2E_FAKE_OLLAMA: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await electronApp.evaluate(({ BrowserWindow, screen }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      const area = screen.getPrimaryDisplay().workArea
+      win.setBounds({
+        x: area.x + Math.min(160, Math.max(40, area.width - 760)),
+        y: area.y + 50,
+        width: Math.min(760, area.width - 80),
+        height: Math.min(620, area.height - 100),
+      })
+    })
+    await createAndSelectProject(page, testInfo, 'Claude Code Drag Detach Project')
+    await page.getByTestId('workspace-tool-claudecode').click()
+    const claudePanel = page.getByTestId('workspace-panel-claudecode')
+    await page.getByTestId('claude-code-composer').fill('Drag detach keeps this run')
+    await page.getByTestId('claude-code-send').click()
+    await expect(claudePanel).toContainText('Fake Claude Code completed: Drag detach keeps this run')
+
+    const header = await page.locator('.workspace-panel-head.panel-claudecode').boundingBox()
+    if (!header) throw new Error('Missing Claude Code drag geometry')
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Claude Code')
+
+    const detachedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const detachedPage = await detachedWindowPromise
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-claudecode')).toBeVisible()
+    await expect(detachedPage.getByText('Fake Claude Code completed: Drag detach keeps this run').first()).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'claudecode')
+
+    await detachedPage.close()
+    await expectPanelDockedAgain(page, 'claudecode')
+    await expect(claudePanel).toContainText('Fake Claude Code completed: Drag detach keeps this run')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+// Step 4: the same detach contract as the Claude Code pilot, per agent tab.
+// Hermes is the one case where an *unanswered ACP permission request* has to
+// survive the ownership transfer — the request lives in the main process, so a
+// renderer-only card would leave it pending with nothing able to answer it.
+test('Hermes detaches by button, carries a pending ACP permission request across, and reattaches intact', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_HERMES: '1',
+    E2E_FAKE_OLLAMA: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await createAndSelectProject(page, testInfo, 'Detached Hermes Project')
+    await page.getByTestId('workspace-tool-hermes').click()
+    const hermesPanel = page.getByTestId('workspace-panel-hermes')
+    await expect(hermesPanel).toBeVisible()
+    await page.getByTestId('hermes-permission-mode').selectOption('1')
+
+    // Start a turn that blocks on a permission request, then detach mid-approval.
+    await page.getByTestId('hermes-composer').fill('keep this approval through detach')
+    await page.getByTestId('hermes-send').click()
+    await expect(page.getByTestId('hermes-permission-card')).toBeVisible()
+    await page.getByTestId('hermes-composer').fill('Unsent Hermes draft survives detach')
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('hermes-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-hermes')).toBeVisible()
+    await expect(detachedPage.getByTestId('detached-hermes-shell')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'hermes')
+    await expect(page.getByTestId('hermes-composer')).toHaveCount(0)
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    // The still-pending ACP request is replayed into the new owner, the draft
+    // came with it, and the permission mode (main-owned) is unchanged.
+    await expect(detachedPage.getByTestId('hermes-permission-card')).toContainText('Run command `npm test`')
+    await expect(detachedPage.getByTestId('hermes-composer')).toHaveValue('Unsent Hermes draft survives detach')
+    await expect(detachedPage.getByTestId('hermes-permission-mode')).toHaveValue('1')
+
+    // Answering in the detached window drives the real main-process gate.
+    await detachedPage.getByTestId('hermes-permission-allow-once').click()
+    await expect(detachedPage.getByTestId('hermes-permission-card')).toHaveCount(0)
+    await expect(detachedPage.getByTestId('detached-hermes-shell'))
+      .toContainText('Fake Hermes approved and completed: keep this approval through detach')
+
+    // Primary way back: the detached window's own header button.
+    await detachedPage.getByTestId('hermes-dock-back').click()
+    await expectPanelDockedAgain(page, 'hermes')
+    await expect(hermesPanel).toContainText('Fake Hermes approved and completed: keep this approval through detach')
+    await expect(hermesPanel.getByTestId('hermes-composer')).toHaveValue('Unsent Hermes draft survives detach')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Hermes uses the shared drag-out gesture and closing its detached window reattaches it', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_HERMES: '1',
+    E2E_FAKE_OLLAMA: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await electronApp.evaluate(({ BrowserWindow, screen }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      const area = screen.getPrimaryDisplay().workArea
+      win.setBounds({
+        x: area.x + Math.min(160, Math.max(40, area.width - 760)),
+        y: area.y + 50,
+        width: Math.min(760, area.width - 80),
+        height: Math.min(620, area.height - 100),
+      })
+    })
+    await createAndSelectProject(page, testInfo, 'Hermes Drag Detach Project')
+    await page.getByTestId('workspace-tool-hermes').click()
+    const hermesPanel = page.getByTestId('workspace-panel-hermes')
+    await expect(hermesPanel).toBeVisible()
+
+    const header = await page.locator('.workspace-panel-head.panel-hermes').boundingBox()
+    if (!header) throw new Error('Missing Hermes drag geometry')
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Hermes')
+
+    const detachedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const detachedPage = await detachedWindowPromise
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-hermes')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'hermes')
+
+    await detachedPage.close()
+    await expectPanelDockedAgain(page, 'hermes')
+    await expect(hermesPanel.getByTestId('hermes-composer')).toBeVisible()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+// Codex has no interactive approval card to route: its CLI is spawned with
+// `approval_policy=never` and the sandbox mode is the sole gate, so the detach
+// contract here is about the transcript, the draft, and the sandbox control
+// re-defaulting to the most restrictive mode in the new window.
+test('Codex detaches by button and drag, keeps its transcript and draft, and never widens its sandbox across the move', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_CODEX: '1',
+    E2E_FAKE_OLLAMA: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await createAndSelectProject(page, testInfo, 'Detached Codex Project')
+    await page.getByTestId('workspace-tool-codex').click()
+    const codexPanel = page.getByTestId('workspace-panel-codex')
+    await expect(codexPanel).toBeVisible()
+
+    // Widen the sandbox before detaching so the assertion below is meaningful.
+    await page.getByTestId('codex-sandbox-workspace-write').click()
+    await page.getByTestId('codex-composer').fill('Keep this Codex transcript through detach')
+    await page.getByTestId('codex-send').click()
+    await expect(codexPanel).toContainText('Fake Codex received: Keep this Codex transcript through detach')
+    await page.getByTestId('codex-composer').fill('Unsent Codex draft survives detach')
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('codex-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-codex')).toBeVisible()
+    await expect(detachedPage.getByTestId('detached-codex-shell')).toBeVisible()
+    await expect(detachedPage.getByText('Fake Codex received: Keep this Codex transcript through detach').first()).toBeVisible()
+    await expect(detachedPage.getByTestId('codex-composer')).toHaveValue('Unsent Codex draft survives detach')
+    await expectPanelCollapsedWhileDetached(page, 'codex')
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    // The sandbox control is renderer-local and intentionally not carried over:
+    // a fresh owner starts read-only rather than silently inheriting a wider
+    // sandbox the user granted in another window.
+    await expect(detachedPage.getByTestId('codex-sandbox-read-only')).toHaveClass(/active/)
+
+    await detachedPage.getByTestId('codex-dock-back').click()
+    await expectPanelDockedAgain(page, 'codex')
+    await expect(codexPanel).toContainText('Fake Codex received: Keep this Codex transcript through detach')
+    await expect(codexPanel.getByTestId('codex-composer')).toHaveValue('Unsent Codex draft survives detach')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+
+    // Same panel, now via the Step 2 drag gesture, released back by closing the window.
+    const header = await page.locator('.workspace-panel-head.panel-codex').boundingBox()
+    if (!header) throw new Error('Missing Codex drag geometry')
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Codex')
+    const draggedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const draggedPage = await draggedWindowPromise
+    await draggedPage.waitForLoadState('domcontentloaded')
+    await expect(draggedPage.getByTestId('detached-panel-codex')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'codex')
+    await draggedPage.close()
+    await expectPanelDockedAgain(page, 'codex')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+// Kimi layers this app's 5-tier permission scheme on top of its own native ACP
+// session mode (default/plan). Both live in the main process, so the detached
+// window must read back the same selection — and, like Hermes, a still-pending
+// ACP permission request has to be answerable in whichever window now owns the tab.
+test('Kimi detaches by button and drag, preserving both permission layers and a pending ACP request', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, {
+    E2E_FAKE_KIMI: '1',
+    E2E_FAKE_OLLAMA: '1',
+  })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await createAndSelectProject(page, testInfo, 'Detached Kimi Project')
+    await page.getByTestId('workspace-tool-kimi').click()
+    const kimiPanel = page.getByTestId('workspace-panel-kimi')
+    await expect(kimiPanel).toBeVisible()
+    await expect(page.getByTestId('kimi-composer')).toBeVisible({ timeout: 10_000 })
+
+    // Native ACP plan mode first, to prove the native layer round-trips too.
+    await page.getByTestId('kimi-permission-mode').selectOption('plan')
+    await expect(page.getByTestId('kimi-permission-mode')).toHaveValue('plan')
+    const [planWindow] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('kimi-detach').click(),
+    ])
+    await planWindow.waitForLoadState('domcontentloaded')
+    await expect(planWindow.getByTestId('detached-kimi-shell')).toBeVisible()
+    await expect(planWindow.getByTestId('kimi-permission-mode')).toHaveValue('plan')
+    await expectPanelCollapsedWhileDetached(page, 'kimi')
+    await planWindow.getByTestId('kimi-dock-back').click()
+    await expectPanelDockedAgain(page, 'kimi')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+
+    // Now the app's own tier, with a turn parked on an unanswered approval.
+    await page.getByTestId('kimi-permission-mode').selectOption('1')
+    await expect(page.getByTestId('kimi-permission-mode')).toHaveValue('1')
+    await page.getByTestId('kimi-composer').fill('keep this Kimi approval through detach')
+    await page.getByTestId('kimi-send').click()
+    await expect(page.getByTestId('kimi-permission-card')).toBeVisible()
+    await page.getByTestId('kimi-composer').fill('Unsent Kimi draft survives detach')
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('kimi-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-kimi')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'kimi')
+    await expect(detachedPage.getByTestId('kimi-permission-mode')).toHaveValue('1')
+    await expect(detachedPage.getByTestId('kimi-permission-card')).toContainText('Run command `npm test`')
+    await expect(detachedPage.getByTestId('kimi-composer')).toHaveValue('Unsent Kimi draft survives detach')
+
+    await detachedPage.getByTestId('kimi-permission-allow-once').click()
+    await expect(detachedPage.getByTestId('kimi-permission-card')).toHaveCount(0)
+    await expect(detachedPage.getByTestId('detached-kimi-shell'))
+      .toContainText('Fake Kimi approved and completed: keep this Kimi approval through detach')
+
+    // Closing the detached window is the other release path (§4.2).
+    await detachedPage.close()
+    await expectPanelDockedAgain(page, 'kimi')
+    await expect(kimiPanel).toContainText('Fake Kimi approved and completed: keep this Kimi approval through detach')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+
+    // And the Step 2 drag gesture reaches this header too.
+    const header = await page.locator('.workspace-panel-head.panel-kimi').boundingBox()
+    if (!header) throw new Error('Missing Kimi drag geometry')
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Kimi')
+    const draggedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const draggedPage = await draggedWindowPromise
+    await draggedPage.waitForLoadState('domcontentloaded')
+    await expect(draggedPage.getByTestId('detached-panel-kimi')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'kimi')
+    await draggedPage.close()
+    await expectPanelDockedAgain(page, 'kimi')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+// Chat is the one detachable tab with no agent identity: it talks to a model
+// directly, has no MCP client and no tool access, so it can never raise a
+// Browser approval. Its detached window therefore mounts no ApprovalCenter at
+// all — asserted here so the simpler shape stays deliberate rather than drifting.
+test('Chat detaches by button and drag with no approval surface, keeping its conversation and draft', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo, { E2E_FAKE_OLLAMA: '1' })
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await createAndSelectProject(page, testInfo, 'Detached Chat Project')
+    await page.getByTestId('workspace-tool-chat').click()
+    const chatPanel = page.getByTestId('workspace-panel-chat')
+    await expect(chatPanel).toBeVisible()
+
+    await page.getByTestId('chat-composer').fill('Keep this conversation through detach')
+    await page.getByTestId('chat-send').click()
+    await expect(chatPanel).toContainText('Fake Chat response: Keep this conversation through detach')
+    await page.getByTestId('chat-composer').fill('Unsent chat draft survives detach')
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      page.getByTestId('chat-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-chat')).toBeVisible()
+    await expect(detachedPage.getByTestId('detached-chat-shell')).toBeVisible()
+    await expect(detachedPage.getByText('Fake Chat response: Keep this conversation through detach').first()).toBeVisible()
+    await expect(detachedPage.getByTestId('chat-composer')).toHaveValue('Unsent chat draft survives detach')
+    await expectPanelCollapsedWhileDetached(page, 'chat')
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    // No approval surface is mounted in a detached Chat window.
+    await expect(detachedPage.getByTestId('approval-overlay')).toHaveCount(0)
+
+    // The detached window keeps talking to the model on its own.
+    await detachedPage.getByTestId('chat-composer').fill('Detached chat still answers')
+    await detachedPage.getByTestId('chat-send').click()
+    await expect(detachedPage.getByText('Fake Chat response: Detached chat still answers').first()).toBeVisible()
+
+    // Bring it back from the main window's rack entry (the detached dot doubles
+    // as the click target), not from a placeholder card.
+    await page.getByTestId('workspace-tool-chat').click()
+    await expectPanelDockedAgain(page, 'chat')
+    await expect(chatPanel).toContainText('Fake Chat response: Detached chat still answers')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+
+    const header = await page.locator('.workspace-panel-head.panel-chat').boundingBox()
+    if (!header) throw new Error('Missing Chat drag geometry')
+    await page.mouse.move(header.x + header.width / 2, header.y + header.height / 2)
+    await page.mouse.down()
+    await page.waitForTimeout(50)
+    await page.mouse.move(-32, header.y + header.height / 2, { steps: 12 })
+    await expect(page.getByTestId('workspace-drag-detach-indicator')).toContainText('Chat')
+    const draggedWindowPromise = electronApp.waitForEvent('window')
+    await page.mouse.up()
+    const draggedPage = await draggedWindowPromise
+    await draggedPage.waitForLoadState('domcontentloaded')
+    await expect(draggedPage.getByTestId('detached-panel-chat')).toBeVisible()
+    await expectPanelCollapsedWhileDetached(page, 'chat')
+    await draggedPage.close()
+    await expectPanelDockedAgain(page, 'chat')
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Browser panel detaches to its own OS window and reattaches when that window is closed', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await expect(page.getByTestId('workspace-shell')).toBeVisible()
+
+    await page.getByTestId('workspace-tool-browser').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+    await expect.poll(() => browserPanel.getByTestId('browser-tab').count()).toBeGreaterThanOrEqual(1)
+    expect(await windowCount(electronApp)).toBe(1)
+
+    // Detach: a real, separate top-level BrowserWindow opens (verified via
+    // Electron's own window registry, not just a Playwright Page handle), and
+    // the main window collapses the panel's dock slot away entirely.
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      browserPanel.getByTestId('browser-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-browser')).toBeVisible()
+    await expect(detachedPage.getByTestId('browser-tabbar')).toBeVisible()
+    await expect(detachedPage.getByTestId('browser-dock-back')).toBeVisible()
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    await expectPanelCollapsedWhileDetached(page, 'browser')
+    await expect(page.getByTestId('browser-tabbar')).toHaveCount(0)
+    // Nothing is left behind in the dock — no ghost card offering a way back.
+    await expect(page.getByText('is open in another window')).toHaveCount(0)
+
+    // Closing the detached window's own titlebar (its OS close button) moves
+    // the panel back into the main window automatically — no orphan window,
+    // no dead end for the user.
+    await detachedPage.close()
+    await expectPanelDockedAgain(page, 'browser')
+    await expect(browserPanel.getByTestId('browser-tabbar')).toBeVisible()
+    await expect.poll(() => browserPanel.getByTestId('browser-tab').count()).toBeGreaterThanOrEqual(1)
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Browser panel docks back from its detached window without needing that window closed first', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-browser').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      browserPanel.getByTestId('browser-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expectPanelCollapsedWhileDetached(page, 'browser')
+
+    // The detached window's own header button is the primary way back.
+    await detachedPage.getByTestId('browser-dock-back').click()
+    await expectPanelDockedAgain(page, 'browser')
+    await expect(browserPanel.getByTestId('browser-tabbar')).toBeVisible()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Preview panel detaches to its own OS window and reattaches when that window is closed', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-preview').click()
+    const previewPanel = page.getByTestId('workspace-panel-preview')
+    await expect(previewPanel).toBeVisible()
+    await expect(previewPanel.getByTestId('preview-url-input')).toBeVisible()
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      previewPanel.getByTestId('preview-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect(detachedPage.getByTestId('detached-panel-preview')).toBeVisible()
+    await expect(detachedPage.getByTestId('preview-url-input')).toBeVisible()
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    await expectPanelCollapsedWhileDetached(page, 'preview')
+    await expect(page.getByTestId('preview-url-input')).toHaveCount(0)
+
+    await detachedPage.close()
+    await expectPanelDockedAgain(page, 'preview')
+    await expect(previewPanel.getByTestId('preview-url-input')).toBeVisible()
+    await expect.poll(() => windowCount(electronApp)).toBe(1)
+  } finally {
+    await electronApp.close().catch(() => undefined)
+  }
+})
+
+test('Closing the main window while the Browser panel is detached also closes the detached window, leaving no orphan', async ({}, testInfo) => {
+  const electronApp = await launchSmokeApp(testInfo)
+  try {
+    const page = await electronApp.firstWindow()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('workspace-tool-browser').click()
+    const browserPanel = page.getByTestId('workspace-panel-browser')
+    await expect(browserPanel).toBeVisible()
+
+    const [detachedPage] = await Promise.all([
+      electronApp.waitForEvent('window'),
+      browserPanel.getByTestId('browser-detach').click(),
+    ])
+    await detachedPage.waitForLoadState('domcontentloaded')
+    await expect.poll(() => windowCount(electronApp)).toBe(2)
+
+    await page.close()
+    await expect.poll(() => windowCount(electronApp), { timeout: 15_000 }).toBe(0)
+  } finally {
+    await electronApp.close().catch(() => undefined)
   }
 })
 
