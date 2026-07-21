@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Project, Session, Message, KimiCheck, KimiActivity, KimiConfigSelect, KimiEvent, KimiCommand, KimiPlanEntry, KimiPermissionMode, KimiPermissionRequestInfo, KimiAuthMethod, KimiAuthStatus, KimiLoginEvent, AgentModelInfo } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
+import { useComposerDraft } from '../hooks/useComposerDraft'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
@@ -81,6 +82,9 @@ const PLAN_MODE_VALUE = 'plan'
 const PLAN_MODE_DESCRIPTION = 'Read-only planning — Kimi maps out an approach and never edits files or runs commands until you switch to an autonomy tier.'
 const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.kimi.pinned'
+// Which session this tab was last looking at, per project — shared across the
+// app's windows so a detached KimiTab remounts on the same session.
+const SELECTED_SESSION_KEY_PREFIX = 'aiworkspace.kimi.selected-session.'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
 }
@@ -405,7 +409,7 @@ export default function KimiTab(props: { project: Project; active?: boolean }) {
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
+  const [input, setInput] = useComposerDraft('aiworkspace.kimi.draft', session?.id)
   const [injectMemory, setInjectMemory] = useState(false)
   const [running, setRunning] = useState(false)
   const [streamText, setStreamText] = useState('')
@@ -450,6 +454,12 @@ export default function KimiTab(props: { project: Project; active?: boolean }) {
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const checkRef = useRef<KimiCheck | null>(null)
   const pendingPermissionsRef = useRef<Map<string, KimiPermissionRequestInfo>>(new Map())
+  // Replaying the live log must not re-fire an OS notification for a request the
+  // previous owner already announced.
+  const notifiedPermissionsRef = useRef<Set<string>>(new Set())
+  // Highest replay sequence already applied, so a detach handover can overlap
+  // the replayed log with the live stream without double-applying an event.
+  const lastLiveSequenceRef = useRef(0)
   checkRef.current = check
 
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
@@ -634,9 +644,28 @@ export default function KimiTab(props: { project: Project; active?: boolean }) {
   }, [isGlobalWorkspace, active])
   useEffect(() => {
     if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
-    window.api.sessions.list(props.project.id, 'kimi').then(setSessions)
-    window.api.sessions.listArchived(props.project.id, 'kimi').then(setArchivedSessions)
+    let disposed = false
+    void Promise.all([
+      window.api.sessions.list(props.project.id, 'kimi'),
+      window.api.sessions.listArchived(props.project.id, 'kimi'),
+      window.api.kimi.liveState(props.project.id),
+    ]).then(([nextSessions, nextArchived, live]) => {
+      if (disposed) return
+      setSessions(nextSessions)
+      setArchivedSessions(nextArchived)
+      let storedId: string | null = null
+      try { storedId = localStorage.getItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`) } catch { /* storage unavailable */ }
+      const desiredId = live?.sessionId ?? storedId
+      const next = desiredId ? [...nextSessions, ...nextArchived].find((candidate) => candidate.id === desiredId) ?? null : null
+      if (next?.id !== sessionRef.current?.id) setSession(next)
+    })
+    return () => { disposed = true }
   }, [props.project.id, isGlobalWorkspace, active])
+
+  useEffect(() => {
+    if (!session?.id) return
+    try { localStorage.setItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`, session.id) } catch { /* storage unavailable */ }
+  }, [props.project.id, session?.id])
   useEffect(() => {
     if (isGlobalWorkspace || !active) return
     window.api.kimi.getPermissionMode().then(setPermissionMode)
@@ -718,27 +747,59 @@ export default function KimiTab(props: { project: Project; active?: boolean }) {
     setRenderOffset(0)
   }, [session])
 
-  useEffect(() => {
-    const offEvent = window.api.kimi.onEvent((d) => {
-      const e: KimiEvent = d.event
-      const isCurrentSession = d.sessionId === sessionRef.current?.id
-      if (!isCurrentSession && e.kind !== 'permissionRequest') return
-      if (e.kind === 'text') { setStreamText((t) => t + e.text); appendLiveText(e.text) }
-      else if (e.kind === 'thought') setThoughtText((t) => t + e.text)
-      else if (e.kind === 'activity') { setActivity((a) => [...a, e.activity]); appendLiveActivity(e.activity) }
-      else if (e.kind === 'error') setError(e.message)
-      else if (e.kind === 'model') setKimiModel(e.name)
-      else if (e.kind === 'configOptions') setConfigSelects(e.options)
-      else if (e.kind === 'commands') setCommands(e.commands)
-      else if (e.kind === 'plan') setPlanEntries(e.entries)
-      else if (e.kind === 'permissionRequest') {
-        pendingPermissionsRef.current.set(d.sessionId, e.request)
-        if (isCurrentSession) setPendingPermission(e.request)
+  // Applies one live event. Shared by the subscription and the replay log so a
+  // window taking ownership mid-run rebuilds the same view — including an
+  // unanswered ACP permissionRequest, which only main can resolve and would
+  // otherwise be left pending with no UI able to answer it.
+  const applyKimiEvent = useCallback((sessionId: string, e: KimiEvent) => {
+    const isCurrentSession = sessionId === (sessionRef.current?.id ?? null)
+    if (!isCurrentSession && e.kind !== 'permissionRequest') return
+    if (e.kind === 'text') { setStreamText((t) => t + e.text); appendLiveText(e.text) }
+    else if (e.kind === 'thought') setThoughtText((t) => t + e.text)
+    else if (e.kind === 'activity') { setActivity((a) => [...a, e.activity]); appendLiveActivity(e.activity) }
+    else if (e.kind === 'error') setError(e.message)
+    else if (e.kind === 'model') setKimiModel(e.name)
+    else if (e.kind === 'configOptions') setConfigSelects(e.options)
+    else if (e.kind === 'commands') setCommands(e.commands)
+    else if (e.kind === 'plan') setPlanEntries(e.entries)
+    else if (e.kind === 'permissionRequest') {
+      pendingPermissionsRef.current.set(sessionId, e.request)
+      if (isCurrentSession) setPendingPermission(e.request)
+      if (!notifiedPermissionsRef.current.has(e.request.requestId)) {
+        notifiedPermissionsRef.current.add(e.request.requestId)
         void window.api.window.notifyApproval({ source: 'kimi', summary: e.request.title, panelActive: activeRef.current })
       }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    let hydrated = false
+    let finished = false
+    const queuedEvents: Array<{ sessionId: string; event: KimiEvent; sequence?: number }> = []
+    lastLiveSequenceRef.current = 0
+    const acceptEvent = (sessionId: string, event: KimiEvent, sequence?: number) => {
+      if (sequence !== undefined) {
+        // Main restarts the counter at 1 for every turn, so a fresh run resets the
+        // watermark — otherwise the second turn of a session would be discarded as
+        // 'already seen'.
+        if (sequence === 1) lastLiveSequenceRef.current = 0
+        if (sequence <= lastLiveSequenceRef.current) return
+        lastLiveSequenceRef.current = sequence
+      }
+      applyKimiEvent(sessionId, event)
+    }
+    const offEvent = window.api.kimi.onEvent((d) => {
+      if (!hydrated) {
+        queuedEvents.push({ sessionId: d.sessionId, event: d.event, sequence: d.sequence })
+        return
+      }
+      acceptEvent(d.sessionId, d.event, d.sequence)
     })
     const offDone = window.api.kimi.onDone(async (d) => {
       pendingPermissionsRef.current.delete(d.sessionId)
+      finished = true
       setRunning(false)
       if (d.sessionId !== sessionRef.current?.id) return
       setPendingPermission(null)
@@ -746,8 +807,25 @@ export default function KimiTab(props: { project: Project; active?: boolean }) {
       setMessages(await window.api.kimi.messages(d.sessionId))
       notifyCompletion()
     })
-    return () => { offEvent(); offDone() }
-  }, [session])
+    const flushQueue = () => {
+      hydrated = true
+      for (const item of queuedEvents) acceptEvent(item.sessionId, item.event, item.sequence)
+      queuedEvents.length = 0
+    }
+    if (session) {
+      void window.api.kimi.liveState(props.project.id).then((live) => {
+        if (disposed) return
+        if (live?.sessionId === session.id) {
+          if (!finished) setRunning(true)
+          for (const item of live.events) acceptEvent(live.sessionId, item.event, item.sequence)
+        }
+        flushQueue()
+      }).catch(() => { if (!disposed) flushQueue() })
+    } else {
+      hydrated = true
+    }
+    return () => { disposed = true; offEvent(); offDone() }
+  }, [session?.id, props.project.id, applyKimiEvent])
 
   useEffect(() => window.api.kimi.onUsage((d) => setKimiUsage(d)), [])
 
