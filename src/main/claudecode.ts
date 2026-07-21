@@ -203,36 +203,41 @@ export function runClaudeCode(opts: {
   signal?: AbortSignal
 }): Promise<RunResult> {
   if (isFakeClaudeCode()) {
-    const permissionMode = opts.permissionMode ?? 'acceptEdits'
-    opts.onEvent({ kind: 'system', summary: 'Fake Claude Code session started', model: opts.model })
-    // Plan mode is read-only: mirror the real binary (verified) — no file write.
-    if (permissionMode === 'plan') {
-      const result = `Fake Claude Code plan (read-only) for: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=plan`
+    return (async () => {
+      const permissionMode = opts.permissionMode ?? 'acceptEdits'
+      opts.onEvent({ kind: 'system', summary: 'Fake Claude Code session started', model: opts.model })
+      const delayMs = Math.max(0, Number(process.env.E2E_FAKE_CLAUDE_CODE_DELAY_MS ?? 0) || 0)
+      if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+      if (opts.signal?.aborted) return { ok: false, result: '', activity: [], error: 'Stopped' }
+      // Plan mode is read-only: mirror the real binary (verified) — no file write.
+      if (permissionMode === 'plan') {
+        const result = `Fake Claude Code plan (read-only) for: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=plan`
+        opts.onEvent({ kind: 'text', text: result })
+        opts.onEvent({
+          kind: 'usage',
+          usage: { used: 12_000, total: 200_000, perModel: [{ model: opts.model ?? 'claude-fake-sonnet', used: 12_000, contextWindow: 200_000 }] },
+        })
+        return { ok: true, result, activity: [] }
+      }
+      const activity: ActivityEntry[] = [{ name: 'Write', summary: 'e2e-claude-output.txt', ok: true }]
+      const before = existsSync(join(opts.projectPath, 'e2e-claude-output.txt'))
+        ? readFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), 'utf8')
+        : null
+      const after = `Fake Claude Code modified files for: ${opts.prompt}\n`
+      writeFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), after, 'utf8')
+      activity[0].diff = { path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after }
+      opts.onEvent({ kind: 'tool', id: 'fake-write', name: 'Write', summary: 'e2e-claude-output.txt' })
+      opts.onEvent({ kind: 'tool-result', id: 'fake-write', ok: true, summary: 'wrote e2e-claude-output.txt' })
+      opts.onEvent({ kind: 'file_diff', toolCallId: 'fake-write', path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after })
+      const result = `Fake Claude Code completed: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=${permissionMode}`
       opts.onEvent({ kind: 'text', text: result })
+      const fakeModel = opts.model ?? 'claude-fake-sonnet'
       opts.onEvent({
         kind: 'usage',
-        usage: { used: 12_000, total: 200_000, perModel: [{ model: opts.model ?? 'claude-fake-sonnet', used: 12_000, contextWindow: 200_000 }] },
+        usage: { used: 54_200, total: 200_000, perModel: [{ model: fakeModel, used: 54_200, contextWindow: 200_000 }] },
       })
-      return Promise.resolve({ ok: true, result, activity: [] })
-    }
-    const activity: ActivityEntry[] = [{ name: 'Write', summary: 'e2e-claude-output.txt', ok: true }]
-    const before = existsSync(join(opts.projectPath, 'e2e-claude-output.txt'))
-      ? readFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), 'utf8')
-      : null
-    const after = `Fake Claude Code modified files for: ${opts.prompt}\n`
-    writeFileSync(join(opts.projectPath, 'e2e-claude-output.txt'), after, 'utf8')
-    activity[0].diff = { path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after }
-    opts.onEvent({ kind: 'tool', id: 'fake-write', name: 'Write', summary: 'e2e-claude-output.txt' })
-    opts.onEvent({ kind: 'tool-result', id: 'fake-write', ok: true, summary: 'wrote e2e-claude-output.txt' })
-    opts.onEvent({ kind: 'file_diff', toolCallId: 'fake-write', path: join(opts.projectPath, 'e2e-claude-output.txt'), before, after })
-    const result = `Fake Claude Code completed: ${opts.prompt}\nmodel=${opts.model ?? 'default'} effort=${opts.effort ?? 'default'} permissionMode=${permissionMode}`
-    opts.onEvent({ kind: 'text', text: result })
-  const fakeModel = opts.model ?? 'claude-fake-sonnet'
-  opts.onEvent({
-    kind: 'usage',
-    usage: { used: 54_200, total: 200_000, perModel: [{ model: fakeModel, used: 54_200, contextWindow: 200_000 }] },
-  })
-    return Promise.resolve({ ok: true, result, activity })
+      return { ok: true, result, activity }
+    })()
   }
   return new Promise((resolve) => {
     const bin = resolveClaudeBin()

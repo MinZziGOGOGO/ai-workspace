@@ -2,7 +2,10 @@ import { app, BrowserWindow, ipcMain, session } from 'electron'
 import http from 'node:http'
 import { join } from 'path'
 import { registerIpc, killAllPtys } from './ipc'
-import { destroyAllBrowserTabs, registerBrowserHostWindow } from './browserPanel'
+import { destroyAllBrowserTabs, registerBrowserHostWindow, isBrowserPanelDetached, reattachBrowserPanel } from './browserPanel'
+import { destroyPreviewPanel, registerPreviewHostWindow, isPreviewPanelDetached, reattachPreviewPanel } from './previewPanel'
+import { registerClaudeCodeMainWindow, isClaudeCodePanelDetached, reattachClaudeCodePanel } from './claudeCodePanel'
+import { registerAgentPanelMainWindow, reattachAllAgentPanels } from './agentPanel'
 import { browserApprovals } from './browserApproval'
 import { startBrowserControlServer, stopBrowserControlServer, browserControlPort, browserControlIdentityToken } from './browserControlServer'
 import { initDb, flushDb } from './db'
@@ -321,6 +324,22 @@ function createWindow(): BrowserWindow {
     win.flashFrame(false)
     app.setBadgeCount(0)
   })
+  // Never leave a detached panel window orphaned: if the main window
+  // closes while either panel is detached (e.g. all its OS windows closed but
+  // a detached panel window is still open, which keeps window-all-closed from
+  // firing), close those detached windows too so there is never a dead
+  // "Bring back" button pointed at a destroyed main window. 'closed' (not
+  // 'close') — see browserPanel.ts's identical comment on why. The reattach
+  // functions' own isDestroyed() guards make this safe to call even after the
+  // main window is already gone; the part that matters (closing the orphan)
+  // doesn't depend on the main window still being alive. See
+  // WINDOW_DETACH_DESIGN.md §4.1.
+  win.on('closed', () => {
+    if (isBrowserPanelDetached()) reattachBrowserPanel()
+    if (isPreviewPanelDetached()) reattachPreviewPanel()
+    if (isClaudeCodePanelDetached()) reattachClaudeCodePanel()
+    reattachAllAgentPanels()
+  })
   return win
 }
 
@@ -422,6 +441,9 @@ app.whenReady().then(async () => {
     // Let agent-initiated browser-tab creation resolve a host window even
     // before the user opens a manual tab.
     registerBrowserHostWindow(win)
+    registerPreviewHostWindow(win)
+    registerClaudeCodeMainWindow(win)
+    registerAgentPanelMainWindow(win)
     browserApprovals.setHostWindow(win)
     console.log('[Main] Window created')
     perfLog('window-created')
@@ -481,6 +503,7 @@ app.on('will-quit', () => {
   stopAllWatchers()
   killAllPtys()
   destroyAllBrowserTabs()
+  destroyPreviewPanel()
   browserApprovals.cancelAll()
   void stopBrowserControlServer()
   void stopWebCompanion()

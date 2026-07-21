@@ -66,7 +66,15 @@ export interface ChatGenerateHandoffPromptRequest {
   conversationHistory: string
 }
 
-export interface ChatTokenEvent { sessionId: string; token: string; kind?: 'answer' | 'thinking' }
+export interface ChatTokenEvent { sessionId: string; token: string; kind?: 'answer' | 'thinking'; sequence?: number }
+export interface ChatLiveEvent { sequence: number; token: string; kind?: 'answer' | 'thinking' }
+/** Chat's replay log. Chat is a direct model conversation with no tool access
+ * and no approval surface, so this only carries streamed tokens. */
+export interface ChatLiveState {
+  projectId: string
+  sessionId: string
+  events: ChatLiveEvent[]
+}
 export interface ChatDoneEvent { sessionId: string }
 export interface ChatErrorEvent { sessionId: string; error: string }
 export interface ChatUsageEvent { sessionId: string; used: number; max: number | null }
@@ -213,6 +221,32 @@ export interface PreviewPanelState {
 export interface PreviewDevServerDetectedEvent {
   projectPath: string
   url: string
+}
+
+// ── Panel window-detach ─────────────────────────────────────────────────────
+export interface PanelDetachedChangedEvent {
+  detached: boolean
+}
+
+/**
+ * The agent tabs that share the generic detach registry (src/main/agentPanel.ts).
+ * Claude Code kept its own dedicated channel set from the Step 3 pilot and is
+ * deliberately not folded in here — see WINDOW_DETACH_DESIGN.md §2.2.
+ */
+export type AgentPanelId = 'hermes' | 'codex' | 'kimi' | 'chat'
+
+export interface AgentPanelDetachedChangedEvent extends PanelDetachedChangedEvent {
+  panel: AgentPanelId
+}
+
+export interface ScreenPoint {
+  x: number
+  y: number
+}
+
+export interface WorkspaceWindowBounds extends ScreenPoint {
+  width: number
+  height: number
 }
 
 // ── Browser panel (manual WebContentsView browsing) ──────────────────────────
@@ -451,6 +485,12 @@ export interface HermesCheck {
   error?: string
 }
 export interface HermesCommand { name: string; description: string; hint?: string }
+// A model advertised by the ACP session. `id` is Hermes's provider-prefixed id;
+// `switchId` is the form that survives its model-id parser (see
+// toSwitchableModelId in src/main/hermes.ts).
+export interface HermesModelInfo { id: string; switchId: string; name: string; description?: string }
+export const HERMES_EFFORT_LEVELS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export type HermesEffort = (typeof HERMES_EFFORT_LEVELS)[number]
 export interface HermesPlanEntry { content: string; status: string }
 export type HermesPermissionMode = 1 | 2 | 3 | 4 | 5
 export type HermesActionKind = 'read' | 'create' | 'edit' | 'execute' | 'destructive' | 'catastrophic'
@@ -461,6 +501,7 @@ export type HermesEvent =
   | { kind: 'activity'; activity: HermesActivity }
   | { kind: 'error'; message: string }
   | { kind: 'model'; name: string }
+  | { kind: 'models'; models: HermesModelInfo[]; currentId: string }
   | { kind: 'usage'; used: number; size: number }
   | { kind: 'commands'; commands: HermesCommand[] }
   | { kind: 'plan'; entries: HermesPlanEntry[] }
@@ -482,7 +523,25 @@ export interface HermesDoneEvent {
 }
 
 export interface HermesUsageEvent { used: number; max: number }
-export interface HermesIpcEvent { sessionId: string; event: HermesEvent }
+export interface HermesIpcEvent { sessionId: string; event: HermesEvent; sequence?: number }
+export interface HermesLiveEvent { sequence: number; event: HermesEvent }
+/**
+ * Main-owned replay log for the in-flight Hermes turn, mirroring
+ * ClaudeCodeLiveState. A detached window mounts a fresh HermesTab that never
+ * saw the earlier stream, so it rebuilds the live view from this before
+ * continuing with sequence-aware events. Unanswered `permissionRequest`
+ * events stay in the log until the user responds, so an ACP approval raised
+ * before a detach is still answerable in the new owner window.
+ */
+export interface HermesLiveState {
+  projectId: string
+  sessionId: string
+  events: HermesLiveEvent[]
+}
+
+// Result of applying the Hermes ACP reasoning-effort patch (src/main/hermesPatch.ts).
+export type HermesPatchStatus = 'applied' | 'already-applied' | 'conflict' | 'unavailable'
+export interface HermesPatchResult { ok: boolean; status: HermesPatchStatus; message?: string }
 
 export interface HermesRespondPermissionRequest {
   sessionId: string
@@ -550,7 +609,16 @@ export interface KimiDoneEvent {
 }
 
 export interface KimiUsageEvent { used: number; max: number }
-export interface KimiIpcEvent { sessionId: string; event: KimiEvent }
+export interface KimiIpcEvent { sessionId: string; event: KimiEvent; sequence?: number }
+export interface KimiLiveEvent { sequence: number; event: KimiEvent }
+/** Kimi's replay log — same contract as HermesLiveState, including unanswered
+ * ACP permission requests (Kimi's native `default`/`plan` mode and this app's
+ * 5-tier scheme both live in main, so only the pending request needs replay). */
+export interface KimiLiveState {
+  projectId: string
+  sessionId: string
+  events: KimiLiveEvent[]
+}
 
 export interface KimiRespondPermissionRequest {
   sessionId: string
@@ -633,7 +701,13 @@ export interface ClaudeCodeSendRequest {
 /** Claude Code autonomy modes exposed by this app's headless composer. */
 export type ClaudeCodePermissionMode = 'plan' | 'acceptEdits' | 'bypassPermissions'
 
-export interface ClaudeCodeIpcEvent { sessionId: string; event: CCEvent }
+export interface ClaudeCodeIpcEvent { sessionId: string; event: CCEvent; sequence?: number }
+export interface ClaudeCodeLiveEvent { sequence: number; event: CCEvent }
+export interface ClaudeCodeLiveState {
+  projectId: string
+  sessionId: string
+  events: ClaudeCodeLiveEvent[]
+}
 export interface ClaudeCodeDoneEvent {
   sessionId: string
   ok?: boolean
@@ -677,7 +751,16 @@ export interface CodexSendRequest {
   regenerateMessageId?: string
 }
 
-export interface CodexIpcEvent { sessionId: string; event: CodexEvent }
+export interface CodexIpcEvent { sessionId: string; event: CodexEvent; sequence?: number }
+export interface CodexLiveEvent { sequence: number; event: CodexEvent }
+/** Codex's replay log. Codex raises no interactive approvals (the CLI runs with
+ * `approval_policy=never`; the sandbox is the gate), so this only carries
+ * stream/tool events. */
+export interface CodexLiveState {
+  projectId: string
+  sessionId: string
+  events: CodexLiveEvent[]
+}
 export interface CodexDoneEvent {
   sessionId: string
   ok?: boolean
@@ -839,6 +922,23 @@ export type MutationResponse = { success: boolean; error?: string }
 export type DeleteAfterResponse = { success: boolean; deletedCount?: number; error?: string }
 
 export interface IpcApi {
+  workspace: {
+    getWindowBounds(): Promise<WorkspaceWindowBounds>
+    openPanelInMain(panel: DockPanel): Promise<void>
+    onOpenPanelRequested(cb: (panel: DockPanel) => void): () => void
+  }
+  /**
+   * Detach registry shared by the Hermes/Codex/Kimi/Chat tabs (Step 4). Claude
+   * Code keeps its own `claudeCode.detach/reattach/isDetached` surface from the
+   * Step 3 pilot rather than being migrated onto this one.
+   */
+  agentPanel: {
+    detach(panel: AgentPanelId, projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent>
+    reattach(panel: AgentPanelId): Promise<PanelDetachedChangedEvent>
+    isDetached(panel: AgentPanelId): Promise<boolean>
+    listDetached(): Promise<AgentPanelId[]>
+    onDetachedChanged(cb: (d: AgentPanelDetachedChangedEvent) => void): () => void
+  }
   projects: {
     list(): Promise<Project[]>
     global(): Promise<Project>
@@ -887,6 +987,7 @@ export interface IpcApi {
     abort(sessionId: string): Promise<void>
     classifyHandoff(opts: ChatClassifyHandoffRequest): Promise<HandoffClassification>
     generateHandoffPrompt(opts: ChatGenerateHandoffPromptRequest): Promise<string>
+    liveState(projectId: string): Promise<ChatLiveState | null>
     onToken(cb: (d: ChatTokenEvent) => void): () => void
     onDone(cb: (d: ChatDoneEvent) => void): () => void
     onError(cb: (d: ChatErrorEvent) => void): () => void
@@ -914,6 +1015,7 @@ export interface IpcApi {
     abort(sessionId: string): Promise<void>
     send(args: CodexSendRequest): Promise<string | null>
     listModels(): Promise<AgentModelInfo[]>
+    liveState(projectId: string): Promise<CodexLiveState | null>
     onEvent(cb: (d: CodexIpcEvent) => void): () => void
     onDone(cb: (d: CodexDoneEvent) => void): () => void
   }
@@ -923,9 +1025,14 @@ export interface IpcApi {
     send(args: ClaudeCodeSendRequest): Promise<string | null>
     abort(sessionId: string): Promise<void>
     listModels(): Promise<AgentModelInfo[]>
+    liveState(projectId: string): Promise<ClaudeCodeLiveState | null>
+    detach(projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent>
+    reattach(): Promise<PanelDetachedChangedEvent>
+    isDetached(): Promise<boolean>
     onEvent(cb: (d: ClaudeCodeIpcEvent) => void): () => void
     onDone(cb: (d: ClaudeCodeDoneEvent) => void): () => void
     onCheckpoint(cb: (d: CheckpointEvent) => void): () => void
+    onDetachedChanged(cb: (d: PanelDetachedChangedEvent) => void): () => void
   }
   checkpoints: {
     create(sessionId: string, projectPath: string, description: string): Promise<CheckpointResult>
@@ -961,6 +1068,13 @@ export interface IpcApi {
     getPermissionMode(): Promise<HermesPermissionMode>
     setPermissionMode(mode: HermesPermissionMode): Promise<MutationResponse>
     respondPermission(args: HermesRespondPermissionRequest): Promise<MutationResponse>
+    getSessionSettings(sessionId: string): Promise<{ model?: string; effort?: HermesEffort }>
+    setModel(sessionId: string, modelId: string): Promise<{ ok: boolean; error?: string }>
+    setEffort(sessionId: string, effort: HermesEffort): Promise<{ ok: boolean; error?: string }>
+    command(sessionId: string, command: string): Promise<{ ok: boolean; text?: string; error?: string }>
+    patchStatus(): Promise<{ applied: boolean }>
+    applyPatch(): Promise<HermesPatchResult>
+    liveState(projectId: string): Promise<HermesLiveState | null>
     onEvent(cb: (d: HermesIpcEvent) => void): () => void
     onDone(cb: (d: HermesDoneEvent) => void): () => void
     onUsage(cb: (d: HermesUsageEvent) => void): () => void
@@ -984,6 +1098,7 @@ export interface IpcApi {
     getAuthStatus(): Promise<KimiAuthStatus>
     setApiKey(key: string): Promise<MutationResponse>
     login(): Promise<{ success: boolean; error?: string }>
+    liveState(projectId: string): Promise<KimiLiveState | null>
     onEvent(cb: (d: KimiIpcEvent) => void): () => void
     onDone(cb: (d: KimiDoneEvent) => void): () => void
     onUsage(cb: (d: KimiUsageEvent) => void): () => void
@@ -1048,10 +1163,14 @@ export interface IpcApi {
     listTabs(): Promise<BrowserTabListResponse>
     getDownloads(): Promise<BrowserDownloadStatus[]>
     reloadSessions(): Promise<void>
+    detach(projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent>
+    reattach(): Promise<PanelDetachedChangedEvent>
+    isDetached(): Promise<boolean>
     onTabUpdated(cb: (d: BrowserTabState) => void): () => void
     onTabCreated(cb: (d: BrowserTabCreatedEvent) => void): () => void
     onTabClosed(cb: (d: BrowserTabClosedEvent) => void): () => void
     onPreviewRequested(cb: (d: BrowserPreviewOpenRequest) => void): () => void
+    onDetachedChanged(cb: (d: PanelDetachedChangedEvent) => void): () => void
   }
   preview: {
     navigate(url: string): Promise<void>
@@ -1063,8 +1182,12 @@ export interface IpcApi {
     restoreAfterDrag(): Promise<void>
     getState(): Promise<PreviewPanelState>
     getDetectedUrl(projectId: string): Promise<string | null>
+    detach(projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent>
+    reattach(): Promise<PanelDetachedChangedEvent>
+    isDetached(): Promise<boolean>
     onUpdated(cb: (d: PreviewPanelState) => void): () => void
     onDevServerDetected(cb: (d: PreviewDevServerDetectedEvent) => void): () => void
+    onDetachedChanged(cb: (d: PanelDetachedChangedEvent) => void): () => void
   }
   approvals: {
     list(): Promise<BrowserApprovalRequest[]>

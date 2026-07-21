@@ -71,6 +71,10 @@ import {
   disconnectHermes,
   hermesConnected,
   runHermesPrompt,
+  runHermesCommand,
+  applyHermesModel,
+  applyHermesEffort,
+  getHermesSessionSettings,
   summarizeHermesRun,
   getHermesConfig,
   testHermesConnection,
@@ -79,6 +83,7 @@ import {
   respondHermesPermission,
   bumpHermesSessionOverride
 } from './hermes'
+import { applyHermesReasoningPatch, checkHermesReasoningPatch } from './hermesPatch'
 import { installSkillFromHub, listSkills, searchSkillsHub, toggleSkill } from './hermesSkills'
 import { getTodayUsage, recordUsage } from './usage'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../shared/globalWorkspace'
@@ -109,10 +114,28 @@ import {
   listBrowserTabs,
   inspectPreviewTab,
   agentGetDownloads,
-  reloadBrowserSessions
+  reloadBrowserSessions,
+  detachBrowserPanel,
+  reattachBrowserPanel,
+  isBrowserPanelDetached
 } from './browserPanel'
 import { detectProjectPreview } from './browserPreview'
 import { browserApprovals } from './browserApproval'
+import {
+  claudeCodePanelHostWindow,
+  detachClaudeCodePanel,
+  isClaudeCodePanelDetached,
+  openPanelInMain,
+  reattachClaudeCodePanel,
+} from './claudeCodePanel'
+import {
+  agentPanelHostWindow,
+  detachAgentPanel,
+  isAgentPanelDetached,
+  listDetachedAgentPanels,
+  reattachAgentPanel,
+  type DetachableAgentPanel,
+} from './agentPanel'
 import {
   navigatePreviewUrl,
   reloadPreview,
@@ -124,6 +147,9 @@ import {
   getPreviewState,
   getLastDetectedDevServerUrl,
   noteTerminalOutput,
+  detachPreviewPanel,
+  reattachPreviewPanel,
+  isPreviewPanelDetached
 } from './previewPanel'
 import type {
   BrowserBounds,
@@ -131,6 +157,7 @@ import type {
   BrowserDownloadStatus,
   BrowserPreviewDetectionResult,
   BrowserPreviewInspection,
+  PanelDetachedChangedEvent,
   PreviewPanelState,
   BrowserApprovalDecision,
   BrowserApprovalRequest,
@@ -142,6 +169,7 @@ import type {
   ChatGenerateHandoffPromptRequest,
   ChatModelMessage,
   ChatSendRequest,
+  ChatLiveState,
   ChatTokenEvent,
   ChatUsageEvent,
   Checkpoint,
@@ -151,10 +179,12 @@ import type {
   ClaudeCodeCheck,
   ClaudeCodeDoneEvent,
   ClaudeCodeIpcEvent,
+  ClaudeCodeLiveState,
   ClaudeCodeSendRequest,
   CodexCheck,
   CodexDoneEvent,
   CodexIpcEvent,
+  CodexLiveState,
   CodexSandboxMode,
   CodexSendRequest,
   DeleteAfterResponse,
@@ -170,7 +200,10 @@ import type {
   HermesCheck,
   HermesEvent,
   HermesIpcEvent,
+  HermesLiveState,
   HermesPermissionMode,
+  HermesEffort,
+  HermesPatchResult,
   HermesRespondPermissionRequest,
   HermesSendRequest,
   HermesUsageEvent,
@@ -179,6 +212,7 @@ import type {
   KimiCheck,
   KimiDoneEvent,
   KimiIpcEvent,
+  KimiLiveState,
   KimiLoginEvent,
   KimiRespondPermissionRequest,
   KimiSendRequest,
@@ -210,6 +244,7 @@ import type {
   RemovedCount,
   ResearchProgress,
   ResearchStartRequest,
+  ScreenPoint,
   Session,
   SettingsDiagnostics,
   SettingsImportResponse,
@@ -222,7 +257,8 @@ import type {
   UsageSummaryRow,
   WebCompanionConfigureRequest,
   WebCompanionRegenerateResponse,
-  WebCompanionStatus
+  WebCompanionStatus,
+  WorkspaceWindowBounds,
 } from '../shared/ipcTypes'
 
 // ---- PTY lifecycle (Phase F) ----
@@ -662,6 +698,31 @@ async function buildDiagnosticsReport(): Promise<SettingsDiagnostics> {
 
 
 export function registerIpc(): void {
+  // Current native bounds are sampled at drag start and cached by the renderer
+  // for cross-window screen-coordinate hit testing.
+  ipcMain.handle('workspace:getWindowBounds', (event): WorkspaceWindowBounds => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win || win.isDestroyed()) throw new Error('No window is associated with this workspace.')
+    return win.getBounds()
+  })
+  ipcMain.handle('workspace:openPanelInMain', (_event, panel: DockPanel): void => openPanelInMain(panel))
+
+  // ---- Agent-tab detach registry (Step 4) ----
+  // One generic surface for Hermes/Codex/Kimi/Chat, unlike the Claude Code pilot
+  // which kept its own dedicated channels. Project name is resolved here so the
+  // detached window gets a real, identifiable taskbar title.
+  ipcMain.handle(
+    'agentPanel:detach',
+    async (_event, panel: DetachableAgentPanel, projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent> => {
+      const project = getDb().prepare('SELECT name FROM projects WHERE id = ?').get(projectId) as { name: string } | undefined
+      if (!project) throw new Error('Project not found.')
+      return detachAgentPanel(panel, projectId, project.name, dropPoint)
+    }
+  )
+  ipcMain.handle('agentPanel:reattach', (_event, panel: DetachableAgentPanel): PanelDetachedChangedEvent => reattachAgentPanel(panel))
+  ipcMain.handle('agentPanel:isDetached', (_event, panel: DetachableAgentPanel): boolean => isAgentPanelDetached(panel))
+  ipcMain.handle('agentPanel:listDetached', (): DetachableAgentPanel[] => listDetachedAgentPanels())
+
   // ---- filesystem (Phase D: Navigator file tree) ----
   // FsEntry[] carries no error channel and this handler already collapses every
   // failure (missing dir, EACCES) to an empty list, so a denial matches its
@@ -1108,6 +1169,16 @@ export function registerIpc(): void {
 
   // Track in-flight chat streams so a Stop can cancel them.
   const chatAborts = new Map<string, AbortController>()
+  // Replay log for the in-flight Chat turn. Chat is a direct model
+  // conversation — no tools, no MCP client, no approval surface — so this
+  // carries streamed tokens only, purely so a detached Chat window can rebuild
+  // a partially-streamed answer instead of showing a gap until the turn ends.
+  const chatLiveRuns = new Map<string, ChatLiveState>()
+  ipcMain.handle('chat:liveState', (_event, projectId: string): ChatLiveState | null => {
+    const state = [...chatLiveRuns.values()].find((candidate) => candidate.projectId === projectId)
+    return state ? { ...state, events: state.events.map((item) => ({ ...item })) } : null
+  })
+
   ipcMain.handle('chat:abort', (_e, sessionId: string): void => {
     chatAborts.get(sessionId)?.abort()
   })
@@ -1118,7 +1189,9 @@ export function registerIpc(): void {
     'chat:send',
     async (event, args: ChatSendRequest): Promise<string | null> => {
       const db = getDb()
-      const win = BrowserWindow.fromWebContents(event.sender)
+      const sourceWin = BrowserWindow.fromWebContents(event.sender)
+      // Re-resolved per emit so a mid-turn detach follows the panel (see agentPanel.ts).
+      const win = () => agentPanelHostWindow('chat', sourceWin)
       const now = Date.now()
       // Regenerate reuses the existing (preceding) user message instead of
       // inserting a duplicate — the caller has already deleted the stale
@@ -1204,9 +1277,11 @@ export function registerIpc(): void {
         if (lastUserIdx !== -1) messages[lastUserIdx] = { ...messages[lastUserIdx], images: args.images }
       }
 
-      emitActivity(win, 'CHAT', `Sending to ${args.model.startsWith('cloud:') ? args.model.slice(6) : args.model}…`)
+      emitActivity(win(), 'CHAT', `Sending to ${args.model.startsWith('cloud:') ? args.model.slice(6) : args.model}…`)
       const controller = new AbortController()
       chatAborts.set(args.sessionId, controller)
+      const liveState: ChatLiveState = { projectId: args.projectId, sessionId: args.sessionId, events: [] }
+      chatLiveRuns.set(args.sessionId, liveState)
       let full = ''
       const isCloud = args.model.startsWith('cloud:')
       try {
@@ -1216,14 +1291,18 @@ export function registerIpc(): void {
           const apiKey = keyRow?.value ?? ''
           for await (const part of streamCloudChatParts(cloudModel, messages, apiKey, controller.signal)) {
             if (part.kind === 'answer') full += part.text
-            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind }
-            win?.webContents.send('chat:token', payload)
+            const sequence = liveState.events.length + 1
+            liveState.events.push({ sequence, token: part.text, kind: part.kind })
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind, sequence }
+            win()?.webContents.send('chat:token', payload)
           }
         } else {
           for await (const part of streamChatParts(args.model, messages, controller.signal)) {
             if (part.kind === 'answer') full += part.text
-            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind }
-            win?.webContents.send('chat:token', payload)
+            const sequence = liveState.events.length + 1
+            liveState.events.push({ sequence, token: part.text, kind: part.kind })
+            const payload: ChatTokenEvent = { sessionId: args.sessionId, token: part.text, kind: part.kind, sequence }
+            win()?.webContents.send('chat:token', payload)
           }
         }
       } catch (err: unknown) {
@@ -1231,10 +1310,11 @@ export function registerIpc(): void {
         // (persisted below) and finish cleanly instead of reporting an error.
         if (!controller.signal.aborted) {
           chatAborts.delete(args.sessionId)
+          chatLiveRuns.delete(args.sessionId)
           const friendly = friendlyChatError(err, { cloud: isCloud, model: isCloud ? args.model.slice(6) : args.model })
           const payload: ChatErrorEvent = { sessionId: args.sessionId, error: friendly }
-          win?.webContents.send('chat:error', payload)
-          emitActivity(win, 'CHAT', `Response failed: ${friendly}`)
+          win()?.webContents.send('chat:error', payload)
+          emitActivity(win(), 'CHAT', `Response failed: ${friendly}`)
           return null
         }
       } finally {
@@ -1253,9 +1333,10 @@ export function registerIpc(): void {
       const estimatedTokens = allMsgs.reduce((sum, m) => sum + Math.ceil(m.content.length / 4), 0)
       const usagePayload: ChatUsageEvent = { sessionId: args.sessionId, used: estimatedTokens, max: null }
       const donePayload: ChatDoneEvent = { sessionId: args.sessionId }
-      win?.webContents.send('chat:usage', usagePayload)
-      win?.webContents.send('chat:done', donePayload)
-      if (full.trim()) emitActivity(win, 'CHAT', `Response complete (${Math.ceil(full.length / 5)} tokens est.)`)
+      win()?.webContents.send('chat:usage', usagePayload)
+      win()?.webContents.send('chat:done', donePayload)
+      if (full.trim()) emitActivity(win(), 'CHAT', `Response complete (${Math.ceil(full.length / 5)} tokens est.)`)
+      chatLiveRuns.delete(args.sessionId)
       return full
     }
   )
@@ -1406,6 +1487,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     getDb().prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY created_at`).all(sessionId) as Message[]
   )
 
+  // Replay log for the in-flight Codex turn (same mechanism as ccLiveRuns). Codex
+  // raises no interactive approvals — the CLI runs with `approval_policy=never`
+  // and the sandbox is the sole gate — so this carries stream/tool events only.
+  const codexLiveRuns = new Map<string, CodexLiveState>()
+  ipcMain.handle('codex:liveState', (_event, projectId: string): CodexLiveState | null => {
+    const state = [...codexLiveRuns.values()].find((candidate) => candidate.projectId === projectId)
+    return state ? { ...state, events: state.events.map((item) => ({ ...item })) } : null
+  })
+
   // Track in-flight Codex runs so a Stop can kill the child process.
   const codexAborts = new Map<string, AbortController>()
   ipcMain.handle('codex:abort', (_e, sessionId: string): void => {
@@ -1419,14 +1509,16 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       args: CodexSendRequest
     ): Promise<string | null> => {
       const db = getDb()
-      const win = BrowserWindow.fromWebContents(event.sender)
+      const sourceWin = BrowserWindow.fromWebContents(event.sender)
+      // Re-resolved per emit so a mid-turn detach follows the panel (see agentPanel.ts).
+      const win = () => agentPanelHostWindow('codex', sourceWin)
       if (isGlobalProjectId(args.projectId)) {
         const payload: CodexDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Open a project to use Codex.'
         }
-        win?.webContents.send('codex:done', payload)
+        win()?.webContents.send('codex:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1462,7 +1554,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         | undefined
       if (!project?.path || !existsSync(project.path)) {
         const payload: CodexDoneEvent = { sessionId: args.sessionId, error: 'Project folder not found.' }
-        win?.webContents.send('codex:done', payload)
+        win()?.webContents.send('codex:done', payload)
         return null
       }
 
@@ -1474,6 +1566,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
       const controller = new AbortController()
       codexAborts.set(args.sessionId, controller)
+      const liveState: CodexLiveState = { projectId: args.projectId, sessionId: args.sessionId, events: [] }
+      codexLiveRuns.set(args.sessionId, liveState)
       const run = await runCodex({
         projectPath: project.path,
         prompt: args.prompt,
@@ -1487,15 +1581,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         // Expose the bundled knowledge + browser MCP servers to this session as
         // per-spawn `-c mcp_servers.*` overrides (Codex ignores
         // claude_desktop_config.json).
-        mcpServers: bundledMcpServers(),
+        mcpServers: bundledMcpServers({ agentId: 'codex', agentName: 'Codex' }),
         signal: controller.signal,
         threadId: sessionRow?.codex_thread_id ?? undefined,
         onEvent: (e) => {
-          const payload: CodexIpcEvent = { sessionId: args.sessionId, event: e }
-          win?.webContents.send('codex:event', payload)
-          if (e.kind === 'tool') emitActivity(win, 'CODE', `Codex ${e.name}: ${e.summary.slice(0, 80)}`)
-          else if (e.kind === 'system') emitActivity(win, 'CODE', `Codex: ${e.summary}`)
-          else if (e.kind === 'error') emitActivity(win, 'CODE', `Codex error: ${e.message.slice(0, 80)}`)
+          const sequence = liveState.events.length + 1
+          liveState.events.push({ sequence, event: e })
+          const payload: CodexIpcEvent = { sessionId: args.sessionId, event: e, sequence }
+          const host = win()
+          host?.webContents.send('codex:event', payload)
+          if (e.kind === 'tool') emitActivity(host, 'CODE', `Codex ${e.name}: ${e.summary.slice(0, 80)}`)
+          else if (e.kind === 'system') emitActivity(host, 'CODE', `Codex: ${e.summary}`)
+          else if (e.kind === 'error') emitActivity(host, 'CODE', `Codex error: ${e.message.slice(0, 80)}`)
         }
       })
       codexAborts.delete(args.sessionId)
@@ -1514,7 +1611,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
           trustRequired: true,
           error: run.error
         }
-        win?.webContents.send('codex:done', payload)
+        win()?.webContents.send('codex:done', payload)
+        codexLiveRuns.delete(args.sessionId)
         return null
       }
 
@@ -1537,11 +1635,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         })
         memorySaved = true
         const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
-        win?.webContents.send('index:updated', payload)
+        win()?.webContents.send('index:updated', payload)
       }
 
       recordUsage('codex', (args.prompt.length + (run.result || '').length) / 4)
-      emitActivity(win, 'CODE', run.ok ? `Codex task complete: ${args.prompt.slice(0, 60)}` : 'Codex task failed')
+      emitActivity(win(), 'CODE', run.ok ? `Codex task complete: ${args.prompt.slice(0, 60)}` : 'Codex task failed')
       const donePayload: CodexDoneEvent = {
         sessionId: args.sessionId,
         ok: run.ok,
@@ -1550,7 +1648,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         memorySaved,
         error: run.ok ? undefined : run.error
       }
-      win?.webContents.send('codex:done', donePayload)
+      win()?.webContents.send('codex:done', donePayload)
+      codexLiveRuns.delete(args.sessionId)
       return run.result
     }
   )
@@ -1563,6 +1662,23 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
   // CLI's own additionalModelOptionsCache (see agentModels.ts); deterministic
   // fake list under E2E_FAKE_CLAUDE_CODE.
   ipcMain.handle('claudecode:listModels', (): AgentModelInfo[] => listClaudeCodeModels())
+
+  // A detached React renderer cannot inherit the old renderer's local stream
+  // buffer. Keep a main-owned, run-scoped replay log for the active run so the
+  // new owner can reconstruct the exact live view before continuing with
+  // sequence-aware events.
+  const ccLiveRuns = new Map<string, ClaudeCodeLiveState>()
+  ipcMain.handle('claudecode:liveState', (_event, projectId: string): ClaudeCodeLiveState | null => {
+    const state = [...ccLiveRuns.values()].find((candidate) => candidate.projectId === projectId)
+    return state ? { ...state, events: state.events.map((item) => ({ ...item })) } : null
+  })
+  ipcMain.handle('claudecode:detach', async (_event, projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent> => {
+    const project = getDb().prepare('SELECT name FROM projects WHERE id = ?').get(projectId) as { name: string } | undefined
+    if (!project) throw new Error('Project not found.')
+    return detachClaudeCodePanel(projectId, project.name, dropPoint)
+  })
+  ipcMain.handle('claudecode:reattach', (): PanelDetachedChangedEvent => reattachClaudeCodePanel())
+  ipcMain.handle('claudecode:isDetached', (): boolean => isClaudeCodePanelDetached())
 
   // Track in-flight Claude Code runs so a Stop can kill the child process.
   const ccAborts = new Map<string, AbortController>()
@@ -1581,14 +1697,15 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       args: ClaudeCodeSendRequest
     ): Promise<string | null> => {
       const db = getDb()
-      const win = BrowserWindow.fromWebContents(event.sender)
+      const sourceWin = BrowserWindow.fromWebContents(event.sender)
+      const targetWindow = () => claudeCodePanelHostWindow(sourceWin)
       if (isGlobalProjectId(args.projectId)) {
         const payload: ClaudeCodeDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Claude Code needs a project folder. Open a project workspace to use it.'
         }
-        win?.webContents.send('claudecode:done', payload)
+        targetWindow()?.webContents.send('claudecode:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1626,7 +1743,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         | undefined
       if (!project) {
         const payload: ClaudeCodeDoneEvent = { sessionId: args.sessionId, error: 'Project not found.' }
-        win?.webContents.send('claudecode:done', payload)
+        targetWindow()?.webContents.send('claudecode:done', payload)
         return null
       }
 
@@ -1659,10 +1776,12 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       } else {
         checkpointPayload = { sessionId: args.sessionId, messageId: userMsgId, success: false, reason: checkpointAttempt.reason, error: checkpointAttempt.error }
       }
-      win?.webContents.send('claudecode:checkpoint', checkpointPayload)
+      targetWindow()?.webContents.send('claudecode:checkpoint', checkpointPayload)
 
       const controller = new AbortController()
       ccAborts.set(args.sessionId, controller)
+      const liveState: ClaudeCodeLiveState = { projectId: args.projectId, sessionId: args.sessionId, events: [] }
+      ccLiveRuns.set(args.sessionId, liveState)
       const run = await runClaudeCode({
         projectPath: project.path,
         prompt,
@@ -1674,15 +1793,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         // Expose the bundled knowledge + browser MCP servers to this session.
         // Without this the CLI runs with no MCP tools at all (it never reads
         // claude_desktop_config.json).
-        mcpServers: bundledMcpServers(),
+        mcpServers: bundledMcpServers({ agentId: 'claudecode', agentName: 'Claude Code' }),
         signal: controller.signal,
         onEvent: (e) => {
-          const payload: ClaudeCodeIpcEvent = { sessionId: args.sessionId, event: e }
-          win?.webContents.send('claudecode:event', payload)
-          if (e.kind === 'tool') emitActivity(win, 'CODE', `${e.name}: ${e.summary.slice(0, 80)}`)
-          else if (e.kind === 'system') emitActivity(win, 'CODE', e.summary.slice(0, 80))
-          else if (e.kind === 'error') emitActivity(win, 'CODE', `Error: ${e.message.slice(0, 80)}`)
-          else if (e.kind === 'file_diff') emitActivity(win, 'CODE', `Diff: ${e.path.slice(0, 80)}`)
+          const sequence = liveState.events.length + 1
+          liveState.events.push({ sequence, event: e })
+          const payload: ClaudeCodeIpcEvent = { sessionId: args.sessionId, event: e, sequence }
+          const host = targetWindow()
+          host?.webContents.send('claudecode:event', payload)
+          if (e.kind === 'tool') emitActivity(host, 'CODE', `${e.name}: ${e.summary.slice(0, 80)}`)
+          else if (e.kind === 'system') emitActivity(host, 'CODE', e.summary.slice(0, 80))
+          else if (e.kind === 'error') emitActivity(host, 'CODE', `Error: ${e.message.slice(0, 80)}`)
+          else if (e.kind === 'file_diff') emitActivity(host, 'CODE', `Diff: ${e.path.slice(0, 80)}`)
         }
       })
       ccAborts.delete(args.sessionId)
@@ -1706,11 +1828,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         })
         memorySaved = true
         const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
-        win?.webContents.send('index:updated', payload)
+        targetWindow()?.webContents.send('index:updated', payload)
       }
 
       recordUsage('claudecode', (args.prompt.length + (run.result || '').length) / 4)
-      emitActivity(win, 'CODE', run.ok ? `Task complete: ${args.prompt.slice(0, 60)}` : `Task failed`)
+      emitActivity(targetWindow(), 'CODE', run.ok ? `Task complete: ${args.prompt.slice(0, 60)}` : `Task failed`)
       const donePayload: ClaudeCodeDoneEvent = {
         sessionId: args.sessionId,
         ok: run.ok,
@@ -1718,7 +1840,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         memorySaved,
         error: run.ok ? undefined : run.error
       }
-      win?.webContents.send('claudecode:done', donePayload)
+      targetWindow()?.webContents.send('claudecode:done', donePayload)
+      ccLiveRuns.delete(args.sessionId)
       return run.result
     }
   )
@@ -1799,6 +1922,10 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     return { success: true }
   })
 
+  // Request ids the user has already decided. Consulted by hermes:liveState so a
+  // replayed turn never re-raises a card for a request that is no longer live.
+  const hermesAnsweredPermissions = new Set<string>()
+
   ipcMain.handle(
     'hermes:respondPermission',
     (
@@ -1809,14 +1936,63 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         bumpHermesSessionOverride(args.sessionId, args.actionKind)
       }
       const handled = respondHermesPermission(args.requestId, args.approved)
+      if (handled) hermesAnsweredPermissions.add(args.requestId)
       return { success: handled }
     }
   )
+
+  // Per-session model / reasoning-effort selection. Both are persisted on the
+  // session row and re-applied whenever the ACP session is (re)opened, so a
+  // choice survives app restarts and Hermes restarts alike.
+  ipcMain.handle('hermes:getSessionSettings', (_e, sessionId: string): { model?: string; effort?: HermesEffort } => {
+    const settings = getHermesSessionSettings(sessionId)
+    return { model: settings.model, effort: settings.effort }
+  })
+
+  ipcMain.handle('hermes:setModel', (_e, sessionId: string, modelId: string) => applyHermesModel(sessionId, modelId))
+
+  ipcMain.handle('hermes:setEffort', (_e, sessionId: string, effort: HermesEffort) => applyHermesEffort(sessionId, effort))
+
+  // Hermes's own slash commands (/context, /compact, /steer, /queue).
+  ipcMain.handle('hermes:command', (_e, sessionId: string, command: string) => runHermesCommand(sessionId, command))
+
+  // Reasoning effort only reaches the agent on a patched Hermes — see
+  // src/main/hermesPatch.ts for why, and what the patch does.
+  ipcMain.handle('hermes:patchStatus', async (): Promise<{ applied: boolean }> => {
+    const check = await checkHermes()
+    return { applied: await checkHermesReasoningPatch(check.distro ?? 'Ubuntu') }
+  })
+
+  ipcMain.handle('hermes:applyPatch', async (): Promise<HermesPatchResult> => {
+    const check = await checkHermes()
+    const result = await applyHermesReasoningPatch(check.distro ?? 'Ubuntu')
+    // The running `hermes acp` process still holds the old code; drop the
+    // connection so the next turn respawns it with the patch in place.
+    if (result.ok && result.status === 'applied') disconnectHermes()
+    return result
+  })
 
   // Track in-flight runs by our session id so abort can cancel them.
   const hermesAborts = new Map<string, AbortController>()
   ipcMain.handle('hermes:abort', (_e, sessionId: string): void => {
     hermesAborts.get(sessionId)?.abort()
+  })
+
+  // Main-owned replay log for the in-flight Hermes turn — the same mechanism as
+  // ccLiveRuns above. A detached HermesTab mounts fresh and cannot inherit the
+  // previous renderer's stream buffer, so it rebuilds from this. Crucially it
+  // also carries an *unanswered* ACP permissionRequest: without the replay a
+  // detach mid-approval would leave the request pending in main with no UI able
+  // to answer it, which would be a real weakening of the gate rather than a
+  // cosmetic gap. Answered requests are dropped on read (see hermesAnsweredPermissions).
+  const hermesLiveRuns = new Map<string, HermesLiveState>()
+  ipcMain.handle('hermes:liveState', (_event, projectId: string): HermesLiveState | null => {
+    const state = [...hermesLiveRuns.values()].find((candidate) => candidate.projectId === projectId)
+    if (!state) return null
+    const events = state.events
+      .filter((item) => !(item.event.kind === 'permissionRequest' && hermesAnsweredPermissions.has(item.event.request.requestId)))
+      .map((item) => ({ ...item }))
+    return { ...state, events }
   })
 
   // Send a prompt to Hermes, stream events back, persist the turn, save memory.
@@ -1827,14 +2003,17 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
       args: HermesSendRequest
     ): Promise<string | null> => {
       const db = getDb()
-      const win = BrowserWindow.fromWebContents(event.sender)
+      const sourceWin = BrowserWindow.fromWebContents(event.sender)
+      // Resolved per emit, not once: the panel can move to a detached window
+      // mid-turn, and the rest of this run must follow it (WINDOW_DETACH_DESIGN.md §2.2).
+      const win = () => agentPanelHostWindow('hermes', sourceWin)
       if (isGlobalProjectId(args.projectId)) {
         const payload: HermesDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Hermes needs a project folder. Open a project workspace to use it.'
         }
-        win?.webContents.send('hermes:done', payload)
+        win()?.webContents.send('hermes:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -1874,6 +2053,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
       const controller = new AbortController()
       hermesAborts.set(args.sessionId, controller)
+      const liveState: HermesLiveState = { projectId: args.projectId, sessionId: args.sessionId, events: [] }
+      hermesLiveRuns.set(args.sessionId, liveState)
       const transcript: Array<{ kind: 'text'; text: string } | { kind: 'activity'; activity: HermesActivity }> = []
       const appendTranscriptEvent = (e: HermesEvent) => {
         if (e.kind === 'text') {
@@ -1894,15 +2075,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         signal: controller.signal,
         onEvent: (e) => {
           appendTranscriptEvent(e)
-          const payload: HermesIpcEvent = { sessionId: args.sessionId, event: e }
-          win?.webContents.send('hermes:event', payload)
+          const sequence = liveState.events.length + 1
+          liveState.events.push({ sequence, event: e })
+          const payload: HermesIpcEvent = { sessionId: args.sessionId, event: e, sequence }
+          const host = win()
+          host?.webContents.send('hermes:event', payload)
           if (e.kind === 'usage') {
             const usagePayload: HermesUsageEvent = { used: e.used, max: e.size }
-            win?.webContents.send('hermes:usage', usagePayload)
+            host?.webContents.send('hermes:usage', usagePayload)
           }
-          else if (e.kind === 'activity') emitActivity(win, 'HERMES', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
-          else if (e.kind === 'error') emitActivity(win, 'HERMES', `Error: ${e.message.slice(0, 80)}`)
-          else if (e.kind === 'model') emitActivity(win, 'HERMES', `Model: ${e.name}`)
+          else if (e.kind === 'activity') emitActivity(host, 'HERMES', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
+          else if (e.kind === 'error') emitActivity(host, 'HERMES', `Error: ${e.message.slice(0, 80)}`)
+          else if (e.kind === 'model') emitActivity(host, 'HERMES', `Model: ${e.name}`)
         }
       })
       hermesAborts.delete(args.sessionId)
@@ -1940,7 +2124,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         })
         memorySaved = true
         const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
-        win?.webContents.send('index:updated', payload)
+        win()?.webContents.send('index:updated', payload)
       }
 
       recordUsage('hermes', (args.prompt.length + (run.text || '').length) / 4)
@@ -1950,7 +2134,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         memorySaved,
         error: run.ok ? undefined : run.error
       }
-      win?.webContents.send('hermes:done', donePayload)
+      win()?.webContents.send('hermes:done', donePayload)
+      hermesLiveRuns.delete(args.sessionId)
       return run.text || null
     }
   )
@@ -1980,11 +2165,28 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     setKimiPlanMode(Boolean(on))
     return { success: true }
   })
+  // Replay log for the in-flight Kimi turn. Like Hermes, it must carry an
+  // unanswered ACP permissionRequest so a detach mid-approval doesn't strand a
+  // request that only main can resolve. Kimi's *modes* (its native
+  // `default`/`plan` session mode and this app's 5-tier scheme) already live in
+  // main and are re-read by the remounted tab, so only the request needs replay.
+  const kimiLiveRuns = new Map<string, KimiLiveState>()
+  const kimiAnsweredPermissions = new Set<string>()
+  ipcMain.handle('kimi:liveState', (_event, projectId: string): KimiLiveState | null => {
+    const state = [...kimiLiveRuns.values()].find((candidate) => candidate.projectId === projectId)
+    if (!state) return null
+    const events = state.events
+      .filter((item) => !(item.event.kind === 'permissionRequest' && kimiAnsweredPermissions.has(item.event.request.requestId)))
+      .map((item) => ({ ...item }))
+    return { ...state, events }
+  })
+
   ipcMain.handle('kimi:respondPermission', (_e, args: KimiRespondPermissionRequest): MutationResponse => {
     if (args.approved && args.alwaysAllowSession && args.actionKind) {
       bumpKimiSessionOverride(args.sessionId, args.actionKind)
     }
     const handled = respondKimiPermission(args.requestId, args.approved)
+    if (handled) kimiAnsweredPermissions.add(args.requestId)
     return { success: handled }
   })
 
@@ -2013,14 +2215,16 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     'kimi:send',
     async (event, args: KimiSendRequest): Promise<string | null> => {
       const db = getDb()
-      const win = BrowserWindow.fromWebContents(event.sender)
+      const sourceWin = BrowserWindow.fromWebContents(event.sender)
+      // Re-resolved per emit so a mid-turn detach follows the panel (see agentPanel.ts).
+      const win = () => agentPanelHostWindow('kimi', sourceWin)
       if (isGlobalProjectId(args.projectId)) {
         const payload: KimiDoneEvent = {
           sessionId: args.sessionId,
           ok: false,
           error: 'Kimi needs a project folder. Open a project workspace to use it.'
         }
-        win?.webContents.send('kimi:done', payload)
+        win()?.webContents.send('kimi:done', payload)
         return null
       }
       const insertMsg = (role: string, content: string, model: string | null) => {
@@ -2054,6 +2258,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
 
       const controller = new AbortController()
       kimiAborts.set(args.sessionId, controller)
+      const liveState: KimiLiveState = { projectId: args.projectId, sessionId: args.sessionId, events: [] }
+      kimiLiveRuns.set(args.sessionId, liveState)
       const transcript: Array<{ kind: 'text'; text: string } | { kind: 'activity'; activity: KimiActivity }> = []
       const appendTranscriptEvent = (e: KimiEvent) => {
         if (e.kind === 'text') {
@@ -2077,15 +2283,18 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         signal: controller.signal,
         onEvent: (e) => {
           appendTranscriptEvent(e)
-          const payload: KimiIpcEvent = { sessionId: args.sessionId, event: e }
-          win?.webContents.send('kimi:event', payload)
+          const sequence = liveState.events.length + 1
+          liveState.events.push({ sequence, event: e })
+          const payload: KimiIpcEvent = { sessionId: args.sessionId, event: e, sequence }
+          const host = win()
+          host?.webContents.send('kimi:event', payload)
           if (e.kind === 'usage') {
             const usagePayload: KimiUsageEvent = { used: e.used, max: e.size }
-            win?.webContents.send('kimi:usage', usagePayload)
+            host?.webContents.send('kimi:usage', usagePayload)
           }
-          else if (e.kind === 'activity') emitActivity(win, 'KIMI', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
-          else if (e.kind === 'error') emitActivity(win, 'KIMI', `Kimi error: ${e.message.slice(0, 80)}`)
-          else if (e.kind === 'model') emitActivity(win, 'KIMI', `Kimi model: ${e.name}`)
+          else if (e.kind === 'activity') emitActivity(host, 'KIMI', `${e.activity.kind}: ${e.activity.message.slice(0, 80)}`)
+          else if (e.kind === 'error') emitActivity(host, 'KIMI', `Kimi error: ${e.message.slice(0, 80)}`)
+          else if (e.kind === 'model') emitActivity(host, 'KIMI', `Kimi model: ${e.name}`)
         }
       })
       kimiAborts.delete(args.sessionId)
@@ -2121,7 +2330,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         })
         memorySaved = true
         const payload: IndexUpdatedEvent = { projectIds: [args.projectId] }
-        win?.webContents.send('index:updated', payload)
+        win()?.webContents.send('index:updated', payload)
       }
 
       recordUsage('kimi', (args.prompt.length + (run.text || '').length) / 4)
@@ -2131,7 +2340,8 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
         memorySaved,
         error: run.ok ? undefined : run.error
       }
-      win?.webContents.send('kimi:done', donePayload)
+      win()?.webContents.send('kimi:done', donePayload)
+      kimiLiveRuns.delete(args.sessionId)
       return run.text || null
     }
   )
@@ -2367,6 +2577,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     const win = BrowserWindow.fromWebContents(e.sender)
     if (win) reloadBrowserSessions(win)
   })
+  ipcMain.handle('browser:detach', (_e, projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent> =>
+    detachBrowserPanel(projectId, dropPoint)
+  )
+  ipcMain.handle('browser:reattach', (): PanelDetachedChangedEvent => reattachBrowserPanel())
+  ipcMain.handle('browser:isDetached', (): boolean => isBrowserPanelDetached())
 
   // ---- Preview panel (read-only, user-only live viewer) -----------------------
   // A second, isolated WebContentsView surface — see previewPanel.ts. It has no
@@ -2385,6 +2600,11 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
     if (!project?.path) return null
     return getLastDetectedDevServerUrl(project.path)
   })
+  ipcMain.handle('preview:detach', (_e, projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent> =>
+    detachPreviewPanel(projectId, dropPoint)
+  )
+  ipcMain.handle('preview:reattach', (): PanelDetachedChangedEvent => reattachPreviewPanel())
+  ipcMain.handle('preview:isDetached', (): boolean => isPreviewPanelDetached())
 
   // Application-level approval queue. This is deliberately outside Hermes so
   // Browser requests from every MCP client share one renderer surface.
@@ -2946,7 +3166,7 @@ Write ONLY the prompt itself, formatted in markdown. No preamble like
  * path builds its own variant — see resolveHermesMcpServers — because it must
  * run the servers Windows-side via WSL interop.
  */
-function bundledMcpServers(): Record<string, McpServerConfig> {
+function bundledMcpServers(identity?: { agentId: string; agentName: string }): Record<string, McpServerConfig> {
   return {
     'ai-workspace-knowledge': knowledgeMcpLaunchConfig(
       join(app.getAppPath(), 'out', 'mcp', 'server.cjs'),
@@ -2955,7 +3175,8 @@ function bundledMcpServers(): Record<string, McpServerConfig> {
     'ai-workspace-browser': browserMcpLaunchConfig(
       join(app.getAppPath(), 'out', 'mcp', 'browser-server.cjs'),
       browserControlPort(),
-      browserControlIdentityToken
+      browserControlIdentityToken,
+      identity,
     )
   }
 }
@@ -2984,7 +3205,11 @@ function bundledMcpServers(): Record<string, McpServerConfig> {
 // support or our servers grow an http/sse transport.
 function kimiMcpServersArray(): object[] {
   const active = getActiveMcpServers()
-  const all = bundledMcpServers()
+  // Identify as Kimi, not the default 'claude-desktop'. The Browser control
+  // server keys approval routing and per-session "allow" grants on this id, so
+  // a Kimi-originated request must be attributable to Kimi — both to label the
+  // card honestly and so a detached Kimi window is the surface that decides it.
+  const all = bundledMcpServers({ agentId: 'kimi', agentName: 'Kimi' })
   const names = Object.keys(all).filter((name) => active[name])
   return names.map((name) => {
     const cfg = all[name]

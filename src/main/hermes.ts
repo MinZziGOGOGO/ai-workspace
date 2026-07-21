@@ -64,12 +64,47 @@ export interface HermesPlanEntry {
   status: string // 'pending' | 'in_progress' | 'completed' (per ACP `plan` update)
 }
 
+// A model as advertised by `session/new` / `session/load`. `id` is the raw ACP
+// id (provider-prefixed, e.g. `custom:gemma4:12b`); `switchId` is what we must
+// actually send to `session/set_model` — see toSwitchableModelId().
+export interface HermesModelInfo {
+  id: string
+  switchId: string
+  name: string
+  description?: string
+}
+
+// Effort levels accepted by Hermes's parse_reasoning_effort (hermes_constants.py).
+// 'default' is our own passthrough: don't send a config option at all.
+export const HERMES_EFFORT_LEVELS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export type HermesEffort = (typeof HERMES_EFFORT_LEVELS)[number]
+
+export function isHermesEffort(value: string): value is HermesEffort {
+  return (HERMES_EFFORT_LEVELS as readonly string[]).includes(value)
+}
+
+// Hermes's own `parse_model_input` splits a model id on the LAST colon, so the
+// provider-prefixed ids it advertises round-trip incorrectly whenever the model
+// name itself contains a colon — every Ollama tag does. Verified against 0.16.0:
+// sending `custom:gemma4:12b` leaves the session on model "12b" with provider
+// "auto" (a broken agent), while sending the bare `gemma4:12b` switches cleanly
+// and keeps the session's provider. So: strip the provider prefix when the
+// remaining name still contains a colon; otherwise the full id is safe and
+// preserves cross-provider switches (e.g. `anthropic:claude-opus-4-8`).
+export function toSwitchableModelId(rawId: string): string {
+  const firstColon = rawId.indexOf(':')
+  if (firstColon < 0) return rawId
+  const bare = rawId.slice(firstColon + 1)
+  return bare.includes(':') ? bare : rawId
+}
+
 export type HermesEvent =
   | { kind: 'text'; text: string }
   | { kind: 'thought'; text: string }
   | { kind: 'activity'; activity: HermesActivity }
   | { kind: 'error'; message: string }
   | { kind: 'model'; name: string }
+  | { kind: 'models'; models: HermesModelInfo[]; currentId: string }
   | { kind: 'usage'; used: number; size: number }
   | { kind: 'commands'; commands: Array<{ name: string; description: string; hint?: string }> }
   | { kind: 'plan'; entries: HermesPlanEntry[] }
@@ -336,6 +371,47 @@ export function getHermesConfig(): RemoteHermesConfig {
   }
 }
 
+// ---- Per-session Hermes settings (persisted) --------------------------------
+// Columns added in db.ts: hermes_acp_session_id, hermes_model, hermes_effort.
+
+export interface HermesSessionSettings {
+  acpSessionId?: string
+  model?: string
+  effort?: HermesEffort
+}
+
+export function getHermesSessionSettings(sessionId: string): HermesSessionSettings {
+  try {
+    const row = getDb()
+      .prepare('SELECT hermes_acp_session_id, hermes_model, hermes_effort FROM sessions WHERE id = ?')
+      .get(sessionId) as { hermes_acp_session_id?: string; hermes_model?: string; hermes_effort?: string } | undefined
+    const effort = row?.hermes_effort
+    return {
+      acpSessionId: row?.hermes_acp_session_id || undefined,
+      model: row?.hermes_model || undefined,
+      effort: effort && isHermesEffort(effort) ? effort : undefined
+    }
+  } catch {
+    return {}
+  }
+}
+
+function updateHermesSessionColumn(sessionId: string, column: 'hermes_acp_session_id' | 'hermes_model' | 'hermes_effort', value: string | null): void {
+  try {
+    getDb().prepare(`UPDATE sessions SET ${column} = ? WHERE id = ?`).run(value, sessionId)
+  } catch {
+    /* session row may not exist yet (first turn creates it) — non-fatal */
+  }
+}
+
+export function setHermesSessionModel(sessionId: string, model: string): void {
+  updateHermesSessionColumn(sessionId, 'hermes_model', model || null)
+}
+
+export function setHermesSessionEffort(sessionId: string, effort: HermesEffort): void {
+  updateHermesSessionColumn(sessionId, 'hermes_effort', effort === 'default' ? null : effort)
+}
+
 // ---- SSH helpers ------------------------------------------------------------
 
 function runSshCheck(config: RemoteHermesConfig): Promise<boolean> {
@@ -507,6 +583,9 @@ class HermesAcpClient {
   private projectPathByAcp = new Map<string, string>()
   // requestId (ours) → the ACP request awaiting a renderer decision
   private pendingPermissions = new Map<string, { msgId: number; params: any }>()
+  // ACP session id → collector that swallows agent text while a slash command
+  // is in flight, so command output never reaches the turn transcript.
+  private commandSinks = new Map<string, { text: string }>()
   private buf = ''
   private _version?: string
   private _connected = false
@@ -584,15 +663,91 @@ class HermesAcpClient {
     this.proc = null
   }
 
-  async newSession(cwd: string, mcpServers: object[] = []): Promise<{ sessionId: string; modelName?: string }> {
+  // `session/new` and `session/load` both answer with a `models` block
+  // ({ availableModels, currentModelId }) — verified against 0.16.0, which
+  // returns the live Ollama catalog for the `custom` provider. Earlier versions
+  // of this client read `result.availableModels` (one level too shallow) and so
+  // always fell back to an empty list.
+  private static readModelState(result: any): { models: HermesModelInfo[]; currentId: string; currentName?: string } {
+    const block = result?.models ?? result ?? {}
+    const raw: any[] = Array.isArray(block.availableModels) ? block.availableModels : []
+    const currentId: string = String(block.currentModelId ?? '')
+    const models: HermesModelInfo[] = raw
+      .map((m: any) => {
+        const id = String(m?.modelId ?? m?.id ?? '')
+        return {
+          id,
+          switchId: toSwitchableModelId(id),
+          name: String(m?.name ?? id),
+          description: typeof m?.description === 'string' ? m.description : undefined
+        }
+      })
+      .filter((m) => m.id)
+    const current = models.find((m) => m.id === currentId)
+    return { models, currentId, currentName: current?.name || currentId || undefined }
+  }
+
+  async newSession(cwd: string, mcpServers: object[] = []): Promise<{ sessionId: string; modelName?: string; models: HermesModelInfo[]; currentId: string }> {
     const result = await this.request('session/new', { cwd, mcpServers }, 20_000)
-    const models: any[] = result?.availableModels ?? []
-    const currentId: string = result?.currentModelId ?? ''
-    const matched = models.find((m: any) => m.id === currentId)
-    const raw = matched?.name ?? matched?.id ?? currentId
-    const modelName: string | undefined = raw || undefined
+    const state = HermesAcpClient.readModelState(result)
     this.projectPathByAcp.set(result.sessionId, cwd)
-    return { sessionId: result.sessionId, modelName }
+    return { sessionId: result.sessionId, modelName: state.currentName, models: state.models, currentId: state.currentId }
+  }
+
+  // Re-attach to a previously created ACP session. Hermes replays the whole
+  // prior conversation as `session/update` notifications *before* answering
+  // (per the ACP spec) — we deliberately call this with no turn listener
+  // registered so that replay is discarded instead of being appended to the
+  // transcript we already have in SQLite.
+  // Returns null when the id is unknown to Hermes (e.g. its state.db was reset).
+  async loadSession(acpSessionId: string, cwd: string, mcpServers: object[] = []): Promise<{ modelName?: string; models: HermesModelInfo[]; currentId: string } | null> {
+    try {
+      const result = await this.request('session/load', { sessionId: acpSessionId, cwd, mcpServers }, 60_000)
+      if (result == null) return null
+      const state = HermesAcpClient.readModelState(result)
+      this.projectPathByAcp.set(acpSessionId, cwd)
+      return { modelName: state.currentName, models: state.models, currentId: state.currentId }
+    } catch {
+      return null
+    }
+  }
+
+  async setModel(acpSessionId: string, modelId: string): Promise<void> {
+    // Rebuilding the agent can take a moment on first use; 0.16.0 answered in
+    // ~850ms locally, but a cold provider resolve is slower.
+    await this.request('session/set_model', { sessionId: acpSessionId, modelId }, 60_000)
+  }
+
+  async setReasoningEffort(acpSessionId: string, effort: HermesEffort): Promise<void> {
+    if (effort === 'default') return
+    await this.request(
+      'session/set_config_option',
+      { sessionId: acpSessionId, configId: 'reasoning_effort', value: effort },
+      60_000
+    )
+  }
+
+  // Run one of Hermes's own slash commands (/context, /compact, /steer …).
+  // These travel as an ordinary `session/prompt`; the adapter intercepts any
+  // text starting with '/' and answers locally without calling the model, so
+  // this is safe to issue *concurrently with a live turn* — which is exactly
+  // how /steer is meant to be used (measured: 3ms while a turn was running).
+  //
+  // The reply comes back as an `agent_message_chunk` on the same session, i.e.
+  // on the same stream as the live turn's output. We divert chunks into a sink
+  // for the (very short) duration of the command so the command's own text
+  // never lands in the transcript. Any live-turn text emitted inside that
+  // window is diverted too; the window is milliseconds, and the alternative
+  // (leaking "⏩ Steer queued…" into the conversation) is worse.
+  async runCommand(acpSessionId: string, command: string): Promise<string> {
+    const sink = { text: '' }
+    this.commandSinks.set(acpSessionId, sink)
+    try {
+      await this.request('session/prompt', { sessionId: acpSessionId, prompt: [{ type: 'text', text: command }] }, 120_000)
+    } finally {
+      this.commandSinks.delete(acpSessionId)
+    }
+    return sink.text.trim()
   }
 
   async sendPrompt(
@@ -744,6 +899,7 @@ class HermesAcpClient {
     this.ourSessionByAcp.clear()
     this.projectPathByAcp.clear()
     this.pendingPermissions.clear()
+    this.commandSinks.clear()
     this.buf = ''
   }
 
@@ -792,7 +948,19 @@ class HermesAcpClient {
     if (method === 'session/update' && !hasId) {
       const sessionId: string = msg.params?.sessionId ?? ''
       const update = msg.params?.update        // singular per ACP spec
-      if (update) this.updateListeners.get(sessionId)?.call(null, update)
+      if (!update) return
+      // A slash command in flight claims the agent's text output: its reply
+      // arrives on the same stream as any live turn, and it must not reach the
+      // transcript. Handled here rather than in the turn listener because
+      // commands are usually issued while the session is idle, when no turn
+      // listener exists at all.
+      const sink = this.commandSinks.get(sessionId)
+      if (sink && update?.sessionUpdate === 'agent_message_chunk') {
+        const t = update?.content?.text
+        if (typeof t === 'string') sink.text += t
+        return
+      }
+      this.updateListeners.get(sessionId)?.call(null, update)
       return
     }
 
@@ -932,13 +1100,160 @@ export function hermesVersion(): string | undefined {
   return _client?.version
 }
 
+// ---- Session reuse ----------------------------------------------------------
+// One ACP session per app session, not one per turn. `session/new` on every
+// prompt (the previous behavior) meant Hermes started from zero each time: no
+// server-side history, /context and /compact permanently meaningless, and any
+// model or effort we set discarded a moment later.
+//
+// The ACP id is persisted in `sessions.hermes_acp_session_id`, so we re-attach
+// with `session/load` across app restarts and Hermes restarts, falling back to
+// `session/new` when Hermes no longer knows the id.
+
+export async function ensureHermesSession(
+  ourSessionId: string,
+  projectPath: string,
+  mcpServers: object[],
+  onEvent?: (e: HermesEvent) => void
+): Promise<string> {
+  if (!_client?.connected) throw new Error('Hermes is not connected')
+  const settings = getHermesSessionSettings(ourSessionId)
+
+  let acpSessionId = ''
+  let models: HermesModelInfo[] = []
+  let currentId = ''
+  let modelName: string | undefined
+  let reattached = false
+
+  if (settings.acpSessionId) {
+    const loaded = await _client.loadSession(settings.acpSessionId, projectPath, mcpServers)
+    if (loaded) {
+      acpSessionId = settings.acpSessionId
+      models = loaded.models
+      currentId = loaded.currentId
+      modelName = loaded.modelName
+      reattached = true
+    }
+  }
+
+  if (!acpSessionId) {
+    const created = await _client.newSession(projectPath, mcpServers)
+    acpSessionId = created.sessionId
+    models = created.models
+    currentId = created.currentId
+    modelName = created.modelName
+    updateHermesSessionColumn(ourSessionId, 'hermes_acp_session_id', acpSessionId)
+  }
+
+  // Re-apply the user's picks. A brand-new Hermes session always starts on the
+  // configured defaults, and a re-attached one may have been rebuilt by Hermes
+  // since we last set them, so this runs either way — it is a no-op when the
+  // session is already on the wanted model.
+  if (settings.model) {
+    const wanted = models.find((m) => m.id === settings.model || m.switchId === settings.model)
+    const switchId = wanted?.switchId ?? toSwitchableModelId(settings.model)
+    const alreadyCurrent = reattached && (currentId === settings.model || toSwitchableModelId(currentId) === switchId)
+    if (!alreadyCurrent) {
+      try {
+        await _client.setModel(acpSessionId, switchId)
+        modelName = wanted?.name ?? settings.model
+      } catch (e: any) {
+        // Hermes refused the stored model (e.g. its context window is too
+        // small). Forget it rather than re-attempting the same doomed switch on
+        // every future turn; the session continues on whatever it is already
+        // running, which the 'model' event below reports honestly.
+        setHermesSessionModel(ourSessionId, '')
+        onEvent?.({ kind: 'error', message: `Could not switch to ${settings.model}: ${cleanAcpError(e)}` })
+      }
+    }
+  }
+
+  if (settings.effort && settings.effort !== 'default') {
+    try {
+      await _client.setReasoningEffort(acpSessionId, settings.effort)
+    } catch (e: any) {
+      onEvent?.({ kind: 'error', message: `Could not set reasoning effort: ${e?.message ?? e}` })
+    }
+  }
+
+  if (models.length > 0) onEvent?.({ kind: 'models', models, currentId: settings.model ?? currentId })
+  if (modelName) onEvent?.({ kind: 'model', name: modelName })
+  return acpSessionId
+}
+
+// Live ACP session for an app session, if one is currently attached. Used by
+// the IPC layer to apply a setting immediately instead of at the next turn.
+function liveAcpSessionId(ourSessionId: string): string | undefined {
+  if (!_client?.connected) return undefined
+  return getHermesSessionSettings(ourSessionId).acpSessionId
+}
+
+// Apply a model choice, persisting it only once Hermes has accepted it.
+// Hermes rejects some models outright — an embedding model, for instance, fails
+// with "context window of 2,048 tokens, which is below the minimum 64,000" —
+// and persisting such a choice would make every later turn retry a switch that
+// can never succeed. When no session is attached yet there is nothing to
+// validate against, so the choice is stored and vetted at the next attach.
+export async function applyHermesModel(ourSessionId: string, modelId: string): Promise<{ ok: boolean; error?: string }> {
+  const acpSessionId = liveAcpSessionId(ourSessionId)
+  if (!acpSessionId) {
+    setHermesSessionModel(ourSessionId, modelId)
+    return { ok: true }
+  }
+  try {
+    await _client!.setModel(acpSessionId, toSwitchableModelId(modelId))
+    setHermesSessionModel(ourSessionId, modelId)
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, error: cleanAcpError(e) }
+  }
+}
+
+// ACP errors arrive as "ACP -32603: Internal error – {"details":"…"}". The
+// details are the part worth showing a user (Hermes explains *why* a model was
+// refused); the JSON-RPC envelope is noise.
+function cleanAcpError(e: any): string {
+  const raw = e?.message ?? String(e)
+  const match = raw.match(/"details"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+  if (match?.[1]) {
+    try { return JSON.parse(`"${match[1]}"`).trim() } catch { return match[1].trim() }
+  }
+  return raw
+}
+
+export async function applyHermesEffort(ourSessionId: string, effort: HermesEffort): Promise<{ ok: boolean; error?: string }> {
+  setHermesSessionEffort(ourSessionId, effort)
+  const acpSessionId = liveAcpSessionId(ourSessionId)
+  if (!acpSessionId || effort === 'default') return { ok: true }
+  try {
+    await _client!.setReasoningEffort(acpSessionId, effort)
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) }
+  }
+}
+
+// Run a Hermes slash command for an app session. `/steer` and `/queue` are
+// meant to be used while a turn is running; `/context` and `/compact` while
+// idle. Returns Hermes's own reply text.
+export async function runHermesCommand(ourSessionId: string, command: string): Promise<{ ok: boolean; text?: string; error?: string }> {
+  const acpSessionId = liveAcpSessionId(ourSessionId)
+  if (!acpSessionId) return { ok: false, error: 'No active Hermes session yet — send a message first.' }
+  try {
+    return { ok: true, text: await _client!.runCommand(acpSessionId, command) }
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) }
+  }
+}
+
 // ---- runHermesPrompt -------------------------------------------------------
-// Connect if needed, open an ACP session, send the prompt, stream events back.
+// Connect if needed, reuse (or open) the ACP session, stream events back.
 
 export async function runHermesPrompt(opts: {
   sessionId: string
   projectPath: string
   prompt: string
+  systemInstruction?: string
   mcpServers?: object[]
   onEvent: (e: HermesEvent) => void
   signal?: AbortSignal
@@ -971,6 +1286,7 @@ export async function runHermesPrompt(opts: {
     opts.onEvent({ kind: 'text', text })
     return { ok: true, text, stopReason: 'end_turn' }
   }
+  const agentPrompt = opts.systemInstruction ? `${opts.prompt}\n\n${opts.systemInstruction}` : opts.prompt
   // Ensure connected
   if (!_client?.connected) {
     const r = await connectHermes(opts.distro ?? 'Ubuntu')
@@ -981,17 +1297,15 @@ export async function runHermesPrompt(opts: {
 
   let acpSessionId: string
   try {
-    const session = await _client!.newSession(opts.projectPath, opts.mcpServers ?? [])
-    acpSessionId = session.sessionId
-    if (session.modelName) opts.onEvent({ kind: 'model', name: session.modelName })
+    acpSessionId = await ensureHermesSession(opts.sessionId, opts.projectPath, opts.mcpServers ?? [], opts.onEvent)
   } catch (e: any) {
-    return { ok: false, text: '', error: `session/new failed: ${e?.message ?? e}` }
+    return { ok: false, text: '', error: `Could not open a Hermes session: ${e?.message ?? e}` }
   }
 
   try {
     const { stopReason, text } = await _client!.sendPrompt(
       acpSessionId,
-      opts.prompt,
+      agentPrompt,
       opts.onEvent,
       opts.signal,
       opts.sessionId

@@ -17,6 +17,11 @@ function resolveOllamaHost(): string {
 const OLLAMA = resolveOllamaHost()
 export const EMBED_MODEL = 'nomic-embed-text'
 
+/** The resolved local Ollama base URL, for sibling modules that probe it directly. */
+export function ollamaHost(): string {
+  return OLLAMA
+}
+
 function isFakeOllama(): boolean {
   return isE2EFakeEnabled('E2E_FAKE_OLLAMA')
 }
@@ -52,6 +57,39 @@ export async function listModels(): Promise<string[]> {
   }
 }
 
+// Longest a single streamed local turn may run before we give up. Local CPU
+// inference on this machine is minutes-per-reply, so the old "no timeout at all"
+// left a wedged model to hang until undici's socket died with an opaque error
+// (the 9-minute dead-end this pass exists to fix). 8 minutes is a real ceiling —
+// generous enough that a genuinely-slow-but-working reply completes, bounded
+// enough that a stuck one fails with a friendly, retryable message. Cloud turns
+// keep the tighter implicit fetch timeout; they have no excuse to be this slow.
+const LOCAL_STREAM_TIMEOUT_MS = 8 * 60_000
+
+// AbortSignal.timeout fires on total elapsed time, which would kill a slow but
+// healthy stream mid-flow. We want an *idle* timeout instead: reset the clock
+// every time a chunk arrives, so only a true stall (no bytes for the window)
+// aborts. Returns a signal linked to the caller's Stop signal plus a poke().
+function idleTimeoutSignal(base: AbortSignal | undefined, windowMs: number): { signal: AbortSignal; poke: () => void; done: () => void } {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const arm = () => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => controller.abort(new DOMException('Idle timeout', 'TimeoutError')), windowMs)
+  }
+  const onBaseAbort = () => controller.abort(base?.reason)
+  if (base) {
+    if (base.aborted) controller.abort(base.reason)
+    else base.addEventListener('abort', onBaseAbort, { once: true })
+  }
+  arm()
+  return {
+    signal: controller.signal,
+    poke: arm,
+    done: () => { if (timer) clearTimeout(timer); base?.removeEventListener('abort', onBaseAbort) }
+  }
+}
+
 export async function* streamChatParts(
   model: string,
   messages: ChatMessage[],
@@ -66,38 +104,44 @@ export async function* streamChatParts(
     }
     return
   }
+  const idle = idleTimeoutSignal(signal, LOCAL_STREAM_TIMEOUT_MS)
   const res = await fetch(`${OLLAMA}/api/chat`, {
     method: 'POST',
     body: JSON.stringify({ model, messages, stream: true }),
-    signal
-  })
-  if (!res.ok || !res.body) throw new Error(`Ollama error: ${res.status}`)
+    signal: idle.signal
+  }).catch((err) => { idle.done(); throw err })
+  if (!res.ok || !res.body) { idle.done(); throw new Error(`Ollama error: ${res.status}`) }
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    const lines = buf.split('\n')
-    buf = lines.pop() ?? ''
-    for (const line of lines) {
-      if (!line.trim()) continue
-      try {
-        const chunk = JSON.parse(line)
-        const thinking = pickString(
-          chunk.message?.thinking,
-          chunk.message?.reasoning_content,
-          chunk.message?.reasoning,
-          chunk.message?.thought
-        )
-        if (thinking) yield { kind: 'thinking', text: thinking }
-        const content = stringField(chunk.message?.content)
-        if (content) yield { kind: 'answer', text: content }
-      } catch {
-        continue // skip malformed NDJSON lines instead of killing the stream
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      idle.poke() // bytes arrived — reset the idle clock, not the total budget
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const chunk = JSON.parse(line)
+          const thinking = pickString(
+            chunk.message?.thinking,
+            chunk.message?.reasoning_content,
+            chunk.message?.reasoning,
+            chunk.message?.thought
+          )
+          if (thinking) yield { kind: 'thinking', text: thinking }
+          const content = stringField(chunk.message?.content)
+          if (content) yield { kind: 'answer', text: content }
+        } catch {
+          continue // skip malformed NDJSON lines instead of killing the stream
+        }
       }
     }
+  } finally {
+    idle.done()
   }
 }
 

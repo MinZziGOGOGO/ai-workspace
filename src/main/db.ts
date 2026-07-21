@@ -304,6 +304,21 @@ function migrate(db: DbWrapper): void {
   if (!sessionCols.has('codex_thread_id')) {
     db.exec('ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT')
   }
+  // Hermes ACP sessions are the same story: `session/new` per turn would give
+  // Hermes no memory across turns and would discard any model/effort we set, so
+  // the ACP session id is persisted and re-attached via `session/load`. The
+  // model and effort are stored alongside it because a fresh `session/new`
+  // (after a Hermes restart) resets both to the config defaults and we have to
+  // re-apply the user's choice. See hermes.ts ensureSession().
+  if (!sessionCols.has('hermes_acp_session_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN hermes_acp_session_id TEXT')
+  }
+  if (!sessionCols.has('hermes_model')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN hermes_model TEXT')
+  }
+  if (!sessionCols.has('hermes_effort')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN hermes_effort TEXT')
+  }
 
   // Quick-reaction capture (thumbs up/down) on assistant messages, for future
   // prompt-tuning reference. No analytics UI reads this yet.

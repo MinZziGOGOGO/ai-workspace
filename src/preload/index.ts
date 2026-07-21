@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
   ActivityEntry,
+  AgentPanelDetachedChangedEvent,
+  AgentPanelId,
   BrowserPreviewOpenRequest,
   BrowserTabCreatedEvent,
   BrowserTabClosedEvent,
@@ -15,6 +17,7 @@ import type {
   ClaudeCodeDoneEvent,
   ClaudeCodeIpcEvent,
   ClaudeCodeSendRequest,
+  DockPanel,
   CodexDoneEvent,
   CodexIpcEvent,
   CodexSandboxMode,
@@ -36,10 +39,12 @@ import type {
   IndexUpdatedEvent,
   IpcApi,
   MemorySavedEvent,
+  PanelDetachedChangedEvent,
   PreviewDevServerDetectedEvent,
   PreviewPanelState,
   ResearchProgress,
   ResearchStartRequest,
+  ScreenPoint,
   TerminalDataEvent,
   TerminalExitEvent,
 } from '../shared/ipcTypes'
@@ -52,6 +57,22 @@ function onPayload<T>(channel: string, cb: (payload: T) => void): () => void {
 
 // Typed bridge: the renderer never touches Node APIs directly.
 const api: IpcApi = {
+  workspace: {
+    getWindowBounds: () => ipcRenderer.invoke('workspace:getWindowBounds'),
+    openPanelInMain: (panel: DockPanel) => ipcRenderer.invoke('workspace:openPanelInMain', panel),
+    onOpenPanelRequested: (cb: (panel: DockPanel) => void) => onPayload('workspace:openPanelRequested', cb)
+  },
+  // Step 4: shared detach registry for the Hermes/Codex/Kimi/Chat tabs.
+  // Claude Code keeps its own `claudeCode.*` detach calls (Step 3 pilot).
+  agentPanel: {
+    detach: (panel: AgentPanelId, projectId: string, dropPoint?: ScreenPoint) =>
+      ipcRenderer.invoke('agentPanel:detach', panel, projectId, dropPoint),
+    reattach: (panel: AgentPanelId) => ipcRenderer.invoke('agentPanel:reattach', panel),
+    isDetached: (panel: AgentPanelId) => ipcRenderer.invoke('agentPanel:isDetached', panel),
+    listDetached: () => ipcRenderer.invoke('agentPanel:listDetached'),
+    onDetachedChanged: (cb: (d: AgentPanelDetachedChangedEvent) => void) =>
+      onPayload('agentPanel:detachedChanged', cb)
+  },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
     global: () => ipcRenderer.invoke('projects:global'),
@@ -110,6 +131,7 @@ const api: IpcApi = {
       ipcRenderer.invoke('chat:classifyHandoff', opts),
     generateHandoffPrompt: (opts: { model: string; agent: 'claudecode' | 'hermes' | 'codex'; conversationHistory: string }) =>
       ipcRenderer.invoke('chat:generateHandoffPrompt', opts),
+    liveState: (projectId: string) => ipcRenderer.invoke('chat:liveState', projectId),
     onToken: (cb: (d: ChatTokenEvent) => void) => onPayload('chat:token', cb),
     onDone: (cb: (d: ChatDoneEvent) => void) => onPayload('chat:done', cb),
     onError: (cb: (d: ChatErrorEvent) => void) => onPayload('chat:error', cb),
@@ -144,6 +166,7 @@ const api: IpcApi = {
     abort: (sessionId: string) => ipcRenderer.invoke('codex:abort', sessionId),
     send: (args: CodexSendRequest & { sandbox?: CodexSandboxMode }) => ipcRenderer.invoke('codex:send', args),
     listModels: () => ipcRenderer.invoke('codex:listModels'),
+    liveState: (projectId: string) => ipcRenderer.invoke('codex:liveState', projectId),
     onEvent: (cb: (d: CodexIpcEvent) => void) => onPayload('codex:event', cb),
     onDone: (cb: (d: CodexDoneEvent) => void) => onPayload('codex:done', cb)
   },
@@ -153,9 +176,14 @@ const api: IpcApi = {
     send: (args: ClaudeCodeSendRequest) => ipcRenderer.invoke('claudecode:send', args),
     abort: (sessionId: string) => ipcRenderer.invoke('claudecode:abort', sessionId),
     listModels: () => ipcRenderer.invoke('claudecode:listModels'),
+    liveState: (projectId: string) => ipcRenderer.invoke('claudecode:liveState', projectId),
+    detach: (projectId: string, dropPoint?: ScreenPoint) => ipcRenderer.invoke('claudecode:detach', projectId, dropPoint),
+    reattach: () => ipcRenderer.invoke('claudecode:reattach'),
+    isDetached: () => ipcRenderer.invoke('claudecode:isDetached'),
     onEvent: (cb: (d: ClaudeCodeIpcEvent) => void) => onPayload('claudecode:event', cb),
     onDone: (cb: (d: ClaudeCodeDoneEvent) => void) => onPayload('claudecode:done', cb),
-    onCheckpoint: (cb: (d: CheckpointEvent) => void) => onPayload('claudecode:checkpoint', cb)
+    onCheckpoint: (cb: (d: CheckpointEvent) => void) => onPayload('claudecode:checkpoint', cb),
+    onDetachedChanged: (cb: (d: PanelDetachedChangedEvent) => void) => onPayload('claudecode:detachedChanged', cb)
   },
   checkpoints: {
     create: (sessionId: string, projectPath: string, description: string) =>
@@ -198,6 +226,13 @@ const api: IpcApi = {
     setPermissionMode: (mode: number) => ipcRenderer.invoke('hermes:setPermissionMode', mode),
     respondPermission: (args: HermesRespondPermissionRequest & { actionKind?: HermesActionKind }) =>
       ipcRenderer.invoke('hermes:respondPermission', args),
+    getSessionSettings: (sessionId: string) => ipcRenderer.invoke('hermes:getSessionSettings', sessionId),
+    setModel: (sessionId: string, modelId: string) => ipcRenderer.invoke('hermes:setModel', sessionId, modelId),
+    setEffort: (sessionId: string, effort: string) => ipcRenderer.invoke('hermes:setEffort', sessionId, effort),
+    command: (sessionId: string, command: string) => ipcRenderer.invoke('hermes:command', sessionId, command),
+    patchStatus: () => ipcRenderer.invoke('hermes:patchStatus'),
+    applyPatch: () => ipcRenderer.invoke('hermes:applyPatch'),
+    liveState: (projectId: string) => ipcRenderer.invoke('hermes:liveState', projectId),
     onEvent: (cb: (d: HermesIpcEvent) => void) => onPayload('hermes:event', cb),
     onDone: (cb: (d: HermesDoneEvent) => void) => onPayload('hermes:done', cb),
     onUsage: (cb: (d: HermesUsageEvent) => void) => onPayload('hermes:usage', cb)
@@ -222,6 +257,7 @@ const api: IpcApi = {
     getAuthStatus: () => ipcRenderer.invoke('kimi:getAuthStatus'),
     setApiKey: (key: string) => ipcRenderer.invoke('kimi:setApiKey', key),
     login: () => ipcRenderer.invoke('kimi:login'),
+    liveState: (projectId: string) => ipcRenderer.invoke('kimi:liveState', projectId),
     onEvent: (cb: (d: KimiIpcEvent) => void) => onPayload('kimi:event', cb),
     onDone: (cb: (d: KimiDoneEvent) => void) => onPayload('kimi:done', cb),
     onUsage: (cb: (d: KimiUsageEvent) => void) => onPayload('kimi:usage', cb),
@@ -292,10 +328,14 @@ const api: IpcApi = {
     listTabs: () => ipcRenderer.invoke('browser:listTabs'),
     getDownloads: () => ipcRenderer.invoke('browser:getDownloads'),
     reloadSessions: () => ipcRenderer.invoke('browser:reloadSessions'),
+    detach: (projectId: string, dropPoint?: ScreenPoint) => ipcRenderer.invoke('browser:detach', projectId, dropPoint),
+    reattach: () => ipcRenderer.invoke('browser:reattach'),
+    isDetached: () => ipcRenderer.invoke('browser:isDetached'),
     onTabUpdated: (cb: (d: BrowserTabState) => void) => onPayload('browser:tabUpdated', cb),
     onTabCreated: (cb: (d: BrowserTabCreatedEvent) => void) => onPayload('browser:tabCreated', cb),
     onTabClosed: (cb: (d: BrowserTabClosedEvent) => void) => onPayload('browser:tabClosed', cb),
-    onPreviewRequested: (cb: (d: BrowserPreviewOpenRequest) => void) => onPayload('browser:previewRequested', cb)
+    onPreviewRequested: (cb: (d: BrowserPreviewOpenRequest) => void) => onPayload('browser:previewRequested', cb),
+    onDetachedChanged: (cb: (d: PanelDetachedChangedEvent) => void) => onPayload('browser:detachedChanged', cb)
   },
   // Preview panel — a second, isolated WebContentsView surface for the user to
   // watch their own dev server. No agent/MCP tool ever calls these.
@@ -310,8 +350,12 @@ const api: IpcApi = {
     restoreAfterDrag: () => ipcRenderer.invoke('preview:restoreAfterDrag'),
     getState: () => ipcRenderer.invoke('preview:getState'),
     getDetectedUrl: (projectId: string) => ipcRenderer.invoke('preview:getDetectedUrl', projectId),
+    detach: (projectId: string, dropPoint?: ScreenPoint) => ipcRenderer.invoke('preview:detach', projectId, dropPoint),
+    reattach: () => ipcRenderer.invoke('preview:reattach'),
+    isDetached: () => ipcRenderer.invoke('preview:isDetached'),
     onUpdated: (cb: (d: PreviewPanelState) => void) => onPayload('preview:updated', cb),
-    onDevServerDetected: (cb: (d: PreviewDevServerDetectedEvent) => void) => onPayload('preview:devServerDetected', cb)
+    onDevServerDetected: (cb: (d: PreviewDevServerDetectedEvent) => void) => onPayload('preview:devServerDetected', cb),
+    onDetachedChanged: (cb: (d: PanelDetachedChangedEvent) => void) => onPayload('preview:detachedChanged', cb)
   },
   approvals: {
     list: () => ipcRenderer.invoke('approvals:list'),

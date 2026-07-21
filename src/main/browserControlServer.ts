@@ -18,6 +18,7 @@ import {
   agentCaptureTab,
   agentClick,
   agentCreateTab,
+  agentNavigateTab,
   agentGetContent,
   agentScroll,
   agentSnapshot,
@@ -34,7 +35,6 @@ import {
   goBack as browserGoBack,
   goForward as browserGoForward,
   listBrowserTabs,
-  navigateTab,
   reloadTab as browserReload,
   normalizeUrl
 } from './browserPanel'
@@ -211,7 +211,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req)
     const url = normalizeUrl(String(body.url ?? '').trim())
     if (!url) return sendJson(res, 400, { error: 'url is required' })
-    return sendOutcome(res, await approved(req, 'browser_navigate', { tabId, targetUrl: url, mutation: true, summary: `Navigate to ${originOf(url) ?? url}`, riskFlags: isLoopbackUrl(url) ? [] : ['Leaves localhost'] }, () => { navigateTab(tabId, url); return { navigated: true } }))
+    return sendOutcome(res, await approved(req, 'browser_navigate', { tabId, targetUrl: url, mutation: true, summary: `Navigate to ${originOf(url) ?? url}`, riskFlags: isLoopbackUrl(url) ? [] : ['Leaves localhost'] }, () => agentNavigateTab(tabId, url)))
   }
 
   if (method === 'POST' && action === 'back') {

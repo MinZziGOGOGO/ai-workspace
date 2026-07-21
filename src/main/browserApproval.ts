@@ -74,9 +74,33 @@ export function classifyBrowserTool(toolName: string, targetUrl?: string): Brows
   }
 }
 
-export function browserRequiresApproval(mode: HermesPermissionMode, category: BrowserPermissionCategory): boolean {
+/**
+ * Decides whether a browser command must be approved by the user first.
+ *
+ * `identityVerified` is a hard gate, not a label. The control server listens on
+ * loopback, so *any* local process can reach it — the identity token is the only
+ * thing distinguishing an MCP client this app launched (and handed the token to
+ * via env) from an unrelated program that simply found port 8973 open. An
+ * unverified caller is therefore pinned to mode-1 "ask before everything"
+ * regardless of the configured permission mode: raising the mode to 4/5 is the
+ * user extending trust to *their* agents, and must not silently extend that
+ * trust to whatever else is running on the machine.
+ */
+export function browserRequiresApproval(
+  mode: HermesPermissionMode,
+  category: BrowserPermissionCategory,
+  identityVerified: boolean,
+): boolean {
+  if (!identityVerified) return true
   if (STRICT.has(category)) return true
-  if (category === 'browser.read' || category === 'browser.navigate.local') return mode === 1
+  // Reads are gated more tightly than the navigation/interaction they enable.
+  // Reading is not "harmless because it changes nothing": these tabs carry the
+  // user's live authenticated sessions, so get_content/screenshot/snapshot can
+  // exfiltrate mail, tickets, dashboards, or anything else already logged in —
+  // silently, and with no page-visible trace the way a click or a navigation has.
+  // Only the explicitly high-trust modes (4-Terminal, 5-Autonomous) auto-approve.
+  if (category === 'browser.read') return mode <= 3
+  if (category === 'browser.navigate.local') return mode === 1
   if (category === 'browser.interact' || category === 'browser.type') return mode < 3
   return mode < 4
 }
@@ -105,6 +129,7 @@ export class BrowserApprovalService {
   private dedupe = new Map<string, Promise<BrowserCommandOutcome<any>>>()
   private mutationTails = new Map<string, Promise<void>>()
   private hostWindow: BrowserWindow | null = null
+  private additionalHostWindows = new Set<BrowserWindow>()
 
   constructor(private readonly timeoutMs = 60_000) {}
 
@@ -112,18 +137,36 @@ export class BrowserApprovalService {
     this.hostWindow = win
   }
 
+  /**
+   * Detached React panels mount their own ApprovalCenter. Register those
+   * windows as display surfaces so queue changes reach the window currently
+   * owning the requesting panel; each renderer filters the shared queue to the
+   * requests it is responsible for showing.
+   */
+  addHostWindow(win: BrowserWindow): () => void {
+    this.additionalHostWindows.add(win)
+    return () => this.additionalHostWindows.delete(win)
+  }
+
   listPending(): BrowserApprovalRequest[] {
     return [...this.pending.values()].map((item) => ({ ...item.publicRequest, riskFlags: [...item.publicRequest.riskFlags] }))
   }
 
   private emit(): void {
-    if (this.hostWindow && !this.hostWindow.isDestroyed()) {
-      this.hostWindow.webContents.send('approvals:changed', this.listPending())
+    const requests = this.listPending()
+    const windows = new Set<BrowserWindow>()
+    if (this.hostWindow) windows.add(this.hostWindow)
+    for (const win of this.additionalHostWindows) windows.add(win)
+    for (const win of windows) {
+      if (!win.isDestroyed()) win.webContents.send('approvals:changed', requests)
     }
   }
 
+  // agentId is caller-supplied (an HTTP header), so an unverified caller can
+  // claim to be "hermes". Keying on the verified flag as well stops it from
+  // inheriting an "allow for session" grant the user gave the real agent.
   private allowKey(identity: BrowserAgentIdentity, category: BrowserPermissionCategory): string {
-    return `${identity.agentId}:${category}`
+    return `${identity.identityVerified ? 'verified' : 'unverified'}:${identity.agentId}:${category}`
   }
 
   async submit<T>(
@@ -137,7 +180,7 @@ export class BrowserApprovalService {
     if (existing) return existing as Promise<BrowserCommandOutcome<T>>
 
     let task: Promise<BrowserCommandOutcome<T>>
-    if (!browserRequiresApproval(mode, draft.category) || this.sessionAllows.has(this.allowKey(identity, draft.category))) {
+    if (!browserRequiresApproval(mode, draft.category, identity.identityVerified) || this.sessionAllows.has(this.allowKey(identity, draft.category))) {
       task = this.executeQueued(draft.tabId, draft.mutation, draft.category, execute)
     } else {
       task = new Promise<BrowserCommandOutcome<T>>((resolve) => {
@@ -177,7 +220,10 @@ export class BrowserApprovalService {
     item.settled = true
     clearTimeout(item.timer)
     this.pending.delete(decision.requestId)
-    if (decision.allowForSession && !STRICT.has(item.publicRequest.category)) {
+    // Unverified callers never earn a standing grant: agentId is spoofable, so a
+    // session allow would not stay scoped to the process the user actually saw.
+    // They stay on per-request approval for the life of the session.
+    if (decision.allowForSession && item.identity.identityVerified && !STRICT.has(item.publicRequest.category)) {
       this.sessionAllows.add(this.allowKey(item.identity, item.publicRequest.category))
     }
     this.emit()

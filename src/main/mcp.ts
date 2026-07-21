@@ -100,23 +100,38 @@ export function knowledgeMcpLaunchConfig(serverCjsPath: string, dbDir: string): 
  *
  * Unlike the knowledge server, this one loads no native modules — it is a thin
  * stdio→HTTP proxy to the app's local browser-control server — so it has no
- * Electron-ABI requirement and runs under plain stock `node`. The control
- * server's loopback port is baked into the env so the standalone process knows
- * where to connect. Single source of truth for every registration path
- * (Claude Desktop config, the Extensions quick-add). The Hermes/WSL path needs
- * the process to run Windows-side (127.0.0.1 must reach the app), so it wraps
- * this differently — see resolveHermesMcpServers in ipc.ts.
+ * Electron-ABI requirement. It nonetheless launches through the app's own
+ * Electron binary in run-as-node mode (process.execPath + ELECTRON_RUN_AS_NODE=1),
+ * exactly like the knowledge server, rather than a bare `node`. Reason: this
+ * config is now consumed by *every* Claude Code / Claude Desktop spawn, and a
+ * bare `node` relies on `node` being on the PATH that the app's child processes
+ * inherit — which is not guaranteed on Windows (the native installer app has no
+ * dependency on Node being installed, let alone on PATH). process.execPath is
+ * always present (it's the running binary), so this removes the PATH gamble.
+ * ELECTRON_RUN_AS_NODE=1 makes Electron behave as a plain Node runtime, which is
+ * all the proxy needs. The control server's loopback port is baked into the env
+ * so the standalone process knows where to connect. Single source of truth for
+ * every registration path (Claude Desktop config, the Extensions quick-add, and
+ * the Claude Code CLI --mcp-config). The Hermes/WSL path needs the process to
+ * run Windows-side (127.0.0.1 must reach the app), so it wraps this differently
+ * — see resolveHermesMcpServers in ipc.ts.
  */
-export function browserMcpLaunchConfig(serverCjsPath: string, controlPort: number, identityToken = ''): McpServerConfig {
+export function browserMcpLaunchConfig(
+  serverCjsPath: string,
+  controlPort: number,
+  identityToken = '',
+  identity: { agentId: string; agentName: string } = { agentId: 'claude-desktop', agentName: 'Claude Desktop' },
+): McpServerConfig {
   return {
-    command: 'node',
+    command: process.execPath,
     args: [serverCjsPath],
     env: {
       AIWORKSPACE_BROWSER_PORT: String(controlPort),
-      AIWORKSPACE_BROWSER_AGENT_ID: 'claude-desktop',
-      AIWORKSPACE_BROWSER_AGENT_NAME: 'Claude Desktop',
+      AIWORKSPACE_BROWSER_AGENT_ID: identity.agentId,
+      AIWORKSPACE_BROWSER_AGENT_NAME: identity.agentName,
       AIWORKSPACE_BROWSER_IDENTITY_SOURCE: 'app-launch',
-      AIWORKSPACE_BROWSER_CONTROL_TOKEN: identityToken
+      AIWORKSPACE_BROWSER_CONTROL_TOKEN: identityToken,
+      ELECTRON_RUN_AS_NODE: '1'
     }
   }
 }

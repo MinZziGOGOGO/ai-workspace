@@ -3,12 +3,14 @@ import { randomUUID } from 'crypto'
 import { existsSync, mkdirSync, statSync } from 'fs'
 import path from 'path'
 import { getDb } from './db'
-import type { BrowserBounds, BrowserTabState } from '../shared/ipcTypes'
+import type { BrowserBounds, BrowserPreviewInspection, BrowserTabState, PanelDetachedChangedEvent, ScreenPoint } from '../shared/ipcTypes'
 import { clickScript, contentScript, scrollScript, snapshotScript, typeScript } from './browserAgentScript'
 import { browserApprovals } from './browserApproval'
 import type { BrowserAgentIdentity } from './browserApproval'
 import { getHermesPermissionMode } from './hermes'
 import { browserUploadHandles, classifyDownloadRisks, sanitizeDownloadFilename } from './browserTransfers'
+import { isLocalPreviewUrl, normalizePreviewUrl } from './browserPreview'
+import { createDetachedPanelWindow } from './detachedPanelWindow'
 
 // ── WebContentsView-backed manual browser (Phase 1: no agent control) ─────────
 //
@@ -29,6 +31,7 @@ interface BrowserTab {
   canGoBack: boolean
   canGoForward: boolean
   navigationError: string | null
+  previewMode: boolean
   snapshotId: string | null
   snapshotUrl: string | null
   navigationGeneration: number
@@ -52,6 +55,13 @@ const ALLOWED_SCHEMES = new Set(['http:', 'https:', 'about:'])
 const tabs = new Map<string, BrowserTab>()
 let activeTabId: string | null = null
 let hostWindow: BrowserWindow | null = null
+// `mainWindow` is the stable original app window (set once at startup);
+// `hostWindow` is whichever window currently owns the WebContentsViews and
+// receives their tabUpdated/tabCreated/etc. events — main by default, or the
+// detached window once detachBrowserPanel() reparents the views. See
+// WINDOW_DETACH_DESIGN.md §2.1.
+let mainWindow: BrowserWindow | null = null
+let detachedWindow: BrowserWindow | null = null
 
 export interface BrowserDownloadRecord {
   downloadId: string; filename: string; origin: string; state: 'pending' | 'progressing' | 'completed' | 'cancelled' | 'interrupted'
@@ -214,7 +224,9 @@ function assertAllowedUrl(url: string): void {
 export function normalizeUrl(input: string): string {
   const raw = input.trim()
   if (!raw) return NEW_TAB_URL
-  if (/^localhost(:\d+)?(\/|$)/i.test(raw)) return `http://${raw}`
+  if (/^(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/|$)/i.test(raw) || /^\[::1\](?::\d+)?(?:\/|$)/i.test(raw)) {
+    return `http://${raw}`
+  }
   if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
     const parsed = new URL(raw)
     assertAllowedUrl(parsed.href)
@@ -235,12 +247,23 @@ function toState(tab: BrowserTab): BrowserTabState {
     canGoBack: tab.canGoBack,
     canGoForward: tab.canGoForward,
     navigationError: tab.navigationError,
+    previewMode: tab.previewMode,
   }
 }
 
 function emit(channel: string, payload: unknown): void {
   if (hostWindow && !hostWindow.isDestroyed()) {
     hostWindow.webContents.send(channel, payload)
+  }
+}
+
+// Detach state must always reach the main window specifically, regardless of
+// which window currently owns the views (emit() above targets hostWindow,
+// which points at the detached window once detached — the main window's
+// placeholder needs its own delivery path).
+function emitToMain(channel: string, payload: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload)
   }
 }
 
@@ -277,16 +300,21 @@ function wireEvents(tab: BrowserTab): void {
     refreshNavState(tab)
     emitUpdate(tab)
   }
-  wc.on('will-navigate', (event, url) => {
+  const guardNavigation = (event: Electron.Event, url: string) => {
     try {
       assertAllowedUrl(url)
+      if (tab.previewMode && url !== NEW_TAB_URL && !isLocalPreviewUrl(url)) {
+        throw new Error('Preview mode blocked navigation outside localhost.')
+      }
     } catch (err) {
       event.preventDefault()
       tab.navigationError = err instanceof Error ? err.message : String(err)
       tab.isLoading = false
       emitUpdate(tab)
     }
-  })
+  }
+  wc.on('will-navigate', guardNavigation)
+  wc.on('will-redirect', guardNavigation)
   wc.on('did-navigate', onNavigate as never)
   wc.on('did-navigate-in-page', onNavigate as never)
   wc.on('page-title-updated', (_e, title) => {
@@ -363,6 +391,7 @@ export function createBrowserTab(win: BrowserWindow, initialUrl?: string): strin
     canGoBack: false,
     canGoForward: false,
     navigationError: null,
+    previewMode: false,
     snapshotId: null,
     snapshotUrl: null,
     navigationGeneration: 0,
@@ -441,7 +470,7 @@ export function navigateTab(tabId: string, url: string): void {
   if (!tab) return
   let target: string
   try {
-    target = normalizeUrl(url)
+    target = tab.previewMode ? normalizePreviewUrl(url) : normalizeUrl(url)
   } catch (err) {
     tab.navigationError = err instanceof Error ? err.message : String(err)
     emitUpdate(tab)
@@ -454,6 +483,66 @@ export function navigateTab(tabId: string, url: string): void {
     tab.snapshotGeneration = null
     tab.snapshotElements = []
   tab.view.webContents.loadURL(target).catch(() => { /* reported via did-fail-load */ })
+}
+
+export function setPreviewMode(tabId: string, enabled: boolean): void {
+  const tab = tabs.get(tabId)
+  if (!tab) return
+  tab.previewMode = enabled
+  tab.navigationError = null
+  if (enabled && tab.url !== NEW_TAB_URL && !isLocalPreviewUrl(tab.url)) {
+    tab.url = NEW_TAB_URL
+    tab.view.webContents.loadURL(NEW_TAB_URL).catch(() => { /* event handlers report */ })
+  }
+  emitUpdate(tab)
+}
+
+export function navigatePreviewTab(tabId: string, url: string): void {
+  const tab = tabs.get(tabId)
+  if (!tab) return
+  tab.previewMode = true
+  navigateTab(tabId, url)
+}
+
+// Agent navigation has one extra routing rule over the manual Browse address
+// bar: loopback preview URLs belong to the built-in Preview surface. Keep this
+// distinction in the app-owned controller so every MCP client gets the same
+// behavior and no agent needs to fall back to an operating-system browser.
+export function agentNavigateTab(tabId: string, url: string): { navigated: true; previewMode: boolean; url: string } {
+  const target = normalizeUrl(url)
+  if (isLocalPreviewUrl(target)) {
+    navigatePreviewTab(tabId, target)
+    setActiveTab(tabId)
+    emit('browser:previewRequested', { tabId, url: target })
+    return { navigated: true, previewMode: true, url: target }
+  }
+  setPreviewMode(tabId, false)
+  navigateTab(tabId, target)
+  setActiveTab(tabId)
+  return { navigated: true, previewMode: false, url: target }
+}
+
+export async function inspectPreviewTab(tabId: string): Promise<BrowserPreviewInspection> {
+  const tab = tabs.get(tabId)
+  if (!tab || !tab.previewMode || !isLocalPreviewUrl(tab.url)) {
+    throw new Error('Preview inspection is only available for an open local preview.')
+  }
+  const result = await tab.view.webContents.executeJavaScript(`(() => {
+    const body = document.body
+    if (!body) return { blank: true, textLength: 0, visualElementCount: 0, reason: 'empty-document' }
+    const textLength = (body.innerText || '').trim().length
+    const selectors = 'img,svg,canvas,video,iframe,input,textarea,button,select,[role="img"],[role="button"]'
+    const visualElementCount = Array.from(body.querySelectorAll(selectors)).filter((element) => {
+      const rect = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+    }).length
+    const background = getComputedStyle(body).backgroundColor
+    const hasBackground = background !== 'rgba(0, 0, 0, 0)' && background !== 'transparent'
+    const blank = textLength === 0 && visualElementCount === 0 && !hasBackground
+    return { blank, textLength, visualElementCount, ...(blank ? { reason: 'no-visible-content' } : {}) }
+  })()`, true) as BrowserPreviewInspection
+  return result
 }
 
 export function goBack(tabId: string): void {
@@ -496,6 +585,24 @@ export function hideAllBrowserViews(): void {
   for (const tab of tabs.values()) applyBounds(tab, HIDDEN_BOUNDS)
 }
 
+// Park every native view off-screen for the duration of a panel-header drag (or
+// while the dock-zone debug overlay is on). The WebContentsView paints above the
+// DOM *and* swallows pointer events, so a drag passing over the Browser panel
+// would otherwise miss drop-zone hover/drop and the snap/debug overlays wouldn't
+// show through. restoreAfterDrag re-applies the active tab's last on-screen rect
+// (same reposition setActiveTab performs). The renderer's bounds-sync loop is
+// gated off on the same signal (see BrowserPanel), so parking here holds for the
+// whole drag instead of being re-pushed on the next animation frame.
+export function parkAllForDrag(): void {
+  for (const tab of tabs.values()) applyBounds(tab, HIDDEN_BOUNDS)
+}
+
+export function restoreAfterDrag(): void {
+  if (!activeTabId) return
+  const active = tabs.get(activeTabId)
+  if (active) applyBounds(active, active.visibleBounds)
+}
+
 export function listBrowserTabs(): { tabs: BrowserTabState[]; activeTabId: string | null } {
   return { tabs: [...tabs.values()].map(toState), activeTabId }
 }
@@ -520,7 +627,7 @@ export function getBrowserState(): {
 // only way to switch persistence for existing tabs is to rebuild them.
 export function reloadBrowserSessions(win: BrowserWindow): void {
   hostWindow = win
-  const snapshot = [...tabs.values()].map((t) => ({ id: t.id, url: t.url }))
+  const snapshot = [...tabs.values()].map((t) => ({ id: t.id, url: t.url, previewMode: t.previewMode }))
   const previousActive = activeTabId
   for (const id of [...tabs.keys()]) {
     const tab = tabs.get(id)
@@ -531,7 +638,7 @@ export function reloadBrowserSessions(win: BrowserWindow): void {
   }
   activeTabId = null
 
-  for (const { id, url } of snapshot) {
+  for (const { id, url, previewMode } of snapshot) {
     const view = new WebContentsView({
       webPreferences: {
         session: browserSession(),
@@ -550,6 +657,7 @@ export function reloadBrowserSessions(win: BrowserWindow): void {
       canGoBack: false,
       canGoForward: false,
       navigationError: null,
+      previewMode,
       snapshotId: null,
       snapshotUrl: null,
       navigationGeneration: 0,
@@ -580,7 +688,73 @@ export function reloadBrowserSessions(win: BrowserWindow): void {
 // Register the host BrowserWindow so agent-initiated tab creation works even
 // before the user has opened a manual tab. Called once from index.ts.
 export function registerBrowserHostWindow(win: BrowserWindow): void {
+  mainWindow = win
   hostWindow = win
+}
+
+export function isBrowserPanelDetached(): boolean {
+  return detachedWindow !== null && !detachedWindow.isDestroyed()
+}
+
+// Reparent every tab's view (not just the active one) so background tabs keep
+// their live state; only the active tab's bounds actually show once the
+// destination window's renderer starts pushing bounds again.
+function moveAllViewsTo(win: BrowserWindow, from: BrowserWindow | null): void {
+  for (const tab of tabs.values()) {
+    if (from && !from.isDestroyed()) {
+      try { from.contentView.removeChildView(tab.view) } catch { /* already detached */ }
+    }
+    try { win.contentView.addChildView(tab.view) } catch { /* view may be gone */ }
+    applyBounds(tab, HIDDEN_BOUNDS)
+  }
+}
+
+// Idempotent: guarded by `detachedWindow !== win` so it's safe whether called
+// from the "Bring back" button (reattachBrowserPanel, which then also closes
+// the window) or from the detached window's own OS close button (the `close`
+// listener below) — whichever happens first does the real work.
+function performReattach(win: BrowserWindow): void {
+  if (detachedWindow !== win) return
+  detachedWindow = null
+  hostWindow = mainWindow
+  if (mainWindow && !mainWindow.isDestroyed()) moveAllViewsTo(mainWindow, win)
+  emitToMain('browser:detachedChanged', { detached: false } satisfies PanelDetachedChangedEvent)
+}
+
+export async function detachBrowserPanel(projectId: string, dropPoint?: ScreenPoint): Promise<PanelDetachedChangedEvent> {
+  if (isBrowserPanelDetached()) {
+    detachedWindow!.focus()
+    return { detached: true }
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error('No main window to detach the Browser panel from.')
+
+  const win = await createDetachedPanelWindow('browser', projectId, 'Browser — AI Workspace', mainWindow, dropPoint)
+  moveAllViewsTo(win, mainWindow)
+  detachedWindow = win
+  hostWindow = win
+
+  // 'closed' (not 'close'): some close paths — including how at least one
+  // automated driver closes a secondary BrowserWindow — go straight to
+  // destruction without emitting the cancelable 'close' event first. 'closed'
+  // is the one event guaranteed to fire exactly once either way. By then `win`
+  // itself is destroyed, but the reparented WebContentsViews are not (their
+  // lifetime is independent, tied to our `tabs` map) — moveAllViewsTo's
+  // `!from.isDestroyed()` guard already skips the now-invalid removeChildView
+  // call and just re-adds each view to mainWindow.
+  win.on('closed', () => performReattach(win))
+
+  emitToMain('browser:detachedChanged', { detached: true } satisfies PanelDetachedChangedEvent)
+  return { detached: true }
+}
+
+export function reattachBrowserPanel(): PanelDetachedChangedEvent {
+  if (!isBrowserPanelDetached()) return { detached: false }
+  const win = detachedWindow!
+  performReattach(win)
+  if (!win.isDestroyed()) {
+    try { win.close() } catch { /* already closing */ }
+  }
+  return { detached: false }
 }
 
 interface AgentScriptError { __error: string }
@@ -680,7 +854,9 @@ async function withRenderViewport<T>(tab: BrowserTab, op: () => Promise<T>): Pro
 // server has no renderer event.sender to derive it from).
 export function agentCreateTab(url?: string): string {
   if (!hostWindow || hostWindow.isDestroyed()) throw new Error('No host window for browser panel')
-  return createBrowserTab(hostWindow, url)
+  const id = createBrowserTab(hostWindow)
+  if (url) agentNavigateTab(id, url)
+  return id
 }
 
 // Resolve after the tab finishes its current load, or after timeoutMs. Resolves
@@ -900,4 +1076,9 @@ export function destroyAllBrowserTabs(): void {
   browserUploadHandles.clear()
   for (const record of downloads.values()) if (record.state === 'pending' || record.state === 'progressing') { try { record.item?.cancel() } catch { /* noop */ }; record.state = 'cancelled'; record.cancelled = true; record.failureReason = 'application_shutdown' }
   activeTabId = null
+  // Never leave the detached Browser window orphaned when the app quits.
+  if (detachedWindow && !detachedWindow.isDestroyed()) {
+    try { detachedWindow.close() } catch { /* already closing */ }
+  }
+  detachedWindow = null
 }

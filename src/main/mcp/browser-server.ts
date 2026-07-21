@@ -19,7 +19,9 @@ const PORT = (() => {
 })()
 const BASE = `http://127.0.0.1:${PORT}`
 const APP_NOT_RUNNING =
-  "AI Workspace isn't running, or its Browser control server is not reachable. Open AI Workspace and try again."
+  "Could not open built-in Browser Preview. Use the Browser panel manually or check Browser control tools. Do not open the system browser. AI Workspace may not be running, or its Browser control server may not be reachable."
+const PREVIEW_FAILED =
+  'Could not open built-in Browser Preview. Use the Browser panel manually or check Browser control tools. Do not open the system browser.'
 
 class AppUnavailableError extends Error {}
 
@@ -92,6 +94,21 @@ async function tabArg(args: Record<string, any>, requiredName: string): Promise<
   return activeTabId()
 }
 
+function isLocalPreviewInput(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const raw = value.trim()
+  const candidate = /^(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/|$)/i.test(raw) || /^\[::1\](?::\d+)?(?:\/|$)/i.test(raw)
+    ? `http://${raw}`
+    : raw
+  try {
+    const parsed = new URL(candidate)
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && ['localhost', '127.0.0.1', '::1'].includes(host)
+  } catch {
+    return false
+  }
+}
+
 const tabIdSchema = { tabId: { type: 'string', description: 'Optional tab id. Defaults to the active Browser tab.' } }
 
 const tools: Tool[] = [
@@ -107,7 +124,7 @@ const tools: Tool[] = [
   },
   {
     name: 'browser_create_tab',
-    description: 'Open a new Browser-panel tab, optionally navigating to a safe URL.',
+    description: "Open a new tab in AI Workspace's built-in Browser panel. Local preview URLs open in Preview mode; never use the system browser for them.",
     inputSchema: {
       type: 'object',
       properties: { url: { type: 'string', description: 'Optional URL. Bare hosts get https://; bare localhost gets http://.' } }
@@ -120,7 +137,7 @@ const tools: Tool[] = [
   },
   {
     name: 'browser_navigate',
-    description: 'Navigate a Browser tab to a safe URL and wait briefly for loading to settle.',
+    description: "Navigate AI Workspace's built-in Browser panel and wait briefly for loading to settle. localhost, 127.0.0.1, and [::1] URLs automatically open/focus Preview mode. Do not open the system browser for local previews.",
     inputSchema: {
       type: 'object',
       properties: { ...tabIdSchema, url: { type: 'string', description: 'Destination URL.' } },
@@ -376,6 +393,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   } catch (err: any) {
     if (err instanceof AppUnavailableError) return errorResult(err.message)
     console.error(`[browser-mcp] tool "${name}" failed:`, err)
+    if ((name === 'browser_navigate' || name === 'browser_create_tab') && isLocalPreviewInput(args.url)) {
+      return errorResult(`${PREVIEW_FAILED} ${err?.message ?? String(err)}`)
+    }
     return errorResult(`Tool "${name}" failed: ${err?.message ?? String(err)}`)
   }
 })
