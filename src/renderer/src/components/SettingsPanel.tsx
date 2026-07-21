@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type {
   HermesCheck,
+  KimiAuthMethod,
+  KimiAuthStatus,
+  KimiCheck,
   Project,
   RemoteHermesConfig,
   SettingsDiagnostics,
@@ -16,6 +19,8 @@ import { applyMotionPreference, type MotionMode } from '../motion'
 import { applyFontFamily, applyTheme, readStoredFontFamily, storeFontFamily } from '../theme'
 import { APP_FONT_OPTIONS } from '../../../shared/appFonts'
 import { SETTING_CHANGED_EVENT } from '../notify'
+import CardSelect, { type CardSelectOption } from './CardSelect'
+import NumberStepper from './NumberStepper'
 
 type OllamaStatus = { connected: boolean; defaultModel: string | null }
 type ClaudeStatus = { installed: boolean; version?: string; bin?: string; error?: string }
@@ -31,7 +36,7 @@ interface SettingMeta {
   description: string
   section: SectionId
   type: 'toggle' | 'select' | 'text' | 'number'
-  options?: { value: string; label: string; stack?: string }[]
+  options?: { value: string; label: string; stack?: string; description?: string }[]
   wired: 'wired' | 'partial' | 'planned'
 }
 
@@ -56,7 +61,7 @@ const SETTINGS: SettingMeta[] = [
   { key: 'workspace_confirm_destructive', label: 'Confirm destructive actions', description: 'Shows an extra confirmation before clearing project memory.', section: 'workspace', type: 'toggle', wired: 'partial' },
   { key: 'workspace_panel_hints', label: 'Panel hints', description: 'Show concise hints in panel chrome where supported.', section: 'workspace', type: 'toggle', wired: 'planned' },
   { key: 'agent_default', label: 'Default code agent', description: 'Preference used by future task handoff flows.', section: 'agents', type: 'select', wired: 'planned', options: [
-    { value: 'codex', label: 'Codex' }, { value: 'claudecode', label: 'Claude Code' }, { value: 'hermes', label: 'Hermes' },
+    { value: 'codex', label: 'Codex' }, { value: 'claudecode', label: 'Claude Code' }, { value: 'hermes', label: 'Hermes' }, { value: 'kimi', label: 'Kimi' },
   ] },
   { key: 'agent_save_outputs_to_knowledge', label: 'Save agent outputs to Knowledge', description: 'Agents already save completed task summaries. This preference gates future auto-save flows.', section: 'agents', type: 'toggle', wired: 'partial' },
   { key: 'agent_show_advanced_logs', label: 'Show advanced agent logs', description: 'Enables expanded tool/run log display when supported.', section: 'agents', type: 'toggle', wired: 'planned' },
@@ -94,7 +99,7 @@ const SECTIONS: { id: SectionId; label: string; description: string }[] = [
   { id: 'overview',    label: 'Overview',         description: 'Workspace health, quick status, and fast-links.' },
   { id: 'appearance',  label: 'Appearance',        description: 'Theme, density, text scale, and motion.' },
   { id: 'workspace',   label: 'Workspace',         description: 'Startup behavior, panel layout, and safety prompts.' },
-  { id: 'agents',      label: 'Agents',            description: 'Codex, Claude Code, and Hermes status and preferences.' },
+  { id: 'agents',      label: 'Agents',            description: 'Codex, Claude Code, Hermes, and Kimi status and preferences.' },
   { id: 'models',      label: 'Models',            description: 'Ollama host, default models, and cloud key status.' },
   { id: 'knowledge',   label: 'Knowledge',         description: 'Shared memory controls, visibility, and explanations.' },
   { id: 'usage',       label: 'Usage',             description: 'Today\'s message and task counts per agent.' },
@@ -141,12 +146,13 @@ function applyUiPrefs(values: Record<string, string | null>) {
   applyMotionPreference(motionMode)
 }
 
-const USAGE_AGENTS = ['chat', 'claudecode', 'hermes', 'codex'] as const
+const USAGE_AGENTS = ['chat', 'claudecode', 'hermes', 'codex', 'kimi'] as const
 const USAGE_LABELS: Record<(typeof USAGE_AGENTS)[number], string> = {
   chat: 'Chat',
   claudecode: 'Claude Code',
   hermes: 'Hermes',
   codex: 'Codex',
+  kimi: 'Kimi',
 }
 
 function tone(ok: boolean | undefined): 'success' | 'error' {
@@ -226,26 +232,79 @@ function SettingsToggle(props: { checked: boolean; onChange: (next: boolean) => 
   )
 }
 
+function optionDescription(key: string, value: string, label: string) {
+  const descriptions: Record<string, Record<string, string>> = {
+    ui_theme: {
+      system: 'Match your OS setting',
+      dark: 'Low-light theme',
+      light: 'Bright theme',
+    },
+    ui_density: {
+      comfortable: 'Roomier rows and controls',
+      compact: 'Tighter spacing for dense work',
+    },
+    ui_font_scale: {
+      '95': 'Slightly smaller interface text',
+      '100': 'Standard interface text size',
+      '110': 'Larger text for easier scanning',
+      '120': 'Largest app-wide text setting',
+    },
+    ui_font_family: {},
+    ui_motion_mode: {
+      full: 'Use the app\'s full motion system',
+      reduced: 'Minimize movement and follow OS preference',
+      off: 'Disable nonessential animation',
+    },
+    workspace_startup: {
+      last: 'Return to the workspace you used last',
+      global: 'Start in the general workspace',
+    },
+    agent_default: {
+      codex: 'Use Codex for future handoff defaults',
+      claudecode: 'Use Claude Code for future handoff defaults',
+      hermes: 'Use Hermes for future autonomous tasks',
+    },
+    research_default_scope: {
+      web: 'Search external web results only',
+      local: 'Search saved workspace knowledge only',
+      both: 'Blend web results with local knowledge',
+    },
+    terminal_start_dir: {
+      project: 'Open shells in the active project folder',
+      app: 'Fall back to the app workspace folder',
+    },
+    hermes_mode: {
+      local: 'Run Hermes through local WSL2',
+      remote: 'Connect to Hermes over SSH',
+    },
+    web_companion_host_mode: {
+      local: 'Accept browser connections from this computer',
+      private: 'Accept private LAN or Tailscale connections',
+    },
+  }
+  return descriptions[key]?.[value] ?? (key === 'ui_font_family' ? `Preview using ${label}` : label)
+}
+
 function SettingsSelect(props: {
   value: string
-  options: { value: string; label: string; stack?: string }[]
+  options: { value: string; label: string; stack?: string; description?: string }[]
   onChange: (next: string) => void
   label: string
+  settingKey: string
+  testId?: string
 }) {
-  const selected = props.options.find((option) => option.value === props.value)
+  const options: CardSelectOption[] = props.options.map((option) => ({
+    ...option,
+    description: option.description ?? optionDescription(props.settingKey, option.value, option.label),
+  }))
   return (
-    <select
-      aria-label={props.label}
+    <CardSelect
+      label={props.label}
       value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-      style={selected?.stack ? { fontFamily: selected.stack } : undefined}
-    >
-      {props.options.map((option) => (
-        <option key={option.value} value={option.value} style={option.stack ? { fontFamily: option.stack } : undefined}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+      options={options}
+      onChange={props.onChange}
+      testId={props.testId}
+    />
   )
 }
 
@@ -377,6 +436,10 @@ export default function SettingsPanel(props: {
   const [claude, setClaude] = useState<ClaudeStatus | null>(null)
   const [hermes, setHermes] = useState<HermesCheck | null>(null)
   const [hermesConfig, setHermesConfig] = useState<RemoteHermesConfig | null>(null)
+  const [kimi, setKimi] = useState<KimiCheck | null>(null)
+  const [kimiAuth, setKimiAuth] = useState<KimiAuthStatus | null>(null)
+  const [kimiApiKeyInput, setKimiApiKeyInput] = useState('')
+  const [kimiLoginBusy, setKimiLoginBusy] = useState(false)
   const [webCompanion, setWebCompanion] = useState<WebCompanionStatus | null>(null)
   const [newWebToken, setNewWebToken] = useState('')
   const [diagnostics, setDiagnostics] = useState<SettingsDiagnostics | null>(null)
@@ -466,12 +529,14 @@ export default function SettingsPanel(props: {
 
   async function refreshProviderStatus(seq = refreshSeq.current) {
     try {
-      const [nextOllama, nextCodex, nextClaude, nextHermes, cfg] = await Promise.all([
+      const [nextOllama, nextCodex, nextClaude, nextHermes, cfg, nextKimi, nextKimiAuth] = await Promise.all([
         window.api.ollama.status(),
         window.api.codex.check(),
         window.api.claudeCode.check(),
         window.api.hermes.check(),
         window.api.hermes.getConfig(),
+        window.api.kimi.check(),
+        window.api.kimi.getAuthStatus(),
       ])
       if (seq !== refreshSeq.current) return
       setOllama(nextOllama)
@@ -479,6 +544,8 @@ export default function SettingsPanel(props: {
       setClaude(nextClaude)
       setHermes(nextHermes)
       setHermesConfig(cfg)
+      setKimi(nextKimi)
+      setKimiAuth(nextKimiAuth)
     } catch (e: any) {
       if (seq === refreshSeq.current) setError(String(e?.message ?? e))
     }
@@ -486,6 +553,13 @@ export default function SettingsPanel(props: {
 
   function valueFor(key: string) {
     return values[key] ?? DEFAULT_VALUES[key] ?? ''
+  }
+
+  function numberValueFor(key: string) {
+    const current = Number(valueFor(key))
+    if (Number.isFinite(current)) return current
+    const fallback = Number(DEFAULT_VALUES[key] ?? 0)
+    return Number.isFinite(fallback) ? fallback : 0
   }
 
   function validate(meta: SettingMeta, next: string): string {
@@ -552,6 +626,7 @@ export default function SettingsPanel(props: {
 
   function renderSetting(meta: SettingMeta) {
     const current = valueFor(meta.key)
+    const saving = savingKey === meta.key && <span className="settings-saving">Saving…</span>
     return (
       <SettingsRow
         key={meta.key}
@@ -572,16 +647,29 @@ export default function SettingsPanel(props: {
             value={current}
             options={meta.options ?? []}
             onChange={(next) => saveSetting(meta, next)}
+            settingKey={meta.key}
+            testId={`settings-select-${meta.key}`}
           />
+        ) : meta.type === 'number' ? (
+          <>
+            {saving}
+            <NumberStepper
+              value={numberValueFor(meta.key)}
+              onChange={(next) => saveSetting(meta, String(next))}
+              min={0}
+              label={meta.label}
+              testId={`settings-number-${meta.key}`}
+            />
+          </>
         ) : (
           <input
-            type={meta.type === 'number' ? 'number' : 'text'}
+            type="text"
             value={current}
             onChange={(e) => saveSetting(meta, e.target.value)}
             aria-label={meta.label}
           />
         )}
-        {savingKey === meta.key && <span className="settings-saving">Saving…</span>}
+        {meta.type !== 'number' && saving}
       </SettingsRow>
     )
   }
@@ -624,6 +712,42 @@ export default function SettingsPanel(props: {
     setSavingKey(null)
   }
 
+  async function setKimiAuthMethodChoice(method: KimiAuthMethod) {
+    setSavingKey('kimi-auth-method')
+    try {
+      await window.api.kimi.setAuthMethod(method)
+      setKimiAuth(await window.api.kimi.getAuthStatus())
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  async function saveKimiApiKey() {
+    if (!kimiApiKeyInput.trim()) return
+    setSavingKey('kimi-api-key')
+    try {
+      await window.api.kimi.setApiKey(kimiApiKeyInput.trim())
+      setKimiApiKeyInput('')
+      showMessage('Kimi API key saved')
+      setKimiAuth(await window.api.kimi.getAuthStatus())
+    } catch (e: any) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  async function runKimiLoginFlow() {
+    setKimiLoginBusy(true)
+    try {
+      const r = await window.api.kimi.login()
+      showMessage(r.success ? 'Kimi login succeeded' : r.error ?? 'Kimi login failed')
+      setKimiAuth(await window.api.kimi.getAuthStatus())
+    } finally {
+      setKimiLoginBusy(false)
+    }
+  }
+
   async function clearMemories() {
     if (isGlobalWorkspace) return
     if (!confirmClear) {
@@ -661,8 +785,10 @@ export default function SettingsPanel(props: {
       `Codex: ${report.providers.codex.installed ? 'installed' : 'missing'} ${report.providers.codex.version ?? ''}`,
       `Claude Code: ${report.providers.claudeCode.installed ? 'installed' : 'missing'} ${report.providers.claudeCode.version ?? ''}`,
       `Hermes: ${report.providers.hermes.connected ? 'connected' : report.providers.hermes.installed ? 'installed' : 'not installed'}`,
+      `Kimi: ${report.providers.kimi.installed ? 'installed' : 'not installed'} ${report.providers.kimi.version ?? ''}`,
       `Web Companion: ${report.webCompanion.running ? 'running' : report.webCompanion.enabled ? 'enabled but stopped' : 'disabled'} (${report.webCompanion.hostMode}, port ${report.webCompanion.port})`,
       `Ollama Cloud key: ${report.settings.secrets.ollama_cloud_key?.configured ? 'configured' : 'not configured'}`,
+      `Kimi API key: ${report.settings.secrets.kimi_api_key?.configured ? 'configured' : 'not configured'}`,
     ].join('\n')
   }
 
@@ -741,7 +867,7 @@ export default function SettingsPanel(props: {
 
   const activeSection = visibleSections.some((s) => s.id === active) ? active : visibleSections[0]?.id ?? 'overview'
 
-  const agentCount = (codex?.installed ? 1 : 0) + (claude?.installed ? 1 : 0) + (hermes?.installed ? 1 : 0)
+  const agentCount = (codex?.installed ? 1 : 0) + (claude?.installed ? 1 : 0) + (hermes?.installed ? 1 : 0) + (kimi?.installed ? 1 : 0)
 
   const usageByAgent = useMemo(() => {
     const map: Partial<Record<(typeof USAGE_AGENTS)[number], UsageSummaryRow>> = {}
@@ -823,8 +949,8 @@ export default function SettingsPanel(props: {
                   />
                   <InfoCard
                     label="Agents available"
-                    value={`${agentCount} of 3`}
-                    detail={[codex?.installed ? 'Codex' : null, claude?.installed ? 'Claude Code' : null, hermes?.installed ? 'Hermes' : null].filter(Boolean).join(', ') || 'None installed'}
+                    value={`${agentCount} of 4`}
+                    detail={[codex?.installed ? 'Codex' : null, claude?.installed ? 'Claude Code' : null, hermes?.installed ? 'Hermes' : null, kimi?.installed ? 'Kimi' : null].filter(Boolean).join(', ') || 'None installed'}
                     tone={agentCount > 0 ? 'success' : 'warning'}
                   />
                 </div>
@@ -890,6 +1016,12 @@ export default function SettingsPanel(props: {
                     detail={hermes?.distro ?? hermes?.error ?? 'WSL2 / remote SSH agent'}
                     tone={hermes?.connected ? 'success' : hermes?.installed ? 'info' : 'warning'}
                   />
+                  <InfoCard
+                    label="Kimi"
+                    value={kimi?.installed ? (kimiAuth?.configured ? 'Ready' : 'Needs auth') : 'Not installed'}
+                    detail={kimi?.version ?? kimi?.error ?? 'Moonshot AI Kimi Code CLI (ACP, local)'}
+                    tone={kimi?.installed && kimiAuth?.configured ? 'success' : kimi?.installed ? 'info' : 'warning'}
+                  />
                 </div>
                 {sectionSettings('agents').map(renderSetting)}
                 {!codex?.installed && (
@@ -902,6 +1034,56 @@ export default function SettingsPanel(props: {
                     Install with <code>npm install -g @anthropic-ai/claude-code</code> and run <code>claude</code> to log in.
                   </WorkspaceNotice>
                 )}
+                {!kimi?.installed && (
+                  <WorkspaceNotice title="Kimi setup" tone="info">
+                    Install with <code>npm install -g @moonshot-ai/kimi-code</code> (Node 22.19+), or the official
+                    install script from the docs, then restart AI Workspace. See{' '}
+                    <a href="#" onClick={(e) => { e.preventDefault(); window.api.shell.openExternal('https://moonshotai.github.io/kimi-code/en/guides/getting-started.html') }}>
+                      getting-started guide
+                    </a>.
+                  </WorkspaceNotice>
+                )}
+                <div className="settings-subpanel">
+                  <h3>Kimi Authentication</h3>
+                  <SettingsRow label="Auth method" description="OAuth device-code login (kimi login) or a Moonshot API key.">
+                    <SettingsSelect
+                      label="Kimi auth method"
+                      value={kimiAuth?.method ?? 'oauth'}
+                      options={[{ value: 'oauth', label: 'OAuth login' }, { value: 'apikey', label: 'API key' }]}
+                      onChange={(method) => void setKimiAuthMethodChoice(method as KimiAuthMethod)}
+                      settingKey="kimi_auth_method"
+                      testId="settings-select-kimi-auth-method"
+                    />
+                  </SettingsRow>
+                  {kimiAuth?.method === 'oauth' ? (
+                    <div className="settings-action-row">
+                      <button className="primary" data-testid="settings-kimi-login" onClick={runKimiLoginFlow} disabled={kimiLoginBusy}>
+                        {kimiLoginBusy ? 'Waiting for login…' : 'Log in with Kimi'}
+                      </button>
+                      <StatusBadge tone={kimiAuth?.configured ? 'success' : 'warning'}>
+                        {kimiAuth?.configured ? 'Authenticated' : kimiAuth?.detail ?? 'Not authenticated'}
+                      </StatusBadge>
+                    </div>
+                  ) : (
+                    <>
+                      <SettingsRow label="Moonshot API key" description="Stored as plaintext in the local database, same as the Ollama Cloud key. Sent to the kimi acp process as an environment variable.">
+                        <input
+                          type="password"
+                          data-testid="settings-kimi-api-key"
+                          value={kimiApiKeyInput}
+                          onChange={(e) => setKimiApiKeyInput(e.target.value)}
+                          placeholder={kimiAuth?.configured ? '••••••••' : 'Paste API key'}
+                        />
+                      </SettingsRow>
+                      <div className="settings-action-row">
+                        <button className="primary" onClick={saveKimiApiKey} disabled={!kimiApiKeyInput.trim() || savingKey === 'kimi-api-key'}>
+                          {savingKey === 'kimi-api-key' ? 'Saving…' : 'Save key'}
+                        </button>
+                        {kimiAuth?.configured && <StatusBadge tone="success">Key saved</StatusBadge>}
+                      </div>
+                    </>
+                  )}
+                </div>
                 {hermesConfig && (
                   <div className="settings-subpanel">
                     <h3>Hermes Connection</h3>
@@ -911,6 +1093,8 @@ export default function SettingsPanel(props: {
                         value={hermesConfig.mode}
                         options={[{ value: 'local', label: 'Local WSL2' }, { value: 'remote', label: 'Remote SSH' }]}
                         onChange={(mode) => setHermesConfig({ ...hermesConfig, mode: mode as RemoteHermesConfig['mode'] })}
+                        settingKey="hermes_mode"
+                        testId="settings-select-hermes-mode"
                       />
                     </SettingsRow>
                     <SettingsRow label="SSH host" description="Remote mode only. Private key file contents are never read or displayed.">
@@ -996,7 +1180,7 @@ export default function SettingsPanel(props: {
 
             {/* ── Knowledge ────────────────────────────────────────────── */}
             {activeSection === 'knowledge' && (
-              <SettingsSection id="settings-knowledge" title="Knowledge & Memory" description="One shared memory layer across Chat, Hermes, Claude Code, and Codex.">
+              <SettingsSection id="settings-knowledge" title="Knowledge & Memory" description="One shared memory layer across Chat, Hermes, Claude Code, Codex, and Kimi.">
                 <WorkspaceNotice title="How memory works" tone="info">
                   Sessions are temporary. Durable memory is extracted after sessions end and stored in the local database. It is shared across all agents in the same project.
                 </WorkspaceNotice>
@@ -1081,7 +1265,7 @@ export default function SettingsPanel(props: {
               <SettingsSection id="settings-editor" title="Editor & Terminal" description="Local editor and shell defaults.">
                 {sectionSettings('editor').map(renderSetting)}
                 <WorkspaceNotice title="Project folder required" tone="warning">
-                  Terminal, Codex, Claude Code, and Hermes need a folder-backed project. Global Workspace intentionally blocks project shell access.
+                  Terminal, Codex, Claude Code, Hermes, and Kimi need a folder-backed project. Global Workspace intentionally blocks project shell access.
                 </WorkspaceNotice>
               </SettingsSection>
             )}
@@ -1112,7 +1296,7 @@ export default function SettingsPanel(props: {
                 </div>
 
                 <WorkspaceNotice title="Security boundary" tone="warning">
-                  The Web Companion exposes Chat only. It does not expose Terminal, Editor writes, Codex, Claude Code, Hermes, arbitrary filesystem browsing, raw settings, environment variables, or database access.
+                  The Web Companion exposes Chat only. It does not expose Terminal, Editor writes, Codex, Claude Code, Hermes, Kimi, arbitrary filesystem browsing, raw settings, environment variables, or database access.
                 </WorkspaceNotice>
 
                 <SettingsRow
@@ -1138,6 +1322,8 @@ export default function SettingsPanel(props: {
                       { value: 'private', label: 'Private network / Tailscale' },
                     ]}
                     onChange={(hostMode) => configureWeb({ hostMode: hostMode as WebCompanionStatus['hostMode'] })}
+                    settingKey="web_companion_host_mode"
+                    testId="settings-select-web-companion-host-mode"
                   />
                 </SettingsRow>
 
@@ -1145,15 +1331,15 @@ export default function SettingsPanel(props: {
                   label="Port"
                   description="Allowed range: 1024-65535. Changing the port restarts the companion server if it is enabled."
                 >
-                  <input
-                    type="number"
+                  {savingKey === 'web-companion' && <span className="settings-saving">Saving...</span>}
+                  <NumberStepper
                     min={1024}
                     max={65535}
                     value={webCompanion?.port ?? 8765}
-                    onChange={(e) => configureWeb({ port: Number(e.target.value) })}
-                    aria-label="Web Companion port"
+                    onChange={(port) => configureWeb({ port })}
+                    label="Web Companion port"
+                    testId="settings-number-web-companion-port"
                   />
-                  {savingKey === 'web-companion' && <span className="settings-saving">Saving...</span>}
                 </SettingsRow>
 
                 <SettingsRow
@@ -1204,7 +1390,7 @@ export default function SettingsPanel(props: {
                     Projects, sessions, memory, settings, and agent summaries are stored in a single SQLite database on your local machine. Nothing is sent to external servers except agent CLI calls you initiate.
                   </WorkspaceNotice>
                   <WorkspaceNotice title="Secret storage warning" tone="warning">
-                    Ollama Cloud keys and Hermes SSH paths are stored as plaintext in the local database. This app does not currently use encrypted storage. Do not use this workspace on a shared machine with sensitive keys.
+                    Ollama Cloud keys, Hermes SSH paths, and Kimi API keys are stored as plaintext in the local database. This app does not currently use encrypted storage. Do not use this workspace on a shared machine with sensitive keys.
                   </WorkspaceNotice>
                 </div>
                 <SettingsRow
