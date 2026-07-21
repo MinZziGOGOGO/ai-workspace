@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
+import { useComposerDraft } from '../hooks/useComposerDraft'
 import { diffLines } from 'diff'
 import type { Project, Session, Message, CCActivityEntry, CCFileDiff, CCEvent, CCUsage, Checkpoint, AgentModelInfo, ClaudeCodePermissionMode } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
@@ -62,6 +63,7 @@ function loadPermissionMode(): ClaudeCodePermissionMode {
 }
 const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.claudecode.pinned'
+const SELECTED_SESSION_KEY_PREFIX = 'aiworkspace.claudecode.selected-session.'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
 }
@@ -370,7 +372,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
+  const [input, setInput] = useComposerDraft('aiworkspace.claudecode.draft', session?.id)
   const [injectMemory, setInjectMemory] = useState(false)
   const [running, setRunning] = useState(false)
   const [output, setOutput] = useState('')
@@ -410,6 +412,7 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const tokenTimestamps = useRef<number[]>([])
+  const lastLiveSequenceRef = useRef(0)
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
   const estimatedTokens = useMemo(
@@ -430,6 +433,11 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     { resetKey: session?.id, immediate: running, activeDelay: running ? 100 : 0 }
   )
   sessionRef.current = session
+
+  useEffect(() => {
+    if (!session?.id) return
+    try { localStorage.setItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`, session.id) } catch { /* storage unavailable */ }
+  }, [props.project.id, session?.id])
 
   useEffect(() => () => {
     stopMotion(sessionSwitchAnimRef.current)
@@ -562,8 +570,22 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
 
   useEffect(() => {
     if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
-    window.api.sessions.list(props.project.id, 'claudecode').then(setSessions)
-    window.api.sessions.listArchived(props.project.id, 'claudecode').then(setArchivedSessions)
+    let disposed = false
+    void Promise.all([
+      window.api.sessions.list(props.project.id, 'claudecode'),
+      window.api.sessions.listArchived(props.project.id, 'claudecode'),
+      window.api.claudeCode.liveState(props.project.id),
+    ]).then(([nextSessions, nextArchived, live]) => {
+      if (disposed) return
+      setSessions(nextSessions)
+      setArchivedSessions(nextArchived)
+      let storedId: string | null = null
+      try { storedId = localStorage.getItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`) } catch { /* storage unavailable */ }
+      const desiredId = live?.sessionId ?? storedId
+      const next = desiredId ? [...nextSessions, ...nextArchived].find((candidate) => candidate.id === desiredId) ?? null : null
+      if (next?.id !== sessionRef.current?.id) setSession(next)
+    })
+    return () => { disposed = true }
   }, [props.project.id, isGlobalWorkspace, active])
 
   useEffect(() => {
@@ -612,23 +634,47 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
     return () => window.removeEventListener('panel:handoffSend', onHandoff)
   }, [])
 
+  const applyLiveEvent = useCallback((e: CCEvent) => {
+    if (e.kind === 'text') { setOutput((o) => o + e.text); tokenTimestamps.current.push(Date.now()) }
+    else if (e.kind === 'tool') setActivity((a) => [...a, { id: e.id, name: e.name, summary: e.summary }])
+    else if (e.kind === 'tool-result') setActivity((a) => markLastPending(a, e.ok))
+    else if (e.kind === 'file_diff') {
+      setActivity((a) => attachDiff(a, e.toolCallId, { path: e.path, before: e.before, after: e.after }))
+      notifyPreviewFileChanged(props.project.id, e.path)
+    }
+    else if (e.kind === 'system') setNote(e.summary)
+    else if (e.kind === 'usage') setContextUsage(e.usage)
+    else if (e.kind === 'error') setError(e.message)
+  }, [props.project.id])
+
   useEffect(() => {
+    let disposed = false
+    let hydrated = false
+    let finished = false
+    const queuedEvents: Array<{ event: CCEvent; sequence?: number }> = []
+    lastLiveSequenceRef.current = 0
+    const acceptEvent = (event: CCEvent, sequence?: number) => {
+      if (sequence !== undefined) {
+        // Main restarts the counter at 1 for every turn, so a fresh run resets the
+        // watermark — otherwise the second turn of a session would be discarded as
+        // 'already seen'.
+        if (sequence === 1) lastLiveSequenceRef.current = 0
+        if (sequence <= lastLiveSequenceRef.current) return
+        lastLiveSequenceRef.current = sequence
+      }
+      applyLiveEvent(event)
+    }
     const offEvent = window.api.claudeCode.onEvent((d) => {
       if (d.sessionId !== session?.id) return
-      const e: CCEvent = d.event
-      if (e.kind === 'text') { setOutput((o) => o + e.text); tokenTimestamps.current.push(Date.now()) }
-      else if (e.kind === 'tool') setActivity((a) => [...a, { id: e.id, name: e.name, summary: e.summary }])
-      else if (e.kind === 'tool-result') setActivity((a) => markLastPending(a, e.ok))
-      else if (e.kind === 'file_diff') {
-        setActivity((a) => attachDiff(a, e.toolCallId, { path: e.path, before: e.before, after: e.after }))
-        notifyPreviewFileChanged(props.project.id, e.path)
+      if (!hydrated) {
+        queuedEvents.push({ event: d.event, sequence: d.sequence })
+        return
       }
-      else if (e.kind === 'system') setNote(e.summary)
-      else if (e.kind === 'usage') setContextUsage(e.usage)
-      else if (e.kind === 'error') setError(e.message)
+      acceptEvent(d.event, d.sequence)
     })
     const offDone = window.api.claudeCode.onDone(async (d) => {
       if (d.sessionId !== session?.id) return
+      finished = true
       setRunning(false); setLoginRequired(d.loginRequired ?? false)
       setMessages(await window.api.claudeCode.messages(d.sessionId))
       setOutput(''); setActivity([]); setNote('')
@@ -653,8 +699,27 @@ export default function ClaudeCodeTab(props: { project: Project; onOpenKnowledge
         return next
       })
     })
-    return () => { offEvent(); offDone(); offCheckpoint() }
-  }, [session])
+    if (session) {
+      void window.api.claudeCode.liveState(props.project.id).then((live) => {
+        if (disposed) return
+        if (live?.sessionId === session.id) {
+          if (!finished) setRunning(true)
+          for (const item of live.events) acceptEvent(item.event, item.sequence)
+        }
+        hydrated = true
+        for (const item of queuedEvents) acceptEvent(item.event, item.sequence)
+        queuedEvents.length = 0
+      }).catch(() => {
+        if (disposed) return
+        hydrated = true
+        for (const item of queuedEvents) acceptEvent(item.event, item.sequence)
+        queuedEvents.length = 0
+      })
+    } else {
+      hydrated = true
+    }
+    return () => { disposed = true; offEvent(); offDone(); offCheckpoint() }
+  }, [session?.id, props.project.id, applyLiveEvent])
 
   // Compute tok/s every 500ms while running
   useEffect(() => {

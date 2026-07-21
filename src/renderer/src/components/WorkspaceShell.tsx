@@ -1,12 +1,13 @@
 import { createPortal } from 'react-dom'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Allotment } from 'allotment'
 import 'allotment/dist/style.css'
-import type { Project, LayoutPreset } from '../types'
+import type { Project, LayoutPreset, Session } from '../types'
 import ChatTab from './ChatTab'
 import HermesTab from './HermesTab'
 import ClaudeCodeTab from './ClaudeCodeTab'
 import CodexTab from './CodexTab'
+import KimiTab from './KimiTab'
 import KnowledgePanel from './KnowledgePanel'
 import SettingsPanel from './SettingsPanel'
 import ProjectPicker from './ProjectPicker'
@@ -17,10 +18,13 @@ import ResearchPanel from './ResearchPanel'
 import ActivityPanel from './ActivityPanel'
 import ExtensionsPanel from './ExtensionsPanel'
 import BrowserPanel from './BrowserPanel'
+import PreviewPanel from './PreviewPanel'
 import ApprovalCenter from './ApprovalCenter'
+import AgentActivityPopover from './AgentActivityPopover'
 import CommandPalette from './CommandPalette'
 import { ToastProvider, useToast } from './ToastContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
+import type { AgentPanelId, ScreenPoint, WorkspaceWindowBounds } from '../../../shared/ipcTypes'
 import { StatusBadge } from './WorkspacePrimitives'
 import { useShortcuts } from '../ShortcutContext'
 import { useAgentActivity, type AgentId } from '../AgentActivityContext'
@@ -42,7 +46,7 @@ import {
 type DockPanel =
   | 'home'
   | 'navigator' | 'chat' | 'knowledge'
-  | 'hermes' | 'claudecode' | 'codex' | 'editor' | 'terminal' | 'research' | 'activity' | 'extensions' | 'browser'
+  | 'hermes' | 'claudecode' | 'codex' | 'kimi' | 'editor' | 'terminal' | 'research' | 'activity' | 'extensions' | 'browser' | 'preview'
 
 type SplitDirection = 'horizontal' | 'vertical'
 
@@ -63,14 +67,17 @@ interface PersistedLayout {
 }
 
 interface DragState {
+  id: number
   panel: DockPanel
   startX: number
   startY: number
   x: number
   y: number
-  originRect: { left: number; right: number; top: number; bottom: number } | null
+  screenX: number
+  screenY: number
   hoverZone: LayoutZone | null
   hoverLocal: LocalDrop | null
+  detachReady: boolean
   live: boolean
   onClickFallback: (() => void) | null
 }
@@ -89,6 +96,33 @@ interface LocalDrop {
 const LAYOUT_VERSION = 3 as const
 const BAND_PX = 40
 const PANEL_MIN_SIZE = 280
+const DETACH_THRESHOLD_PX = 16
+// Step 4 extends the Step 2 drag gesture and the Step 3 button-detach to the
+// four remaining agent tabs. Settings/Knowledge/Research stay out until they get
+// their own scoping decision (WINDOW_DETACH_DESIGN.md §2.3).
+const AGENT_DETACH_PANELS: AgentPanelId[] = ['hermes', 'codex', 'kimi', 'chat']
+const DETACHABLE_PANELS = new Set<DockPanel>(['browser', 'preview', 'claudecode', ...AGENT_DETACH_PANELS])
+
+// Panels whose header carries an explicit "Detach" button (Browser and Preview
+// have their own in-panel chrome for this). Claude Code's pilot testid is kept
+// verbatim; the Step 4 tabs follow the same `<panel>-detach` convention.
+const HEADER_DETACH_TESTIDS: Partial<Record<DockPanel, string>> = {
+  claudecode: 'claude-code-detach',
+  hermes: 'hermes-detach',
+  codex: 'codex-detach',
+  kimi: 'kimi-detach',
+  chat: 'chat-detach',
+}
+
+function isPastDetachThreshold(point: ScreenPoint, bounds: WorkspaceWindowBounds | null): boolean {
+  if (!bounds) return false
+  return (
+    point.x < bounds.x - DETACH_THRESHOLD_PX ||
+    point.x > bounds.x + bounds.width + DETACH_THRESHOLD_PX ||
+    point.y < bounds.y - DETACH_THRESHOLD_PX ||
+    point.y > bounds.y + bounds.height + DETACH_THRESHOLD_PX
+  )
+}
 
 // ── Layout picker zones ────────────────────────────────────────────────────────
 
@@ -109,7 +143,7 @@ const ZONES: ZoneEntry[] = [
 ]
 
 const PANELS: DockPanel[] = [
-  'home', 'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'editor', 'terminal', 'research', 'activity', 'extensions', 'browser'
+  'home', 'navigator', 'chat', 'knowledge', 'hermes', 'claudecode', 'codex', 'kimi', 'editor', 'terminal', 'research', 'activity', 'extensions', 'browser', 'preview'
 ]
 
 const PANEL_TITLES: Record<DockPanel, string> = {
@@ -120,12 +154,14 @@ const PANEL_TITLES: Record<DockPanel, string> = {
   hermes: 'Hermes',
   claudecode: 'Claude Code',
   codex: 'Codex',
+  kimi: 'Kimi',
   editor: 'Editor',
   terminal: 'Terminal',
   research: 'Research',
   activity: 'Activity',
   extensions: 'Extensions',
   browser: 'Browser',
+  preview: 'Preview',
 }
 
 const PANEL_META: Record<DockPanel, {
@@ -176,6 +212,12 @@ const PANEL_META: Record<DockPanel, {
     status: 'Runs',
     tone: 'success',
   },
+  kimi: {
+    kind: 'Agent',
+    hint: 'Kimi Code (Moonshot AI) tasks in the selected project',
+    status: 'Runs',
+    tone: 'success',
+  },
   editor: {
     kind: 'File',
     hint: 'Open and edit files from Navigator',
@@ -210,6 +252,12 @@ const PANEL_META: Record<DockPanel, {
     kind: 'Browser',
     hint: 'Browse the web in an embedded Chromium tab',
     status: 'Manual',
+    tone: 'neutral',
+  },
+  preview: {
+    kind: 'Preview',
+    hint: 'Watch your project\'s own dev server update live',
+    status: 'Live',
     tone: 'neutral',
   },
 }
@@ -263,6 +311,13 @@ const hermesIcon = tablerIcon([
 
 const claudeCodeIcon = tablerIcon(['M7 8l-4 4l4 4', 'M17 8l4 4l-4 4', 'M14 4l-4 16'])
 
+const kimiIcon = tablerIcon([
+  'M4 19v-14',
+  'M4 12l9 -7',
+  'M4 12l9 7',
+  'M13 5l7 7l-7 7',
+])
+
 const codexIcon = tablerIcon([
   'M21 16.008v-8.018a1.98 1.98 0 0 0 -1 -1.717l-7 -4.008a2.016 2.016 0 0 0 -2 0l-7 4.008c-.619 .359 -1 1.02 -1 1.718v8.018c0 .698 .381 1.359 1 1.718l7 4.008a2.016 2.016 0 0 0 2 0l7 -4.008c.619 -.359 1 -1.02 1 -1.718z',
   'M12 22v-10',
@@ -304,6 +359,11 @@ const browserIcon = tablerIcon([
   'M12.5 3a17 17 0 0 1 0 18',
 ])
 
+const previewIcon = tablerIcon([
+  'M3 12c2.5 -5 6 -7.5 9 -7.5s6.5 2.5 9 7.5c-2.5 5 -6 7.5 -9 7.5s-6.5 -2.5 -9 -7.5',
+  'M12 15m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0',
+])
+
 const TOPBAR_GROUPS: { label: string; panels: TopbarPanel[] }[] = [
   { label: 'Home',      panels: [topbarPanel('home', homeIcon)] },
   { label: 'AI',        panels: [
@@ -311,12 +371,14 @@ const TOPBAR_GROUPS: { label: string; panels: TopbarPanel[] }[] = [
     topbarPanel('hermes', hermesIcon),
     topbarPanel('claudecode', claudeCodeIcon),
     topbarPanel('codex', codexIcon),
+    topbarPanel('kimi', kimiIcon),
   ] },
   { label: 'Tools',     panels: [
     topbarPanel('navigator', navigatorIcon),
     topbarPanel('editor', editorIcon),
     topbarPanel('terminal', terminalIcon),
     topbarPanel('browser', browserIcon),
+    topbarPanel('preview', previewIcon),
     topbarPanel('activity', activityIcon),
     topbarPanel('extensions', extensionsIcon),
   ] },
@@ -581,6 +643,87 @@ function localHighlightStyle(side: LocalDropSide, target: DOMRect, workspace: DO
   }
 }
 
+// ── Window-half hit-testing (shared by live drag + debug overlay) ────────────
+// A single resolver so the overlay can never disagree with the real drop logic.
+
+type PanelRect = { target: DockPanel; rect: DOMRect }
+
+// Proportional nearest-edge for a point relative to a panel rect. Distances are
+// normalized by width/height so a wide (or tall) panel isn't biased toward its
+// short axis. Every point resolves to exactly one side, so the four sides tile
+// the WHOLE panel as diagonal quadrants — there is no inert center.
+function nearestSide(x: number, y: number, rect: DOMRect): LocalDropSide {
+  const left = rect.width ? (x - rect.left) / rect.width : 1
+  const right = rect.width ? (rect.right - x) / rect.width : 1
+  const top = rect.height ? (y - rect.top) / rect.height : 1
+  const bottom = rect.height ? (rect.bottom - y) / rect.height : 1
+  const min = Math.min(left, right, top, bottom)
+  if (min === top) return 'top'
+  if (min === bottom) return 'bottom'
+  if (min === left) return 'left'
+  return 'right'
+}
+
+// Map any workspace point to a target panel: the panel it is inside, or — when
+// it lands in a gap between floating cards — the nearest panel by squared
+// distance to that panel's rect. This puts the boundary between two panels'
+// drop zones in the middle of the visible gap, so no pixel range is dead.
+function nearestPanel(x: number, y: number, panels: PanelRect[]): PanelRect | null {
+  let nearest: PanelRect | null = null
+  let best = Infinity
+  for (const p of panels) {
+    const { rect } = p
+    if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return p
+    const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0
+    const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0
+    const dist = dx * dx + dy * dy
+    if (dist < best) { best = dist; nearest = p }
+  }
+  return nearest
+}
+
+// The open panels' on-screen rects (optionally excluding the dragged one, which
+// is hidden while dragging). Rect-based lookup, so pointer-events:none on the
+// wrap during drag doesn't hide panels the way elementsFromPoint would.
+function collectPanelRects(workspaceEl: HTMLElement, exclude: DockPanel | null): PanelRect[] {
+  const out: PanelRect[] = []
+  for (const el of workspaceEl.querySelectorAll<HTMLElement>('[data-dock-panel-id]')) {
+    const raw = el.dataset.dockPanelId
+    if (!raw || !PANELS.includes(raw as DockPanel)) continue
+    const target = raw as DockPanel
+    if (target === exclude) continue
+    const rect = el.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) continue
+    out.push({ target, rect })
+  }
+  return out
+}
+
+type Resolved =
+  | { kind: 'band'; zone: LayoutZone }
+  | { kind: 'local'; target: DockPanel; side: LocalDropSide; rect: DOMRect }
+  | { kind: 'full' }
+  | { kind: 'none' }
+
+// Single source of truth for "what does a drop at (x,y) resolve to?" Priority:
+//   1. outer screen-half edge band (unchanged),
+//   2. window-half — nearest panel, then nearest edge across its FULL bounds
+//      (gaps included via nearestPanel),
+//   3. full — only when there is no candidate panel at all,
+//   4. none — outside the workspace rect.
+function resolveDropAt(x: number, y: number, workspaceRect: DOMRect, panels: PanelRect[]): Resolved {
+  if (x < workspaceRect.left || x > workspaceRect.right || y < workspaceRect.top || y > workspaceRect.bottom) {
+    return { kind: 'none' }
+  }
+  const band = getBandZone(x, y, workspaceRect)
+  if (band) return { kind: 'band', zone: band }
+  const panel = nearestPanel(x, y, panels)
+  if (!panel) return { kind: 'full' }
+  const cx = Math.min(panel.rect.right, Math.max(panel.rect.left, x))
+  const cy = Math.min(panel.rect.bottom, Math.max(panel.rect.top, y))
+  return { kind: 'local', target: panel.target, side: nearestSide(cx, cy, panel.rect), rect: panel.rect }
+}
+
 // ── Update sizes in tree ──────────────────────────────────────────────────────
 
 function updateSizes(node: LayoutNode, path: number[], sizes: number[]): LayoutNode {
@@ -617,7 +760,8 @@ function WorkspaceShellInner(props: {
   const [groupDropdown, setGroupDropdown] = useState<{ label: string; rect: DOMRect } | null>(null)
   const { addToast } = useToast()
   const { shortcuts } = useShortcuts()
-  const { active: agentActive } = useAgentActivity()
+  const { active: agentActive, tasks: agentTasks } = useAgentActivity()
+  const [activityPopoverRect, setActivityPopoverRect] = useState<DOMRect | null>(null)
   const focusedPanelRef = useRef<DockPanel | null>(null)
   const knowledgeButtonRef = useRef<HTMLButtonElement | null>(null)
   const knowledgePulseRef = useRef<MotionHandle>(null)
@@ -634,6 +778,72 @@ function WorkspaceShellInner(props: {
   const [presets, setPresets] = useState<LayoutPreset[]>([])
   const [savingPreset, setSavingPreset] = useState(false)
   const [presetName, setPresetName] = useState('')
+  // Which detachable panels currently live in their own OS window. A detached
+  // panel gives up its dock slot entirely — nothing is left behind — so this
+  // set exists only to drive the topbar rack's "detached" badge and to route a
+  // rack click to "bring the window home" instead of "open a new slot".
+  const [detachedPanels, setDetachedPanels] = useState<Set<DockPanel>>(() => new Set())
+  const isPanelDetached = (panel: DockPanel) => detachedPanels.has(panel)
+
+  /**
+   * Collapse-and-reflow, the browser-tab-strip way: detaching *closes* the
+   * panel's dock slot and reattaching *opens* it again, reusing the exact
+   * closePanel/openPanel the header's Close button and the rack already use.
+   * Allotment therefore reflows the remaining panes with no bespoke logic and
+   * no placeholder card. Called from every panel's detachedChanged event, so
+   * button-detach, drag-out, "Bring back" and closing the detached window all
+   * converge here. See WINDOW_DETACH_DESIGN.md §4.6.
+   */
+  const applyDetachedLayout = useCallback((panel: DockPanel, detached: boolean) => {
+    setDetachedPanels((prev) => {
+      if (prev.has(panel) === detached) return prev
+      const next = new Set(prev)
+      if (detached) next.add(panel); else next.delete(panel)
+      return next
+    })
+    if (detached) handlersRef.current.closePanel(panel)
+    else handlersRef.current.openPanel(panel)
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    // On mount only `true` acts: a renderer that reloaded while a panel was
+    // detached must collapse that slot, but `false` must not conjure a slot for
+    // a panel the user never opened.
+    void window.api.claudeCode.isDetached().then((detached) => {
+      if (!disposed && detached) applyDetachedLayout('claudecode', true)
+    })
+    const off = window.api.claudeCode.onDetachedChanged(({ detached }) => applyDetachedLayout('claudecode', detached))
+    return () => { disposed = true; off() }
+  }, [applyDetachedLayout])
+
+  useEffect(() => {
+    let disposed = false
+    void window.api.agentPanel.listDetached().then((panels) => {
+      if (disposed) return
+      for (const panel of panels) applyDetachedLayout(panel, true)
+    })
+    const off = window.api.agentPanel.onDetachedChanged(({ panel, detached }) => applyDetachedLayout(panel, detached))
+    return () => { disposed = true; off() }
+  }, [applyDetachedLayout])
+
+  useEffect(() => {
+    let disposed = false
+    void window.api.browser.isDetached().then((detached) => {
+      if (!disposed && detached) applyDetachedLayout('browser', true)
+    })
+    const off = window.api.browser.onDetachedChanged(({ detached }) => applyDetachedLayout('browser', detached))
+    return () => { disposed = true; off() }
+  }, [applyDetachedLayout])
+
+  useEffect(() => {
+    let disposed = false
+    void window.api.preview.isDetached().then((detached) => {
+      if (!disposed && detached) applyDetachedLayout('preview', true)
+    })
+    const off = window.api.preview.onDetachedChanged(({ detached }) => applyDetachedLayout('preview', detached))
+    return () => { disposed = true; off() }
+  }, [applyDetachedLayout])
 
   useEffect(() => {
     function handleKnowledgePulse() {
@@ -697,6 +907,15 @@ function WorkspaceShellInner(props: {
     return () => document.removeEventListener('mousedown', handleOutside)
   }, [presetsDropdown])
 
+  // Close the activity popover on outside click (its own mousedown stops
+  // propagation, and the badge toggle stops it too, so a bubble listener is safe).
+  useEffect(() => {
+    if (!activityPopoverRect) return
+    function handleOutside() { setActivityPopoverRect(null) }
+    document.addEventListener('mousedown', handleOutside)
+    return () => document.removeEventListener('mousedown', handleOutside)
+  }, [activityPopoverRect])
+
   // ── Layout picker state ────────────────────────────────────────────────────
   const [layoutPickerState, setLayoutPickerState] = useState<{ rect: DOMRect; panelId: DockPanel } | null>(null)
   const layoutPickerTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -718,7 +937,7 @@ function WorkspaceShellInner(props: {
   }
 
   useEffect(() => {
-    if (!groupDropdown && !presetsDropdown && !layoutPickerState) return
+    if (!groupDropdown && !presetsDropdown && !layoutPickerState && !activityPopoverRect) return
     function handleMenuEscape(event: KeyboardEvent) {
       if (event.key !== 'Escape') return
       event.preventDefault()
@@ -726,10 +945,20 @@ function WorkspaceShellInner(props: {
       setPresetsDropdown(null)
       setLayoutPickerState(null)
       setSavingPreset(false)
+      setActivityPopoverRect(null)
     }
     document.addEventListener('keydown', handleMenuEscape)
     return () => document.removeEventListener('keydown', handleMenuEscape)
-  }, [groupDropdown, presetsDropdown, layoutPickerState])
+  }, [groupDropdown, presetsDropdown, layoutPickerState, activityPopoverRect])
+
+  // Topbar overlays (group dropdowns, layout presets, layout picker, save-preset
+  // modal) are plain DOM and cannot paint over the browser's native
+  // WebContentsView, which always renders above the DOM. Broadcast whenever any
+  // of them is open so BrowserPanel parks the native view and the menu shows.
+  const menuOverlayOpen = Boolean(groupDropdown || presetsDropdown || layoutPickerState || savingPreset || activityPopoverRect)
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('menu-overlay-change', { detail: { covered: menuOverlayOpen } }))
+  }, [menuOverlayOpen])
 
   function applyZone(panelId: DockPanel, zone: LayoutZone) {
     setLayoutPickerState(null)
@@ -740,15 +969,20 @@ function WorkspaceShellInner(props: {
   const [drag, setDrag] = useState<DragState | null>(null)
   const dragRef = useRef<DragState | null>(null)
   dragRef.current = drag
+  const dragSequenceRef = useRef(0)
+  const dragCaptureRef = useRef<{ element: HTMLElement; pointerId: number } | null>(null)
+  const dragWindowBoundsRef = useRef<WorkspaceWindowBounds | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
   const topbarRef = useRef<HTMLElement>(null)
 
-  const handlersRef = useRef({ openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, activePanelFromFocus, resetLayout } as {
+  const handlersRef = useRef({ openPanel, focusPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, detachPanel, activePanelFromFocus, resetLayout } as {
     openPanel: (p: DockPanel) => void
+    focusPanel: (p: DockPanel) => void
     closePanel: (p: DockPanel) => void
     dropPanel: (p: DockPanel, edge: DropEdge) => void
     dropPanelOnTarget: (p: DockPanel, target: DockPanel, side: LocalDropSide) => void
     placePanelInZone: (p: DockPanel, zone: LayoutZone) => void
+    detachPanel: (p: DockPanel, point?: ScreenPoint) => void
     activePanelFromFocus: () => DockPanel | null
     resetLayout: () => void
   })
@@ -757,84 +991,61 @@ function WorkspaceShellInner(props: {
   useEffect(() => {
     if (!dragActive) return
 
-    function getLocalDrop(x: number, y: number, draggedPanel: DockPanel, originRect: DragState['originRect']): LocalDrop | null {
-      const workspaceEl = workspaceRef.current
-      if (!workspaceEl) return null
-      const workspaceRect = workspaceEl.getBoundingClientRect()
-      if (x < workspaceRect.left || x > workspaceRect.right || y < workspaceRect.top || y > workspaceRect.bottom) {
-        return null
-      }
-      if (
-        originRect &&
-        x >= originRect.left && x <= originRect.right &&
-        y >= originRect.top && y <= originRect.bottom
-      ) {
-        return null
-      }
-
-      // Use rect-based lookup instead of elementsFromPoint so that pointer-events:none
-      // on .workspace-panel-wrap (applied during drag) doesn't cause panels to be skipped.
-      for (const panelEl of workspaceEl.querySelectorAll<HTMLElement>('[data-dock-panel-id]')) {
-        const rawPanelId = panelEl.dataset.dockPanelId
-        if (!rawPanelId || !PANELS.includes(rawPanelId as DockPanel)) continue
-        const target = rawPanelId as DockPanel
-        if (target === draggedPanel) continue
-
-        const targetRect = panelEl.getBoundingClientRect()
-        if (targetRect.width === 0 || targetRect.height === 0) continue
-        if (x < targetRect.left || x > targetRect.right || y < targetRect.top || y > targetRect.bottom) continue
-
-        const distances: Array<{ side: LocalDropSide; value: number }> = [
-          { side: 'left', value: x - targetRect.left },
-          { side: 'right', value: targetRect.right - x },
-          { side: 'top', value: y - targetRect.top },
-          { side: 'bottom', value: targetRect.bottom - y },
-        ]
-        distances.sort((a, b) => a.value - b.value)
-
-        const closest = distances[0]
-        return {
-          target,
-          side: closest.side,
-          style: localHighlightStyle(closest.side, targetRect, workspaceRect),
-        }
-      }
-
-      return null
-    }
-
     function onMove(e: PointerEvent) {
       setDrag(prev => {
         if (!prev) return null
         const dx = e.clientX - prev.startX
         const dy = e.clientY - prev.startY
         const live = prev.live || Math.sqrt(dx * dx + dy * dy) > 5
+        const point = { x: e.screenX, y: e.screenY }
+        const detachReady = live && DETACHABLE_PANELS.has(prev.panel) &&
+          isPastDetachThreshold(point, dragWindowBoundsRef.current)
+        const coordinates = {
+          x: e.clientX,
+          y: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+          detachReady,
+        }
 
         if (!live) {
-          return { ...prev, x: e.clientX, y: e.clientY, live, hoverZone: null, hoverLocal: null }
+          return { ...prev, ...coordinates, live, hoverZone: null, hoverLocal: null }
+        }
+
+        // Once a detachable panel is clearly beyond the native window bounds,
+        // suppress every in-window snap target. Moving back inside immediately
+        // returns to the unchanged docking resolver below.
+        if (detachReady) {
+          return { ...prev, ...coordinates, live, hoverZone: null, hoverLocal: null }
         }
 
         const workspaceEl = workspaceRef.current
         const r = workspaceEl?.getBoundingClientRect() ?? null
-        const inWorkspace = r !== null
-          && e.clientX >= r.left && e.clientX <= r.right
-          && e.clientY >= r.top  && e.clientY <= r.bottom
-
-        // Priority 1: global 40px edge bands — always take precedence
-        const bandZone = r ? getBandZone(e.clientX, e.clientY, r) : null
-        if (bandZone) {
-          return { ...prev, x: e.clientX, y: e.clientY, live, hoverZone: bandZone, hoverLocal: null }
+        if (!workspaceEl || !r) {
+          return { ...prev, ...coordinates, live, hoverZone: null, hoverLocal: null }
         }
 
-        // Priority 2: panel-local nearest-edge split
-        const hoverLocal = getLocalDrop(e.clientX, e.clientY, prev.panel, prev.originRect)
-        if (hoverLocal) {
-          return { ...prev, x: e.clientX, y: e.clientY, live, hoverZone: null, hoverLocal }
-        }
+        // One resolver drives everything (bands → window-half → full). Excluding
+        // the dragged panel means every remaining pixel of the workspace maps to
+        // a real target — panel interiors AND the gaps between cards.
+        const panels = collectPanelRects(workspaceEl, prev.panel)
+        const resolved = resolveDropAt(e.clientX, e.clientY, r, panels)
 
-        // Priority 3: in workspace but no band/panel hit → full
-        const hoverZone: LayoutZone | null = inWorkspace ? 'full' : null
-        return { ...prev, x: e.clientX, y: e.clientY, live, hoverZone, hoverLocal: null }
+        if (resolved.kind === 'band') {
+          return { ...prev, ...coordinates, live, hoverZone: resolved.zone, hoverLocal: null }
+        }
+        if (resolved.kind === 'local') {
+          const hoverLocal: LocalDrop = {
+            target: resolved.target,
+            side: resolved.side,
+            style: localHighlightStyle(resolved.side, resolved.rect, r),
+          }
+          return { ...prev, ...coordinates, live, hoverZone: null, hoverLocal }
+        }
+        // 'full' (no candidate panels — e.g. dragging the only open panel) or
+        // 'none' (outside the workspace).
+        const hoverZone: LayoutZone | null = resolved.kind === 'full' ? 'full' : null
+        return { ...prev, ...coordinates, live, hoverZone, hoverLocal: null }
       })
     }
 
@@ -842,9 +1053,14 @@ function WorkspaceShellInner(props: {
       const d = dragRef.current
       if (!d) return
       if (d.live) {
+        const releasePoint = { x: e.screenX, y: e.screenY }
+        const detachOnRelease = DETACHABLE_PANELS.has(d.panel) &&
+          isPastDetachThreshold(releasePoint, dragWindowBoundsRef.current)
         const topbarEl = topbarRef.current
         const topbarBottom = topbarEl ? topbarEl.getBoundingClientRect().bottom : 0
-        if (e.clientY <= topbarBottom) {
+        if (detachOnRelease) {
+          handlersRef.current.detachPanel(d.panel, releasePoint)
+        } else if (e.clientY <= topbarBottom) {
           handlersRef.current.closePanel(d.panel)
         } else if (d.hoverLocal) {
           handlersRef.current.dropPanelOnTarget(d.panel, d.hoverLocal.target, d.hoverLocal.side)
@@ -854,22 +1070,146 @@ function WorkspaceShellInner(props: {
       } else {
         d.onClickFallback?.()
       }
+      const capture = dragCaptureRef.current
+      if (capture?.element.hasPointerCapture(capture.pointerId)) {
+        capture.element.releasePointerCapture(capture.pointerId)
+      }
+      dragCaptureRef.current = null
       setDrag(null)
     }
 
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') setDrag(null)
+      if (e.key !== 'Escape') return
+      const capture = dragCaptureRef.current
+      if (capture?.element.hasPointerCapture(capture.pointerId)) {
+        capture.element.releasePointerCapture(capture.pointerId)
+      }
+      dragCaptureRef.current = null
+      setDrag(null)
+    }
+
+    function onCancel() {
+      dragCaptureRef.current = null
+      setDrag(null)
     }
 
     document.addEventListener('pointermove', onMove)
     document.addEventListener('pointerup', onUp)
+    document.addEventListener('pointercancel', onCancel)
     document.addEventListener('keydown', onKeyDown)
     return () => {
       document.removeEventListener('pointermove', onMove)
       document.removeEventListener('pointerup', onUp)
+      document.removeEventListener('pointercancel', onCancel)
       document.removeEventListener('keydown', onKeyDown)
     }
   }, [dragActive])
+
+  // ── TEMP DEBUG — dock-zone bounding-box overlay (remove after diagnosis) ─────
+  // Toggle with Ctrl+Shift+D. Visualizes the ACTUAL resolved drop zone for every
+  // pixel of the workspace by grid-sampling resolveDropAt() — the exact resolver
+  // the live drag uses. Screen-half bands are drawn as their exact rects; the
+  // rest of the area is sampled and painted per window-half side (with the run
+  // cells merged per row). Any interior cell that resolves to full/none is
+  // painted DEAD red — after the Fix-1 gap coverage there should be none.
+  type DebugRect = {
+    kind: 'screen-half' | 'window-half' | 'window-target' | 'dead'
+    side?: LocalDropSide
+    label?: string
+    style: React.CSSProperties
+  }
+  const [debugZones, setDebugZones] = useState(false)
+  const [debugRects, setDebugRects] = useState<DebugRect[]>([])
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'd' || e.key === 'D')) {
+        e.preventDefault()
+        setDebugZones(v => !v)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  useEffect(() => {
+    if (!debugZones) { setDebugRects([]); return }
+    function recompute() {
+      const workspaceEl = workspaceRef.current
+      if (!workspaceEl) { setDebugRects([]); return }
+      const wr = workspaceEl.getBoundingClientRect()
+      const panels = collectPanelRects(workspaceEl, null)
+      const rects: DebugRect[] = []
+
+      // Screen-half — the 4 global 40px edge bands (unchanged by this fix). Exact.
+      const bands: Array<{ side: LayoutZone; style: React.CSSProperties }> = [
+        { side: 'left',   style: { left: 0, top: 0, width: BAND_PX, height: wr.height } },
+        { side: 'right',  style: { left: wr.width - BAND_PX, top: 0, width: BAND_PX, height: wr.height } },
+        { side: 'top',    style: { left: 0, top: 0, width: wr.width, height: BAND_PX } },
+        { side: 'bottom', style: { left: 0, top: wr.height - BAND_PX, width: wr.width, height: BAND_PX } },
+      ]
+      for (const b of bands) rects.push({ kind: 'screen-half', label: `screen-half: ${b.side}`, style: b.style })
+
+      // Panel outlines, for orientation only.
+      for (const p of panels) {
+        rects.push({
+          kind: 'window-target',
+          label: `target: ${p.target}`,
+          style: { left: p.rect.left - wr.left, top: p.rect.top - wr.top, width: p.rect.width, height: p.rect.height },
+        })
+      }
+
+      // Window-half coverage — sample the SAME resolver the drag uses on a grid,
+      // run-length-merging same-zone cells per row. This shows every pixel's
+      // resolved side (including the gaps, now mapped to the nearest panel) and
+      // surfaces any dead space as red. exclude=null so all panels are candidates
+      // (this is a rest-state map of where each side would resolve).
+      const STEP = 14
+      const labelled = new Set<string>()
+      for (let sy = 0; sy < wr.height; sy += STEP) {
+        const rowTop = sy
+        const rowH = Math.min(STEP, wr.height - sy)
+        const cy = wr.top + Math.min(wr.height - 1, sy + rowH / 2)
+        let runStart = 0
+        let runKey: string | null = null
+        let runSide: LocalDropSide | undefined
+        let runKind: 'window-half' | 'dead' = 'window-half'
+        const flush = (endPx: number) => {
+          if (runKey === null) return
+          const showLabel = !labelled.has(runKey)
+          if (showLabel) labelled.add(runKey)
+          rects.push({
+            kind: runKind,
+            side: runSide,
+            label: showLabel ? (runKind === 'dead' ? 'DEAD' : `window-half: ${runSide}`) : undefined,
+            style: { left: runStart, top: rowTop, width: Math.max(0, endPx - runStart), height: rowH },
+          })
+          runKey = null
+        }
+        for (let sx = 0; sx < wr.width; sx += STEP) {
+          const cx = wr.left + Math.min(wr.width - 1, sx + STEP / 2)
+          const res = resolveDropAt(cx, cy, wr, panels)
+          if (res.kind === 'band') { flush(sx); continue } // bands drawn separately
+          let key: string
+          let side: LocalDropSide | undefined
+          let kind: 'window-half' | 'dead'
+          if (res.kind === 'local') { kind = 'window-half'; side = res.side; key = `${res.target}:${res.side}` }
+          else { kind = 'dead'; side = undefined; key = 'dead' }
+          if (runKey !== key) {
+            flush(sx)
+            runStart = sx; runKey = key; runSide = side; runKind = kind
+          }
+        }
+        flush(wr.width)
+      }
+
+      setDebugRects(rects)
+    }
+    recompute()
+    const raf = requestAnimationFrame(recompute)
+    window.addEventListener('resize', recompute)
+    return () => { cancelAnimationFrame(raf); window.removeEventListener('resize', recompute) }
+  }, [debugZones, layout, fullscreenId])
 
   // ── Layout mutations ───────────────────────────────────────────────────────
 
@@ -895,6 +1235,19 @@ function WorkspaceShellInner(props: {
       const newRoot = addToRoot(cur.root, panel, 'right')
       return normalizeLayout({ root: newRoot, openIds: newOpenIds })
     })
+  }
+
+  // Jump from an activity-popover row to the agent's tab + session. AgentId
+  // values are a subset of DockPanel, so the agent id doubles as the panel id.
+  // Reuses the panel:selectSession contract the command palette already uses;
+  // the small delay lets the panel mount its listener before we dispatch.
+  function jumpToAgentSession(agent: AgentId, session: Session) {
+    setActivityPopoverRect(null)
+    openPanel(agent)
+    focusPanel(agent)
+    window.setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('panel:selectSession', { detail: { panel: agent, session } }))
+    }, 60)
   }
 
   function removePanel(panel: DockPanel) {
@@ -1037,7 +1390,25 @@ function WorkspaceShellInner(props: {
 
   // ── Rack click: auto-layout ─────────────────────────────────────────────────
 
+  // Every detached window carries its own "Bring back" control in its header
+  // (browser-dock-back / preview-dock-back / <panel>-dock-back) — that is the
+  // primary way home. This is the main window's secondary route, reached from
+  // the rack badge, so a user who has lost track of which window holds which
+  // panel can still recall it from where panels are opened.
+  function reattachPanel(panel: DockPanel) {
+    if (panel === 'browser') void window.api.browser.reattach()
+    else if (panel === 'preview') void window.api.preview.reattach()
+    else if (panel === 'claudecode') void window.api.claudeCode.reattach()
+    else void window.api.agentPanel.reattach(panel as AgentPanelId)
+  }
+
   function handleRackClick(panel: DockPanel) {
+    // Detached panels hold no dock slot to focus or re-open; clicking the rack
+    // entry brings the window home, and the reattach event re-opens the slot.
+    if (isPanelDetached(panel)) {
+      reattachPanel(panel)
+      return
+    }
     if (layout.openIds.includes(panel)) {
       focusPanel(panel)
       return
@@ -1047,6 +1418,25 @@ function WorkspaceShellInner(props: {
 
   // ── Drag start ──────────────────────────────────────────────────────────────
 
+  function detachPanel(panel: DockPanel, point?: ScreenPoint) {
+    if (!DETACHABLE_PANELS.has(panel)) return
+    // The detached renderer can load before React unmounts this owner. Flush
+    // the shared draft hook synchronously so the new window reads the latest
+    // text rather than racing the unmount cleanup.
+    window.dispatchEvent(new Event('composer:flushDrafts'))
+    void (async () => {
+      try {
+        if (panel === 'browser') await window.api.browser.detach(props.project.id, point)
+        else if (panel === 'preview') await window.api.preview.detach(props.project.id, point)
+        else if (panel === 'claudecode') await window.api.claudeCode.detach(props.project.id, point)
+        else await window.api.agentPanel.detach(panel as AgentPanelId, props.project.id, point)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        addToast(`Could not detach ${PANEL_TITLES[panel]}: ${message}`)
+      }
+    })()
+  }
+
   function startDrag(
     e: React.PointerEvent,
     panel: DockPanel,
@@ -1054,18 +1444,39 @@ function WorkspaceShellInner(props: {
   ) {
     if (e.button !== 0) return
     e.preventDefault()
-    const originEl = (e.currentTarget as HTMLElement).closest<HTMLElement>('[data-dock-panel-id]')
-    const originDomRect = originEl?.getBoundingClientRect() ?? null
-    const originRect = originDomRect
-      ? { left: originDomRect.left, right: originDomRect.right, top: originDomRect.top, bottom: originDomRect.bottom }
-      : null
+    // The dragged source is intentionally hidden once the gesture is live.
+    // Capture on the persistent shell so React can hide/unmount that header
+    // without Chromium releasing capture at the window boundary.
+    const captureTarget = shellRef.current ?? (e.currentTarget as HTMLElement)
+    try {
+      captureTarget.setPointerCapture(e.pointerId)
+      dragCaptureRef.current = { element: captureTarget, pointerId: e.pointerId }
+    } catch {
+      dragCaptureRef.current = null
+    }
+
+    const id = ++dragSequenceRef.current
+    dragWindowBoundsRef.current = {
+      x: window.screenX,
+      y: window.screenY,
+      width: window.outerWidth,
+      height: window.outerHeight,
+    }
+    void window.api.workspace.getWindowBounds().then(bounds => {
+      if (dragRef.current?.id === id) dragWindowBoundsRef.current = bounds
+    }).catch(() => {
+      // Keep the renderer-derived fallback; the gesture still degrades safely.
+    })
+
     setDrag({
+      id,
       panel,
       startX: e.clientX, startY: e.clientY,
       x: e.clientX, y: e.clientY,
-      originRect,
+      screenX: e.screenX, screenY: e.screenY,
       hoverZone: null, live: false,
       hoverLocal: null,
+      detachReady: false,
       onClickFallback,
     })
   }
@@ -1079,6 +1490,28 @@ function WorkspaceShellInner(props: {
   const openIds = activeLayout.openIds
   const isDragging = drag?.live ?? false
   const activeAgentIds = (Object.keys(agentActive) as AgentId[]).filter((id) => agentActive[id])
+
+  // FIX 2 — the Browser panel's native WebContentsView paints above the DOM and
+  // swallows pointer events, so while a panel drag is live it would break
+  // drop-zone hit-testing over its area and hide the snap/debug overlays. Park
+  // every native browser view for the duration of a drag (and while the dock-zone
+  // debug overlay is on, so zones can be inspected over the Browser panel too),
+  // then restore. The dispatched event tells BrowserPanel to also stop its
+  // bounds-sync loop so the park isn't undone on the next frame.
+  const browserParked = isDragging || debugZones
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('browser-drag-change', { detail: { covered: browserParked } }))
+    if (browserParked) void window.api.browser.parkForDrag()
+    else void window.api.browser.restoreAfterDrag()
+  }, [browserParked])
+
+  // The Preview panel's native view has the same above-DOM painting problem as
+  // Browser during a panel drag — park it too (see FIX 2 above).
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('preview-drag-change', { detail: { covered: browserParked } }))
+    if (browserParked) void window.api.preview.parkForDrag()
+    else void window.api.preview.restoreAfterDrag()
+  }, [browserParked])
 
   function rememberFocusedPanel(panel: DockPanel) {
     focusedPanelRef.current = panel
@@ -1122,9 +1555,26 @@ function WorkspaceShellInner(props: {
   // render) so they always see the current layout state without tearing down
   // and re-adding six window listeners on every render.
   useEffect(() => {
+    const unsubscribePreviewRequest = window.api.browser.onPreviewRequested(() => {
+      handlersRef.current.openPanel('browser')
+      window.setTimeout(() => handlersRef.current.focusPanel('browser'), 60)
+    })
+    const unsubscribeMainPanelRequest = window.api.workspace.onOpenPanelRequested((panel) => {
+      if (PANELS.includes(panel)) handlersRef.current.openPanel(panel)
+    })
+
     function onOpenPanel(event: Event) {
       const panel = (event as CustomEvent<{ panel?: string }>).detail?.panel
       if (panel && PANELS.includes(panel as DockPanel)) handlersRef.current.openPanel(panel as DockPanel)
+    }
+
+    function onOpenLivePreview(event: Event) {
+      const detail = (event as CustomEvent<{ projectId?: string; url?: string }>).detail
+      handlersRef.current.openPanel('browser')
+      window.setTimeout(() => {
+        handlersRef.current.focusPanel('browser')
+        window.dispatchEvent(new CustomEvent('browser:openLivePreview', { detail }))
+      }, 60)
     }
 
     function onOpenSettings() {
@@ -1160,6 +1610,7 @@ function WorkspaceShellInner(props: {
     }
 
     window.addEventListener('workspace:openPanel', onOpenPanel)
+    window.addEventListener('workspace:openLivePreview', onOpenLivePreview)
     window.addEventListener('workspace:openSettings', onOpenSettings)
     window.addEventListener('workspace:showShortcuts', onShowShortcuts)
     window.addEventListener('workspace:toggleCommandPalette', onToggleCommandPalette)
@@ -1168,7 +1619,10 @@ function WorkspaceShellInner(props: {
     window.addEventListener('workspace:focusComposer', onFocusComposer)
     window.addEventListener('workspace:resetLayout', onResetLayout)
     return () => {
+      unsubscribePreviewRequest()
+      unsubscribeMainPanelRequest()
       window.removeEventListener('workspace:openPanel', onOpenPanel)
+      window.removeEventListener('workspace:openLivePreview', onOpenLivePreview)
       window.removeEventListener('workspace:openSettings', onOpenSettings)
       window.removeEventListener('workspace:showShortcuts', onShowShortcuts)
       window.removeEventListener('workspace:toggleCommandPalette', onToggleCommandPalette)
@@ -1196,10 +1650,14 @@ function WorkspaceShellInner(props: {
   const shellAccent =
     firstOpen === 'hermes' ? 'hermes'
     : firstOpen === 'claudecode' || firstOpen === 'codex' ? 'claudecode'
+    : firstOpen === 'kimi' ? 'kimi'
     : 'chat'
 
   // ── Panel content renderer ──────────────────────────────────────────────────
 
+  // A detached panel has no dock slot at all (applyDetachedLayout closes it), so
+  // there is no "open in another window" placeholder branch here — every case
+  // below renders the real panel or nothing.
   function renderContent(panel: DockPanel): ReactNode {
     switch (panel) {
       case 'home':
@@ -1243,11 +1701,14 @@ function WorkspaceShellInner(props: {
         )
       case 'codex':
         return <CodexTab project={props.project} active={openIds.includes('codex')} />
+      case 'kimi':
+        return <KimiTab project={props.project} active={openIds.includes('kimi')} />
       case 'editor':
         return (
           <EditorPanel
             selectedFile={selectedFile}
-            onCloseFile={() => setSelectedFile(null)}
+            workspaceId={props.project.id}
+            onActiveFileChange={setSelectedFile}
           />
         )
       case 'terminal':
@@ -1264,7 +1725,9 @@ function WorkspaceShellInner(props: {
       case 'extensions':
         return <ExtensionsPanel active={openIds.includes('extensions')} />
       case 'browser':
-        return <BrowserPanel active={openIds.includes('browser')} />
+        return <BrowserPanel active={openIds.includes('browser')} project={props.project} />
+      case 'preview':
+        return <PreviewPanel active={openIds.includes('preview')} project={props.project} />
     }
   }
 
@@ -1349,6 +1812,18 @@ function WorkspaceShellInner(props: {
                 <span className="workspace-panel-hint">{meta.hint}</span>
               </div>
               <StatusBadge tone={meta.tone}>{meta.status}</StatusBadge>
+              {HEADER_DETACH_TESTIDS[panel] && !isPanelDetached(panel) && (
+                <button
+                  type="button"
+                  className="ghost tiny"
+                  data-testid={HEADER_DETACH_TESTIDS[panel]}
+                  onClick={() => detachPanel(panel)}
+                  title={`Open ${PANEL_TITLES[panel]} in a separate window`}
+                  aria-label={`Open ${PANEL_TITLES[panel]} in a separate window`}
+                >
+                  Detach
+                </button>
+              )}
               <button
                 className="ghost tiny"
                 data-testid={`workspace-panel-layout-${panel}`}
@@ -1435,6 +1910,18 @@ function WorkspaceShellInner(props: {
               <span className="workspace-panel-hint">{meta.hint}</span>
             </div>
             <StatusBadge tone={meta.tone}>{meta.status}</StatusBadge>
+            {HEADER_DETACH_TESTIDS[panel] && !isPanelDetached(panel) && (
+              <button
+                type="button"
+                className="ghost tiny"
+                data-testid={HEADER_DETACH_TESTIDS[panel]}
+                onClick={() => detachPanel(panel)}
+                title={`Open ${PANEL_TITLES[panel]} in a separate window`}
+                aria-label={`Open ${PANEL_TITLES[panel]} in a separate window`}
+              >
+                Detach
+              </button>
+            )}
             <button
               className="ghost tiny"
               data-testid={`workspace-panel-layout-${panel}`}
@@ -1489,10 +1976,10 @@ function WorkspaceShellInner(props: {
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
-  handlersRef.current = { openPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, activePanelFromFocus, resetLayout }
+  handlersRef.current = { openPanel, focusPanel, closePanel, dropPanel, dropPanelOnTarget, placePanelInZone, detachPanel, activePanelFromFocus, resetLayout }
 
   return (
-    <div ref={shellRef} className={`shell mode-${shellAccent}`} data-testid="workspace-shell">
+    <div ref={shellRef} className={`shell mode-${shellAccent}${drag?.detachReady ? ' workspace-detach-ready' : ''}`} data-testid="workspace-shell">
       <header className="topbar" ref={topbarRef}>
         <span className="project-badge">{props.project.name}</span>
         <div className="topbar-sep" aria-hidden />
@@ -1500,12 +1987,18 @@ function WorkspaceShellInner(props: {
         <nav className="topbar-groups" aria-label="Workspace tools">
           {TOPBAR_GROUPS.map((group, gi) => {
             const hasOpen = group.panels.some(p => openIds.includes(p.id))
+            // The inline rack tabs collapse into this button on narrow windows,
+            // so the detached marker has to surface here too — otherwise a
+            // detached panel would have no visible trace at all at that width.
+            const hasDetached = group.panels.some(p => isPanelDetached(p.id))
             const isDropOpen = groupDropdown?.label === group.label
             return (
               <div key={group.label} className="topbar-group">
                 <button
                   ref={group.label === 'Knowledge' ? knowledgeButtonRef : undefined}
-                  className={`topbar-group-btn${hasOpen ? ' has-open' : ''}`}
+                  className={`topbar-group-btn${hasOpen ? ' has-open' : ''}${hasDetached ? ' has-detached' : ''}`}
+                  data-testid={`workspace-group-${group.label.toLowerCase()}`}
+                  title={hasDetached ? `A ${group.label} panel is open in another window` : undefined}
                   aria-haspopup="menu"
                   aria-expanded={isDropOpen}
                   onClick={(e) => {
@@ -1518,30 +2011,59 @@ function WorkspaceShellInner(props: {
                   {group.label}
                   <span className="topbar-group-chevron" aria-hidden>▾</span>
                   {hasOpen && <span className="topbar-group-dot" aria-hidden />}
+                  {hasDetached && (
+                    <span
+                      className="topbar-tab-detached-dot"
+                      data-testid={`workspace-group-${group.label.toLowerCase()}-detached`}
+                      aria-label={`A ${group.label} panel is open in another window`}
+                    />
+                  )}
                 </button>
                 {group.label === 'AI' && activeAgentIds.length > 0 && (
-                  <span
-                    className="topbar-activity-badge"
+                  <button
+                    type="button"
+                    className={`topbar-activity-badge${activityPopoverRect ? ' is-open' : ''}`}
                     data-testid="topbar-activity-badge"
-                    title={`Active: ${activeAgentIds.map((id) => PANEL_TITLES[id]).join(', ')}`}
+                    aria-haspopup="menu"
+                    aria-expanded={Boolean(activityPopoverRect)}
+                    title={`Active: ${activeAgentIds.map((id) => PANEL_TITLES[id]).join(', ')} — click to view all agent activity`}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (activityPopoverRect) { setActivityPopoverRect(null); return }
+                      setActivityPopoverRect((e.currentTarget as HTMLElement).getBoundingClientRect())
+                    }}
                   >
                     <BreathingDot />
                     {activeAgentIds.length} active
-                  </span>
+                  </button>
                 )}
                 {group.panels.map(item => {
                   const panel = item.id
                   const isOpen = openIds.includes(panel)
+                  const detached = isPanelDetached(panel)
                   if (isDragging && drag?.panel === panel) return null
                   return (
                     <button
                       key={panel}
-                      className={`topbar-tab${isOpen ? ' active' : ''}`}
+                      className={`topbar-tab${isOpen ? ' active' : ''}${detached ? ' is-detached' : ''}`}
                       data-testid={`workspace-tool-${panel}`}
-                      title={isOpen ? `Focus ${PANEL_TITLES[panel]}` : `Open ${PANEL_TITLES[panel]}`}
+                      title={
+                        detached ? `${PANEL_TITLES[panel]} is open in another window — click to bring it back`
+                        : isOpen ? `Focus ${PANEL_TITLES[panel]}`
+                        : `Open ${PANEL_TITLES[panel]}`
+                      }
                       onPointerDown={e => startDrag(e, panel, () => handleRackClick(panel))}
                     >
                       {item.label}
+                      {/* No placeholder card is left in the dock, so this dot is
+                          the main window's only trace of a detached panel. */}
+                      {detached && (
+                        <span
+                          className="topbar-tab-detached-dot"
+                          data-testid={`workspace-tool-${panel}-detached`}
+                          aria-label={`${PANEL_TITLES[panel]} is open in another window`}
+                        />
+                      )}
                       {isOpen && (
                         <span
                           className="topbar-tab-close"
@@ -1615,14 +2137,17 @@ function WorkspaceShellInner(props: {
 
           {openIds.length > 0 && (
             <div
-              className={`workspace-area${isDragging ? ' workspace-dragging' : ''}`}
+              className={`workspace-area${isDragging ? ' workspace-dragging' : ''}${drag?.detachReady ? ' workspace-detach-ready' : ''}`}
               ref={workspaceRef}
               style={{ width: '100%', height: '100%', flex: 1, minWidth: 0, minHeight: 0, position: 'relative', overflow: 'auto' }}
             >
               {activeLayout.root && renderRoot(activeLayout.root)}
 
-              {/* Always-mounted closed panels so state is preserved */}
-              {PANELS.filter(p => !openIds.includes(p)).map(p => (
+              {/* Always-mounted closed panels so state is preserved — except a
+                  detached one, whose state now lives in its own window. Keeping
+                  a hidden second instance here would double-subscribe the panel
+                  and let it park native views the other window owns. */}
+              {PANELS.filter(p => !openIds.includes(p) && !isPanelDetached(p)).map(p => (
                 <div
                   key={p}
                   data-testid={`workspace-panel-hidden-${p}`}
@@ -1674,10 +2199,84 @@ function WorkspaceShellInner(props: {
                   }}
                 />
               ))}
+
+              {/* TEMP DEBUG — dock-zone overlay (remove after diagnosis). Grid-
+                  sampled from the real resolver, so it shows every pixel's
+                  resolved zone with no dead space. */}
+              {debugZones && debugRects.map((rect, i) => {
+                const SIDE_COLORS: Record<LocalDropSide, string> = {
+                  left: '#39ff5a', right: '#22e0ff', top: '#ffd23f', bottom: '#c77dff',
+                }
+                const color =
+                  rect.kind === 'screen-half' ? '#ff2fd0'
+                  : rect.kind === 'dead' ? '#ff0033'
+                  : rect.kind === 'window-target' ? '#ffffff'
+                  : (rect.side ? SIDE_COLORS[rect.side] : '#39ff5a')
+                const isFilled = rect.kind !== 'window-target'
+                const fillPct = rect.kind === 'dead' ? 60 : rect.kind === 'window-half' ? 24 : 14
+                const z = rect.kind === 'screen-half' ? 499 : rect.kind === 'window-target' ? 498 : 497
+                return (
+                  <div
+                    key={`debug-${i}`}
+                    aria-hidden
+                    style={{
+                      position: 'absolute',
+                      zIndex: z,
+                      pointerEvents: 'none',
+                      boxSizing: 'border-box',
+                      border: rect.kind === 'window-half' ? 'none' : `1.5px dashed ${color}`,
+                      background: isFilled ? `color-mix(in srgb, ${color} ${fillPct}%, transparent)` : 'transparent',
+                      ...rect.style,
+                    }}
+                  >
+                    {rect.label && (
+                      <span
+                        style={{
+                          position: 'absolute',
+                          top: 1,
+                          left: 2,
+                          font: '9px/1.2 ui-monospace, "Cascadia Code", monospace',
+                          color: '#000',
+                          background: color,
+                          padding: '0 3px',
+                          borderRadius: 2,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {rect.label}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           )}
         </main>
       </div>
+
+      {/* TEMP DEBUG — active-mode banner (remove after diagnosis) */}
+      {debugZones && createPortal(
+        <div
+          style={{
+            position: 'fixed',
+            bottom: 12,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 10000,
+            pointerEvents: 'none',
+            background: '#ff2fd0',
+            color: '#000',
+            font: '600 12px/1 ui-monospace, "Cascadia Code", monospace',
+            padding: '7px 12px',
+            borderRadius: 6,
+            boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+            letterSpacing: '0.02em',
+          }}
+        >
+          DEBUG: Dock zones visible — Ctrl+Shift+D to exit
+        </div>,
+        document.body
+      )}
 
       {settingsOpen && (
         <SettingsPanel
@@ -1701,18 +2300,44 @@ function WorkspaceShellInner(props: {
       {/* Ghost tab portal */}
       {isDragging && drag && createPortal(
         <div
-          className="drag-ghost"
+          className={`drag-ghost${drag.detachReady ? ' detach-ready' : ''}`}
+          data-testid={drag.detachReady ? 'workspace-drag-detach-indicator' : 'workspace-drag-ghost'}
+          data-screen-x={drag.screenX}
+          data-screen-y={drag.screenY}
+          role="status"
+          aria-live="polite"
           style={{
             position: 'fixed',
-            left: drag.x - 40,
-            top: drag.y - 12,
+            left: drag.detachReady
+              ? Math.min(Math.max(12, drag.x - 40), Math.max(12, window.innerWidth - 250))
+              : drag.x - 40,
+            top: drag.detachReady
+              ? Math.min(Math.max(12, drag.y - 12), Math.max(12, window.innerHeight - 44))
+              : drag.y - 12,
             pointerEvents: 'none',
-            opacity: 0.85,
+            opacity: drag.detachReady ? 0.98 : 0.85,
           }}
         >
           <span className={`drag-ghost-dot panel-${drag.panel}`} aria-hidden />
-          {PANEL_TITLES[drag.panel]}
+          {drag.detachReady ? `Release to open ${PANEL_TITLES[drag.panel]} in a new window` : PANEL_TITLES[drag.panel]}
         </div>,
+        document.body
+      )}
+
+      {/* Unified agent-activity popover, anchored under the "N active" badge. */}
+      {activityPopoverRect && createPortal(
+        <AnimatedDropdown
+          className="topbar-dropdown activity-pop-shell"
+          style={{
+            position: 'fixed',
+            top: activityPopoverRect.bottom + 4,
+            left: activityPopoverRect.left,
+            zIndex: 9999,
+          }}
+          onMouseDown={e => e.stopPropagation()}
+        >
+          <AgentActivityPopover tasks={agentTasks} onJump={jumpToAgentSession} />
+        </AnimatedDropdown>,
         document.body
       )}
 
@@ -1731,12 +2356,14 @@ function WorkspaceShellInner(props: {
           {(TOPBAR_GROUPS.find(g => g.label === groupDropdown.label)?.panels ?? []).map((item, index) => {
             const panel = item.id
             const isOpen = openIds.includes(panel)
+            const detached = isPanelDetached(panel)
             return (
               <button
                 key={panel}
-                className={`topbar-dropdown-item${isOpen ? ' is-open' : ''}`}
+                className={`topbar-dropdown-item${isOpen ? ' is-open' : ''}${detached ? ' is-detached' : ''}`}
                 role="menuitem"
                 autoFocus={index === 0}
+                title={detached ? `${PANEL_TITLES[panel]} is open in another window — click to bring it back` : undefined}
                 onClick={() => {
                   handleRackClick(panel)
                   setGroupDropdown(null)
@@ -1744,6 +2371,13 @@ function WorkspaceShellInner(props: {
               >
                 {item.icon}
                 <span className="topbar-dropdown-item-label">{item.label}</span>
+                {detached && (
+                  <span
+                    className="topbar-tab-detached-dot"
+                    data-testid={`workspace-tool-${panel}-detached-menu`}
+                    aria-label={`${PANEL_TITLES[panel]} is open in another window`}
+                  />
+                )}
                 {isOpen && <span className="topbar-dropdown-check">✓</span>}
               </button>
             )

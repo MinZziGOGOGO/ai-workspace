@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Project, Session, Message, CodexCheck, CodexActivityEntry, CodexEvent, CodexPlanUsage, CodexSandboxMode, AgentModelInfo } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
+import { useComposerDraft } from '../hooks/useComposerDraft'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
@@ -29,6 +30,9 @@ const CODEX_EMPTY_HEADINGS = [
 ]
 const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.codex.pinned'
+// Which session this tab was last looking at, per project — shared across the
+// app's windows so a detached CodexTab remounts on the same session.
+const SELECTED_SESSION_KEY_PREFIX = 'aiworkspace.codex.selected-session.'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
 }
@@ -115,7 +119,7 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
+  const [input, setInput] = useComposerDraft('aiworkspace.codex.draft', session?.id)
   const [running, setRunning] = useState(false)
   const [output, setOutput] = useState('')
   const [activity, setActivity] = useState<CodexActivityEntry[]>([])
@@ -159,6 +163,9 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const lastPromptRef = useRef('')
+  // Highest replay sequence already applied, so a detach handover can overlap
+  // the replayed log with the live stream without double-applying an event.
+  const lastLiveSequenceRef = useRef(0)
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
   const estimatedTokens = useMemo(
@@ -291,9 +298,28 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
   useEffect(() => { if (!isGlobalWorkspace && active) recheck() }, [isGlobalWorkspace, active])
   useEffect(() => {
     if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
-    window.api.sessions.list(props.project.id, 'codex').then(setSessions)
-    window.api.sessions.listArchived(props.project.id, 'codex').then(setArchivedSessions)
+    let disposed = false
+    void Promise.all([
+      window.api.sessions.list(props.project.id, 'codex'),
+      window.api.sessions.listArchived(props.project.id, 'codex'),
+      window.api.codex.liveState(props.project.id),
+    ]).then(([nextSessions, nextArchived, live]) => {
+      if (disposed) return
+      setSessions(nextSessions)
+      setArchivedSessions(nextArchived)
+      let storedId: string | null = null
+      try { storedId = localStorage.getItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`) } catch { /* storage unavailable */ }
+      const desiredId = live?.sessionId ?? storedId
+      const next = desiredId ? [...nextSessions, ...nextArchived].find((candidate) => candidate.id === desiredId) ?? null : null
+      if (next?.id !== sessionRef.current?.id) setSession(next)
+    })
+    return () => { disposed = true }
   }, [props.project.id, isGlobalWorkspace, active])
+
+  useEffect(() => {
+    if (!session?.id) return
+    try { localStorage.setItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`, session.id) } catch { /* storage unavailable */ }
+  }, [props.project.id, session?.id])
 
   useEffect(() => {
     if (session) window.api.codex.messages(session.id).then(setMessages)
@@ -321,18 +347,46 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
     return () => window.removeEventListener('panel:handoffSend', onHandoff)
   }, [])
 
+  // Applies one live event. Shared by the subscription and by the replay log
+  // fetched on mount, so a window that takes ownership mid-run rebuilds the same
+  // view. Codex has no approval events to replay — its CLI runs with
+  // `approval_policy=never` and the sandbox mode is the gate.
+  const applyCodexEvent = useCallback((e: CodexEvent) => {
+    if (e.kind === 'text') setOutput((o) => o + (o ? '\n' : '') + e.text)
+    else if (e.kind === 'tool') setActivity((a) => [...a, { name: e.name, summary: e.summary, ok: true }])
+    else if (e.kind === 'system') setNote(e.summary)
+    else if (e.kind === 'usage') setUsage({ used: e.used, total: e.total, plan: e.plan })
+    else if (e.kind === 'error') setError(e.message)
+  }, [])
+
   useEffect(() => {
+    let disposed = false
+    let hydrated = false
+    let finished = false
+    const queuedEvents: Array<{ event: CodexEvent; sequence?: number }> = []
+    lastLiveSequenceRef.current = 0
+    const acceptEvent = (event: CodexEvent, sequence?: number) => {
+      if (sequence !== undefined) {
+        // Main restarts the counter at 1 for every turn, so a fresh run resets the
+        // watermark — otherwise the second turn of a session would be discarded as
+        // 'already seen'.
+        if (sequence === 1) lastLiveSequenceRef.current = 0
+        if (sequence <= lastLiveSequenceRef.current) return
+        lastLiveSequenceRef.current = sequence
+      }
+      applyCodexEvent(event)
+    }
     const offEvent = window.api.codex.onEvent((d) => {
       if (d.sessionId !== session?.id) return
-      const e: CodexEvent = d.event
-      if (e.kind === 'text') setOutput((o) => o + (o ? '\n' : '') + e.text)
-      else if (e.kind === 'tool') setActivity((a) => [...a, { name: e.name, summary: e.summary, ok: true }])
-      else if (e.kind === 'system') setNote(e.summary)
-      else if (e.kind === 'usage') setUsage({ used: e.used, total: e.total, plan: e.plan })
-      else if (e.kind === 'error') setError(e.message)
+      if (!hydrated) {
+        queuedEvents.push({ event: d.event, sequence: d.sequence })
+        return
+      }
+      acceptEvent(d.event, d.sequence)
     })
     const offDone = window.api.codex.onDone(async (d) => {
       if (d.sessionId !== session?.id) return
+      finished = true
       setRunning(false)
       if (d.trustRequired) {
         setError('Codex refused to run because this folder is not trusted or is not a Git repository. Enable “Allow Codex in this folder” below and resend.')
@@ -344,8 +398,25 @@ export default function CodexTab(props: { project: Project; active?: boolean }) 
       setOutput(''); setActivity([]); setNote('')
       notifyCompletion()
     })
-    return () => { offEvent(); offDone() }
-  }, [session])
+    const flushQueue = () => {
+      hydrated = true
+      for (const item of queuedEvents) acceptEvent(item.event, item.sequence)
+      queuedEvents.length = 0
+    }
+    if (session) {
+      void window.api.codex.liveState(props.project.id).then((live) => {
+        if (disposed) return
+        if (live?.sessionId === session.id) {
+          if (!finished) setRunning(true)
+          for (const item of live.events) acceptEvent(item.event, item.sequence)
+        }
+        flushQueue()
+      }).catch(() => { if (!disposed) flushQueue() })
+    } else {
+      hydrated = true
+    }
+    return () => { disposed = true; offEvent(); offDone() }
+  }, [session?.id, props.project.id, applyCodexEvent])
 
   // Close context menu on outside click
   useEffect(() => {
