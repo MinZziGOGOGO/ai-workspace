@@ -10,6 +10,8 @@ type AiContextBarProps = {
   mode?: string
   status?: string
   disabledReason?: string
+  /** Trailing action, e.g. Hermes's "Compact" (runs the agent's /compact). */
+  action?: import('react').ReactNode
 }
 
 function formatTokens(tokens: number, approximate?: boolean): string {
@@ -32,8 +34,11 @@ export default function AiContextBar(props: AiContextBarProps) {
   const fillScale = percent === undefined ? 1 : percent / 100
 
   const modelText = props.model?.trim() || 'model unknown'
+  // No percentage yet is the normal idle state, not an anomaly — the dimmed
+  // meter already communicates "unknown"; a literal "context unknown" label
+  // reads like an error.
   const details = [
-    percent === undefined ? 'context unknown' : `${percent}% context`,
+    percent === undefined ? undefined : `${percent}% context`,
     hasUsed ? formatTokens(props.usedTokens!, props.tokensApproximate) : undefined,
     modelText,
     props.mode?.trim(),
@@ -57,6 +62,7 @@ export default function AiContextBar(props: AiContextBarProps) {
           </Fragment>
         ))}
       </div>
+      {props.action && <div className="context-bar-action">{props.action}</div>}
     </div>
   )
 }

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, HermesPlanEntry, HermesPermissionMode, HermesPermissionRequestInfo, RemoteHermesConfig } from '../types'
+import type { Project, Session, Message, HermesCheck, HermesActivity, HermesEvent, HermesCommand, HermesPlanEntry, HermesPermissionMode, HermesPermissionRequestInfo, HermesModelInfo, HermesEffort, RemoteHermesConfig } from '../types'
+import { KimiModelPicker } from './ModelPicker'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
+import { useComposerDraft } from '../hooks/useComposerDraft'
 import Markdown from './Markdown'
 import RelativeTime from './RelativeTime'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import { useToast } from './ToastContext'
-import { useAgentActivity } from '../AgentActivityContext'
+import { useAgentTaskReporter } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { AgentErrorNotice, AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
 import { WorkspaceNotice } from './WorkspacePrimitives'
@@ -16,8 +18,25 @@ import anime, { prefersReducedMotion, stopMotion, usePressMotion, type MotionHan
 import { setAgentAvailable, setAgentPanelOpen, setAgentSession, clearAgentCurrent, type HandoffSendDetail } from '../handoff'
 import { isLastAssistantMessage, useMessageActions } from '../messageActions'
 import { useCompletionNotifier } from '../notify'
+import LivePreviewAffordance, { notifyPreviewFromHermesActivity } from './LivePreviewAffordance'
 
-const HERMES_MODEL = 'gemma4-workspace:12b'
+// Placeholder only. The real model name comes from the live ACP session
+// (`session/new` reports the provider's actual catalog), never from a constant —
+// the previous hardcoded 'gemma4-workspace:12b' silently lied whenever Hermes
+// was configured for anything else.
+const MODEL_UNKNOWN = 'model unknown'
+
+// Reasoning effort levels Hermes accepts (hermes_constants.parse_reasoning_effort).
+// 'default' is our passthrough: leave whatever Hermes is configured for.
+const EFFORT_OPTIONS: Array<{ value: HermesEffort; name: string; description?: string }> = [
+  { value: 'default', name: 'Default', description: "Leave Hermes on its configured effort" },
+  { value: 'none', name: 'None', description: 'Disable reasoning entirely' },
+  { value: 'minimal', name: 'Minimal' },
+  { value: 'low', name: 'Low' },
+  { value: 'medium', name: 'Medium' },
+  { value: 'high', name: 'High' },
+  { value: 'xhigh', name: 'Extra high' }
+]
 
 const HERMES_EMPTY_HEADINGS = [
   'What should Hermes work on?',
@@ -34,6 +53,10 @@ const PERMISSION_MODES: Array<{ mode: HermesPermissionMode; label: string; descr
 ]
 const RENDER_LIMIT = 50
 const PINNED_KEY = 'aiworkspace.hermes.pinned'
+// Which session this tab was last looking at, per project. localStorage is
+// shared across the app's windows, so a detached HermesTab remounts on the same
+// session the docked one had selected (same mechanism as ClaudeCodeTab).
+const SELECTED_SESSION_KEY_PREFIX = 'aiworkspace.hermes.selected-session.'
 function loadPinned(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(PINNED_KEY) ?? '[]')) } catch { return new Set() }
 }
@@ -354,14 +377,13 @@ interface CtxMenu { sessionId: string; x: number; y: number }
 
 export default function HermesTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
-  const { setActive: setAgentActive } = useAgentActivity()
   const [check, setCheck] = useState<HermesCheck | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
+  const [input, setInput] = useComposerDraft('aiworkspace.hermes.draft', session?.id)
   const [injectMemory, setInjectMemory] = useState(false)
   const [pendingContextBlock, setPendingContextBlock] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
@@ -377,6 +399,17 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const [connectProgress, setConnectProgress] = useState('')
   const [hermesModel, setHermesModel] = useState<string | undefined>(undefined)
   const [hermesUsage, setHermesUsage] = useState<{ used: number; max: number } | null>(null)
+  // Model catalog as advertised by the live ACP session (Hermes reports the
+  // real provider catalog — for the `custom` provider that is the running
+  // Ollama's model list). Never hardcoded; empty until a session is attached.
+  const [models, setModels] = useState<HermesModelInfo[]>([])
+  const [selectedModel, setSelectedModel] = useState<string>('')
+  const [effort, setEffort] = useState<HermesEffort>('default')
+  // Reasoning effort only reaches the agent on a patched Hermes; until we know,
+  // the control stays hidden rather than pretending to work.
+  const [effortSupported, setEffortSupported] = useState<boolean | null>(null)
+  const [patchBusy, setPatchBusy] = useState(false)
+  const [commandBusy, setCommandBusy] = useState(false)
   const [commands, setCommands] = useState<HermesCommand[]>([])
   const [slashIdx, setSlashIdx] = useState(-1)
   const [contextMenu, setContextMenu] = useState<CtxMenu | null>(null)
@@ -403,10 +436,16 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const checkRef = useRef<HermesCheck | null>(null)
   const pendingPermissionsRef = useRef<Map<string, HermesPermissionRequestInfo>>(new Map())
+  const notifiedPermissionsRef = useRef<Set<string>>(new Set())
+  // Highest replay sequence already applied, so the live stream and the replayed
+  // log can overlap during a detach handover without double-applying an event.
+  const lastLiveSequenceRef = useRef(0)
   checkRef.current = check
 
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const active = props.active ?? true
+  const activeRef = useRef(active)
+  activeRef.current = active
   const connected = check?.connected ?? false
   const estimatedTokens = useMemo(
     () => estimateTokensFromText([...messages.map((m) => m.content), streamText, thoughtText, input].filter(Boolean).join('\n')),
@@ -482,12 +521,14 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     })
   }
 
-  // Publish start/stop only (not per event) so the topbar activity badge
-  // doesn't re-render on every streamed chunk.
-  useEffect(() => {
-    setAgentActive('hermes', running)
-    return () => setAgentActive('hermes', false)
-  }, [running, setAgentActive])
+  // Publish start/stop only (not per event) so the topbar activity badge and
+  // activity popover don't re-render on every streamed chunk.
+  useAgentTaskReporter('hermes', {
+    running,
+    session,
+    title: session?.summary || session?.title,
+    failed: Boolean(error)
+  })
 
   const recheck = () => window.api.hermes.check().then(setCheck)
 
@@ -599,11 +640,122 @@ export default function HermesTab(props: { project: Project; active?: boolean })
   useEffect(() => { if (!isGlobalWorkspace && active) recheck() }, [isGlobalWorkspace, active])
   useEffect(() => {
     if (isGlobalWorkspace || !active) { setSessions([]); setArchivedSessions([]); return }
-    window.api.sessions.list(props.project.id, 'hermes').then(setSessions)
-    window.api.sessions.listArchived(props.project.id, 'hermes').then(setArchivedSessions)
+    let disposed = false
+    void Promise.all([
+      window.api.sessions.list(props.project.id, 'hermes'),
+      window.api.sessions.listArchived(props.project.id, 'hermes'),
+      window.api.hermes.liveState(props.project.id),
+    ]).then(([nextSessions, nextArchived, live]) => {
+      if (disposed) return
+      setSessions(nextSessions)
+      setArchivedSessions(nextArchived)
+      // A running turn wins over the remembered selection: whichever window owns
+      // the panel now must land on the session that is actually streaming.
+      let storedId: string | null = null
+      try { storedId = localStorage.getItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`) } catch { /* storage unavailable */ }
+      const desiredId = live?.sessionId ?? storedId
+      const next = desiredId ? [...nextSessions, ...nextArchived].find((candidate) => candidate.id === desiredId) ?? null : null
+      if (next?.id !== sessionRef.current?.id) setSession(next)
+    })
+    return () => { disposed = true }
   }, [props.project.id, isGlobalWorkspace, active])
+
+  useEffect(() => {
+    if (!session?.id) return
+    try { localStorage.setItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`, session.id) } catch { /* storage unavailable */ }
+  }, [props.project.id, session?.id])
   useEffect(() => { if (!isGlobalWorkspace && active) window.api.hermes.getConfig().then(setConfig) }, [isGlobalWorkspace, active])
   useEffect(() => { if (!isGlobalWorkspace && active) window.api.hermes.getPermissionMode().then(setPermissionMode) }, [isGlobalWorkspace, active])
+
+  // Restore this session's persisted model/effort so the pills show the real
+  // selection before the first turn of the session re-attaches to Hermes.
+  useEffect(() => {
+    if (isGlobalWorkspace || !session) {
+      setSelectedModel('')
+      setEffort('default')
+      return
+    }
+    let cancelled = false
+    void window.api.hermes.getSessionSettings(session.id).then((settings) => {
+      if (cancelled) return
+      setSelectedModel(settings.model ?? '')
+      setEffort(settings.effort ?? 'default')
+    })
+    return () => { cancelled = true }
+  }, [isGlobalWorkspace, session?.id])
+
+  // Whether this Hermes install can honor reasoning effort over ACP at all.
+  useEffect(() => {
+    if (isGlobalWorkspace || !active) return
+    let cancelled = false
+    void window.api.hermes.patchStatus().then((s) => { if (!cancelled) setEffortSupported(s.applied) })
+    return () => { cancelled = true }
+  }, [isGlobalWorkspace, active])
+
+  // Model / reasoning-effort switching. Both persist on the session row and are
+  // re-applied by the main process whenever the ACP session is (re)opened, so a
+  // choice survives Hermes restarts — see ensureHermesSession in hermes.ts.
+  async function changeModel(modelId: string) {
+    if (!session) return
+    const previous = selectedModel
+    setSelectedModel(modelId)
+    const result = await window.api.hermes.setModel(session.id, modelId)
+    if (!result.ok) {
+      setSelectedModel(previous)
+      addToast(`Could not switch model: ${result.error ?? 'unknown error'}`)
+      return
+    }
+    setHermesModel(models.find((m) => m.id === modelId)?.name ?? modelId)
+  }
+
+  async function changeEffort(value: HermesEffort) {
+    if (!session) return
+    const previous = effort
+    setEffort(value)
+    const result = await window.api.hermes.setEffort(session.id, value)
+    if (!result.ok) {
+      setEffort(previous)
+      addToast(`Could not set reasoning effort: ${result.error ?? 'unknown error'}`)
+    }
+  }
+
+  // Runs one of Hermes's own slash commands and surfaces its reply as a toast.
+  // /steer and /queue are meant to be fired while a turn is running; /context
+  // and /compact while idle.
+  async function runHermesCommand(command: string, label: string): Promise<boolean> {
+    if (!session) return false
+    setCommandBusy(true)
+    try {
+      const result = await window.api.hermes.command(session.id, command)
+      if (!result.ok) {
+        addToast(`${label} failed: ${result.error ?? 'unknown error'}`)
+        return false
+      }
+      addToast(result.text?.trim() || `${label} done.`)
+      return true
+    } finally {
+      setCommandBusy(false)
+    }
+  }
+
+  async function enableEffortControl() {
+    setPatchBusy(true)
+    try {
+      const result = await window.api.hermes.applyPatch()
+      if (result.ok) {
+        setEffortSupported(true)
+        addToast(
+          result.status === 'already-applied'
+            ? 'Hermes already supports reasoning effort.'
+            : 'Reasoning effort enabled. Hermes will restart on your next message.'
+        )
+      } else {
+        addToast(result.message ?? 'Could not enable reasoning effort.')
+      }
+    } finally {
+      setPatchBusy(false)
+    }
+  }
 
   async function changePermissionMode(mode: HermesPermissionMode) {
     const previous = permissionMode
@@ -676,10 +828,14 @@ export default function HermesTab(props: { project: Project; active?: boolean })
     return () => window.removeEventListener('panel:handoffSend', onHandoff)
   }, [])
 
-  useEffect(() => {
-    const offEvent = window.api.hermes.onEvent((d) => {
-      const e: HermesEvent = d.event
-      const isCurrentSession = d.sessionId === sessionRef.current?.id
+  // Applies one live event. Split out of the subscription below so the replay
+  // log fetched on mount (hermes:liveState) goes through exactly the same code
+  // path as a freshly streamed event — including the permission card, so an ACP
+  // approval raised before a detach is still answerable in the new window.
+  const applyHermesEvent = useCallback((sessionId: string, e: HermesEvent) => {
+    {
+      const d = { sessionId }
+      const isCurrentSession = d.sessionId === (sessionRef.current?.id ?? null)
       if (!isCurrentSession && e.kind !== 'permissionRequest') return
       if (e.kind === 'text') {
         setStreamText((t) => t + e.text)
@@ -689,18 +845,57 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       else if (e.kind === 'activity') {
         setActivity((a) => [...a, e.activity])
         appendLiveActivity(e.activity)
+        notifyPreviewFromHermesActivity(props.project.id, e.activity)
       }
       else if (e.kind === 'error') setError(e.message)
       else if (e.kind === 'model') setHermesModel(e.name)
+      else if (e.kind === 'models') {
+        setModels(e.models)
+        // Only adopt the session's current model when the user hasn't already
+        // chosen one — otherwise a mid-run advertisement would clobber the pick.
+        setSelectedModel((current) => current || e.currentId)
+      }
       else if (e.kind === 'commands') setCommands(e.commands)
       else if (e.kind === 'plan') setPlanEntries(e.entries)
       else if (e.kind === 'permissionRequest') {
         pendingPermissionsRef.current.set(d.sessionId, e.request)
         if (isCurrentSession) setPendingPermission(e.request)
+        if (!notifiedPermissionsRef.current.has(e.request.requestId)) {
+          notifiedPermissionsRef.current.add(e.request.requestId)
+          void window.api.window.notifyApproval({ source: 'hermes', summary: e.request.title, panelActive: activeRef.current })
+        }
       }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.project.id])
+
+  useEffect(() => {
+    let disposed = false
+    let hydrated = false
+    let finished = false
+    const queuedEvents: Array<{ sessionId: string; event: HermesEvent; sequence?: number }> = []
+    lastLiveSequenceRef.current = 0
+    const acceptEvent = (sessionId: string, event: HermesEvent, sequence?: number) => {
+      if (sequence !== undefined) {
+        // Main restarts the counter at 1 for every turn, so a fresh run resets the
+        // watermark — otherwise the second turn of a session would be discarded as
+        // 'already seen'.
+        if (sequence === 1) lastLiveSequenceRef.current = 0
+        if (sequence <= lastLiveSequenceRef.current) return
+        lastLiveSequenceRef.current = sequence
+      }
+      applyHermesEvent(sessionId, event)
+    }
+    const offEvent = window.api.hermes.onEvent((d) => {
+      if (!hydrated) {
+        queuedEvents.push({ sessionId: d.sessionId, event: d.event, sequence: d.sequence })
+        return
+      }
+      acceptEvent(d.sessionId, d.event, d.sequence)
     })
     const offDone = window.api.hermes.onDone(async (d) => {
       pendingPermissionsRef.current.delete(d.sessionId)
+      finished = true
       setRunning(false)
       if (d.sessionId !== sessionRef.current?.id) return
       setPendingPermission(null)
@@ -708,8 +903,25 @@ export default function HermesTab(props: { project: Project; active?: boolean })
       setMessages(await window.api.hermes.messages(d.sessionId))
       notifyCompletion()
     })
-    return () => { offEvent(); offDone() }
-  }, [session])
+    const flushQueue = () => {
+      hydrated = true
+      for (const item of queuedEvents) acceptEvent(item.sessionId, item.event, item.sequence)
+      queuedEvents.length = 0
+    }
+    if (session) {
+      void window.api.hermes.liveState(props.project.id).then((live) => {
+        if (disposed) return
+        if (live?.sessionId === session.id) {
+          if (!finished) setRunning(true)
+          for (const item of live.events) acceptEvent(live.sessionId, item.event, item.sequence)
+        }
+        flushQueue()
+      }).catch(() => { if (!disposed) flushQueue() })
+    } else {
+      hydrated = true
+    }
+    return () => { disposed = true; offEvent(); offDone() }
+  }, [session?.id, props.project.id, applyHermesEvent])
 
   useEffect(() => { return window.api.hermes.onUsage((d) => setHermesUsage(d)) }, [])
 
@@ -986,9 +1198,22 @@ export default function HermesTab(props: { project: Project; active?: boolean })
         usedTokens={session ? (hermesUsage?.used ?? estimatedTokens) : undefined}
         maxTokens={session ? hermesUsage?.max : undefined}
         tokensApproximate={session ? (hermesUsage === null && estimatedTokens !== undefined) : undefined}
-        model={hermesModel ?? HERMES_MODEL}
+        model={hermesModel ?? MODEL_UNKNOWN}
         mode="Hermes"
         status={contextStatus}
+        action={
+          session ? (
+            <button
+              className="context-bar-btn"
+              data-testid="hermes-compact"
+              disabled={!connected || commandBusy}
+              title="Ask Hermes to compress this conversation's context (/compact)"
+              onClick={() => void runHermesCommand('/compact', 'Compact')}
+            >
+              Compact
+            </button>
+          ) : undefined
+        }
       />
       <div
         className={`composer composer-shell${isDragOver ? ' composer-dropzone-active' : ''}`}
@@ -1031,6 +1256,36 @@ export default function HermesTab(props: { project: Project; active?: boolean })
         <div className="composer-bar">
           <div className="composer-bar-left">
             <button className="composer-icon-btn" onClick={() => void pickFile()} title="Attach file" aria-label="Attach file" disabled={running}>＋</button>
+            {models.length > 0 && (
+              <KimiModelPicker
+                testId="hermes-model"
+                models={models.map((m) => ({ id: m.id, label: m.name, description: m.description }))}
+                model={selectedModel || models[0]?.id || ''}
+                onModelChange={(id) => void changeModel(id)}
+                // The effort drill-in only appears on a Hermes that can honor
+                // it; see enableEffortControl() for the unpatched path.
+                configSelects={effortSupported ? [{
+                  id: 'reasoning_effort',
+                  name: 'Reasoning effort',
+                  currentValue: effort,
+                  options: EFFORT_OPTIONS.map((o) => ({ value: o.value, name: o.name, description: o.description }))
+                }] : []}
+                configValues={{ reasoning_effort: effort }}
+                onConfigChange={(_id, value) => void changeEffort(value as HermesEffort)}
+                disabled={!connected}
+              />
+            )}
+            {effortSupported === false && (
+              <button
+                className="composer-text-toggle"
+                data-testid="hermes-enable-effort"
+                disabled={patchBusy}
+                title="This Hermes build ignores reasoning effort over ACP. Enable it by patching your local Hermes checkout."
+                onClick={() => void enableEffortControl()}
+              >
+                {patchBusy ? 'Enabling…' : 'Enable effort control'}
+              </button>
+            )}
             <div className="model-select model-picker-plain" data-testid="hermes-mode-control" title={PERMISSION_MODES.find((m) => m.mode === permissionMode)?.description}>
               <select
                 data-testid="hermes-permission-mode"
@@ -1043,6 +1298,32 @@ export default function HermesTab(props: { project: Project; active?: boolean })
             </div>
           </div>
           <div className="composer-bar-right">
+            {/* While a turn is live the composer's text is not a new prompt but
+                a course correction: /steer reaches the agent between tool calls
+                without interrupting it, /queue holds it for the next turn.
+                Both are Hermes's own commands. */}
+            {running && (
+              <>
+                <button
+                  className="composer-text-toggle"
+                  data-testid="hermes-steer"
+                  disabled={!connected || commandBusy || !input.trim()}
+                  title="Send this as guidance to the running turn, without interrupting it (/steer)"
+                  onClick={() => { const text = input.trim(); if (text) void runHermesCommand(`/steer ${text}`, 'Steer').then((sent) => { if (sent) setInput('') }) }}
+                >
+                  Steer
+                </button>
+                <button
+                  className="composer-text-toggle"
+                  data-testid="hermes-queue"
+                  disabled={!connected || commandBusy || !input.trim()}
+                  title="Hold this prompt until the current turn finishes (/queue)"
+                  onClick={() => { const text = input.trim(); if (text) void runHermesCommand(`/queue ${text}`, 'Queue').then((sent) => { if (sent) setInput('') }) }}
+                >
+                  Queue
+                </button>
+              </>
+            )}
             {running
               ? <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn stop" onClick={cancelRun} title="Stop Hermes">Stop</button>
               : <button ref={sendButtonMotion.ref} {...sendButtonMotion.pressHandlers} className="composer-send-btn" data-testid="hermes-send" disabled={!connected} onClick={() => void run()}>Send</button>}
@@ -1103,7 +1384,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
           onRenameCancel={() => {}}
         />
         <section className="chat-main">
-          <AiContextBar testId="context-bar-hermes" model={HERMES_MODEL} mode="Hermes" status="Project required" disabledReason="Open a project folder" />
+          <AiContextBar testId="context-bar-hermes" model={MODEL_UNKNOWN} mode="Hermes" status="Project required" disabledReason="Open a project folder" />
           <div className="empty center cc-setup" data-testid="hermes-global-unavailable">
             <h2>Hermes needs a project folder.</h2>
             <p className="muted">Open a project workspace to use Hermes. Global Workspace is available for general chat and shared memory, but this Hermes integration should not run without a real project path.</p>
@@ -1186,6 +1467,7 @@ export default function HermesTab(props: { project: Project; active?: boolean })
               </span>
               {emptyHeading}
             </h2>
+            <LivePreviewAffordance project={props.project} agent="hermes" active={active} />
             {composerBlock}
           </div>
         ) : (
@@ -1217,7 +1499,9 @@ export default function HermesTab(props: { project: Project; active?: boolean })
               tone={running ? 'info' : connected ? 'success' : 'warning'}
               running={running}
               detail={isRemote ? 'Remote SSH' : 'WSL2 ACP'}
-            />
+            >
+              <LivePreviewAffordance project={props.project} agent="hermes" active={active} />
+            </AgentStatusStrip>
 
             {view === 'board' ? (
               <div className="chat-scroll kanban-scroll">

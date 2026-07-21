@@ -1,73 +1,38 @@
-// End-to-end test for M6 — the Hermes Agent client.
-// Exercises the REAL localhost API when it's up; no Electron.
+// Test for the Hermes ACP client (src/main/hermes.ts). No Electron, no WSL.
 // Run: npm run test:hermes
 //
-// Two outcomes are both a PASS (mirrors test-claudecode.ts):
-//   • Hermes running → submit a task, poll it to a terminal state, see activity
-//                      stream + status events, and a task summary saved to memory.
-//   • Not running    → checkHermes() reports it accurately (wsl2/installed/running)
-//                      without crashing, and the run path surfaces a clean error.
+// This replaces the original M6 test, which still targeted the long-removed
+// HTTP client (runTask/hermesHealth/HERMES_PORT) and had stopped building.
 //
-// A tiny built-in mock server is used when HERMES_TEST_MOCK=1 so the full
-// submit→poll→summary path can be verified on a machine without WSL/Hermes.
+// Covers the parts that are pure or DB-backed and therefore verifiable without
+// a live Hermes:
+//   1. toSwitchableModelId — the workaround for Hermes's model-id parser, which
+//      splits on the LAST colon and so corrupts its own advertised ids whenever
+//      the model name contains one (every Ollama tag).
+//   2. Per-session model/effort persistence, including re-attach of the ACP id.
+//   3. The embedded ACP patch text matches scripts/hermes-patches/*.patch byte
+//      for byte, so the copy shipped to remote hosts can never drift.
+//   4. checkHermes() stays honest and non-throwing whatever the environment.
+//
+// The live protocol behavior these rest on (session/new advertising models,
+// set_model, set_config_option, mid-turn /steer) was verified directly against
+// hermes-agent 0.16.0; see docs and src/main/hermesPatch.ts for the findings.
 
-import { createServer, type Server } from 'http'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { initDb, getDb } from '../src/main/db'
 import { importFolder } from '../src/main/projects'
-import { saveMemory } from '../src/main/knowledge'
 import {
   checkHermes,
-  hermesHealth,
-  runTask,
-  summarizeTask,
-  HERMES_PORT,
-  type HermesEvent
+  toSwitchableModelId,
+  isHermesEffort,
+  getHermesSessionSettings,
+  setHermesSessionModel,
+  setHermesSessionEffort,
+  HERMES_EFFORT_LEVELS
 } from '../src/main/hermes'
-
-// ---- optional mock Hermes server -------------------------------------------
-// Models the integration contract: /health, POST /tasks, GET /tasks/:id with a
-// growing activity log that completes after a couple of polls.
-function startMockHermes(port: number): Promise<Server> {
-  const task = {
-    id: 't1',
-    prompt: '',
-    status: 'pending' as string,
-    activity: [] as { ts: number; kind: string; message: string }[]
-  }
-  let polls = 0
-  const server = createServer((req, res) => {
-    const url = req.url ?? ''
-    res.setHeader('content-type', 'application/json')
-    if (url === '/health') return res.end(JSON.stringify({ status: 'ok', version: 'mock-1.0' }))
-    if (req.method === 'POST' && url === '/tasks') {
-      let body = ''
-      req.on('data', (d) => (body += d))
-      req.on('end', () => {
-        try { task.prompt = JSON.parse(body).prompt } catch {}
-        task.status = 'running'
-        task.activity = [{ ts: Date.now(), kind: 'log', message: 'received task' }]
-        res.end(JSON.stringify(task))
-      })
-      return
-    }
-    if (url === '/tasks') return res.end(JSON.stringify([task]))
-    if (url.startsWith('/tasks/')) {
-      polls++
-      if (polls === 1) task.activity.push({ ts: Date.now(), kind: 'tool', message: 'search_memory' })
-      if (polls >= 2) {
-        task.status = 'completed'
-        ;(task as any).result = 'done: created a plan'
-      }
-      return res.end(JSON.stringify(task))
-    }
-    res.statusCode = 404
-    res.end('{}')
-  })
-  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
-}
+import { HERMES_PATCH_TEXT } from '../src/main/hermesPatch'
 
 async function main() {
   const userData = mkdtempSync(join(tmpdir(), 'aiws-hermes-'))
@@ -77,70 +42,92 @@ async function main() {
 
   let ok = true
   const fail = (m: string) => { console.error(`❌ FAIL: ${m}`); ok = false }
-  const cleanup = (server?: Server) => {
-    server?.close()
+  const cleanup = () => {
     try { rmSync(userData, { recursive: true, force: true }) } catch {}
     try { rmSync(projectDir, { recursive: true, force: true }) } catch {}
   }
 
-  let mock: Server | undefined
-  if (process.env.HERMES_TEST_MOCK === '1') {
-    mock = await startMockHermes(HERMES_PORT)
-    console.error(`[test] mock Hermes listening on :${HERMES_PORT}`)
+  // ---- 1) model id normalization -------------------------------------------
+  // Hermes advertises `custom:gemma4:12b` but parses it back as provider
+  // "custom:gemma4" / model "12b" — so colon-bearing names must be sent bare.
+  const modelCases: Array<[string, string]> = [
+    ['custom:gemma4:12b', 'gemma4:12b'],
+    ['custom:gemma4-workspace:12b', 'gemma4-workspace:12b'],
+    ['custom:nomic-embed-text:latest', 'nomic-embed-text:latest'],
+    // No colon inside the model name: the full id parses correctly and is kept,
+    // which is what preserves cross-provider switching.
+    ['anthropic:claude-opus-4-8', 'anthropic:claude-opus-4-8'],
+    ['openrouter:openai/gpt-5.6-sol', 'openrouter:openai/gpt-5.6-sol'],
+    // Already bare — a single colon is indistinguishable from a provider
+    // prefix, and passing it through unchanged is correct either way.
+    ['gemma4:12b', 'gemma4:12b'],
+    ['claude-opus-4-8', 'claude-opus-4-8']
+  ]
+  for (const [input, expected] of modelCases) {
+    const actual = toSwitchableModelId(input)
+    if (actual !== expected) fail(`toSwitchableModelId(${input}) = ${actual}, expected ${expected}`)
   }
+  console.error('[test] model id normalization — OK')
 
-  // ---- 1) check (must never throw, whatever the environment) ----
+  // ---- 2) effort level validation ------------------------------------------
+  for (const level of HERMES_EFFORT_LEVELS) {
+    if (!isHermesEffort(level)) fail(`isHermesEffort rejected its own level ${level}`)
+  }
+  for (const bogus of ['ultra', 'MEDIUM', '', 'off']) {
+    if (isHermesEffort(bogus)) fail(`isHermesEffort accepted ${JSON.stringify(bogus)}`)
+  }
+  console.error('[test] effort levels — OK')
+
+  // ---- 3) per-session settings persistence ---------------------------------
+  const db = getDb()
+  const sessionId = 'hermes-test-session'
+  db.prepare(
+    'INSERT INTO sessions (id, project_id, mode, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(sessionId, project.id, 'hermes', 'Test', Date.now(), Date.now())
+
+  const empty = getHermesSessionSettings(sessionId)
+  if (empty.model || empty.effort || empty.acpSessionId) fail('fresh session reported stale Hermes settings')
+
+  setHermesSessionModel(sessionId, 'gemma4-hermes:latest')
+  setHermesSessionEffort(sessionId, 'high')
+  const saved = getHermesSessionSettings(sessionId)
+  if (saved.model !== 'gemma4-hermes:latest') fail(`model not persisted (got ${saved.model})`)
+  if (saved.effort !== 'high') fail(`effort not persisted (got ${saved.effort})`)
+
+  // 'default' is our passthrough — it must clear the column, not store a value,
+  // so the next session/new is left on whatever Hermes is configured for.
+  setHermesSessionEffort(sessionId, 'default')
+  if (getHermesSessionSettings(sessionId).effort !== undefined) fail("effort 'default' was persisted instead of cleared")
+
+  // A value that is no longer a valid level must not be handed back to callers.
+  db.prepare('UPDATE sessions SET hermes_effort = ? WHERE id = ?').run('bogus', sessionId)
+  if (getHermesSessionSettings(sessionId).effort !== undefined) fail('invalid stored effort was returned')
+
+  // Unknown session ids must be answered, not thrown on.
+  const missing = getHermesSessionSettings('does-not-exist')
+  if (missing.model || missing.effort) fail('unknown session returned settings')
+  console.error('[test] per-session model/effort persistence — OK')
+
+  // ---- 4) ACP patch text integrity -----------------------------------------
+  const patchFile = readFileSync('scripts/hermes-patches/0001-acp-reasoning-effort.patch', 'utf8').replace(/\r\n/g, '\n')
+  if (patchFile !== HERMES_PATCH_TEXT) {
+    fail(`embedded patch text differs from the .patch file (${HERMES_PATCH_TEXT.length} vs ${patchFile.length} chars)`)
+  } else {
+    console.error('[test] embedded patch matches .patch file — OK')
+  }
+  if (!HERMES_PATCH_TEXT.includes('reasoning_effort')) fail('patch text does not mention reasoning_effort')
+
+  // ---- 5) checkHermes stays honest -----------------------------------------
   const check = await checkHermes()
   console.error('[test] checkHermes():', JSON.stringify(check))
-  for (const k of ['wsl2', 'installed', 'running'] as const) {
-    if (typeof (check as any)[k] !== 'boolean') fail(`check.${k} is not a boolean`)
+  for (const k of ['wsl2', 'installed', 'connected'] as const) {
+    if (typeof check[k] !== 'boolean') fail(`check.${k} is not a boolean`)
   }
 
-  const health = await hermesHealth()
-  if (!health.ok) {
-    console.error('[test] Hermes API not reachable — setup path is what the UI shows. SKIP run.')
-    // summarizeTask must still be robust on a failed/empty run.
-    const summary = summarizeTask('plan the work', { ok: false, activity: [], error: 'not reachable' })
-    if (!summary.title || !summary.content.includes('Task:')) fail('summarizeTask malformed on empty run')
-    cleanup(mock)
-    if (!ok) { console.error('\n❌ FAILED'); process.exit(1) }
-    console.error('\n⚠️  SKIP: Hermes API not running (build is fine; setup path verified)')
-    process.exit(0)
-  }
-
-  // ---- 2) submit + poll a task, capturing streamed events ----
-  const events: HermesEvent[] = []
-  console.error('[test] submitting a task (real API)…')
-  const run = await runTask({
-    prompt: 'Make a short plan for adding a healthcheck.',
-    project: projectDir,
-    pollMs: 200,
-    maxMs: 20_000,
-    onEvent: (e) => {
-      events.push(e)
-      if (e.kind === 'activity') console.error(`   • ${e.activity.kind}: ${e.activity.message}`)
-      else if (e.kind === 'status') console.error(`   • status: ${e.status} (${e.summary})`)
-      else if (e.kind === 'error') console.error(`   • error: ${e.message}`)
-    }
-  })
-  console.error('[test] run:', JSON.stringify({ ok: run.ok, status: run.task?.status, activity: run.activity.length }))
-
-  if (!events.some((e) => e.kind === 'status')) fail('no status event was streamed')
-  if (!run.task) fail('run produced no task')
-  if (run.ok && run.activity.length === 0) fail('completed run streamed no activity')
-
-  // ---- 3) post-task summary saved to memory (single write queue) ----
-  const { title, content } = summarizeTask('Make a short plan for adding a healthcheck.', run)
-  await saveMemory({ projectId: project.id, type: 'task', title, content, source: 'hermes', tags: ['hermes'] })
-  const saved = getDb()
-    .prepare(`SELECT COUNT(*) AS n FROM memory_items WHERE project_id = ? AND source = 'hermes'`)
-    .get(project.id) as { n: number }
-  if (saved.n < 1) fail('no Hermes task summary memory was saved')
-  else console.error('[test] task summary saved to memory — OK')
-
-  cleanup(mock)
-  if (ok) { console.error('\n✅ PASS: Hermes client (check + submit/poll/stream + summary)'); process.exit(0) }
-  else { console.error('\n❌ FAILED'); process.exit(1) }
+  cleanup()
+  if (ok) { console.error('\n✅ PASS: Hermes ACP client (model ids, effort, session settings, patch integrity)'); process.exit(0) }
+  console.error('\n❌ FAILED')
+  process.exit(1)
 }
 
 main().catch((err) => { console.error('[test] fatal:', err); process.exit(1) })

@@ -167,6 +167,37 @@ events stream, task summary saved to memory); without it, the test asserts
 `checkHermes()` reports state accurately and the setup/SKIP path is clean (no
 crash). On this box it correctly detects WSL2+Ubuntu present, Hermes not yet
 installed. tsc clean, `npm run build` green.
+
+### M6.1 — Hermes control parity (ACP)
+The HTTP/`localhost:7823` design above is **historical**: the client now speaks ACP
+JSON-RPC over the `hermes acp` process's stdio (local WSL2 or remote SSH). This pass
+closed the gap between the tab and what the terminal Hermes can actually do.
+**Session model:** `runHermesPrompt` used to call `session/new` on *every* prompt, so
+Hermes started from zero each turn. Now one ACP session is created per app session,
+persisted in `sessions.hermes_acp_session_id`, and re-attached with `session/load`
+(mirrors the `codex_thread_id` precedent). Hermes keeps server-side history, and
+`/context` + `/compact` become meaningful.
+**Model switching:** the catalog comes from the live `session/new` / `session/load`
+`models` block — for the `custom` provider that is the running Ollama's real list; the
+old hardcoded `HERMES_MODEL` constant is gone. Hermes's own `parse_model_input` splits
+on the **last** colon and so corrupts the provider-prefixed ids it advertises whenever
+the model name contains one (every Ollama tag), so `toSwitchableModelId()` sends the
+bare name. Models Hermes refuses (e.g. a 2K-context embedding model) surface their
+reason and are never persisted.
+**Reasoning effort:** not wired into ACP upstream — `_make_agent` never passes
+`reasoning_config`, so effort was pinned to "medium" whatever the config said. A small
+patch to the user's own Hermes checkout makes `session/set_config_option
+{reasoning_effort}` real; `src/main/hermesPatch.ts` applies it over WSL **or SSH** and
+detects it by grepping the source (a `hermes update` can revert it). The effort control
+only renders once that check passes.
+**Steer / queue:** a slash command sent as a concurrent `session/prompt` answers in ~3ms
+while a turn runs — Hermes's intended `/steer` path. Its reply streams on the same
+channel as the live turn, so a command sink diverts it out of the transcript.
+**Verified:** `npm run test:hermes` (rewritten — the old one still imported the removed
+HTTP client and no longer built) covers id normalization, effort validation, session
+settings, and patch-text integrity. `npm run test:hermes-live` (new, skips without a
+live Hermes) proves session reuse, cross-turn memory, model round-trip, and command
+capture against the real agent.
 **Env note (this dev box):** WSL2 (with Ubuntu) is present but Hermes itself is not
 installed, so the live submit path was validated against the mock; the real
 end-to-end run requires running `setup-hermes.ps1` first.
