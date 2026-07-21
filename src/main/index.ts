@@ -1,4 +1,5 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain, session } from 'electron'
+import http from 'node:http'
 import { join } from 'path'
 import { registerIpc, killAllPtys } from './ipc'
 import { destroyAllBrowserTabs, registerBrowserHostWindow } from './browserPanel'
@@ -23,6 +24,43 @@ const gpuDisabled =
   process.env.ELECTRON_DISABLE_GPU === '1' ||
   process.env.AIWORKSPACE_DISABLE_GPU === '1'
 
+// Verbose renderer content dumps (full markup, raw served body). These were the
+// probes used to diagnose the corrupted-cache bug; that cause is understood and
+// the health check below now auto-recovers from it, so they no longer earn a
+// place in every launch's log. Kept — behind an opt-in — because they are the
+// tool of choice if a similar "page parsed but looks wrong" report ever returns.
+// The cheap one-line signals (contentType, HTTP status) stay unconditional.
+const diagVerbose = process.env.AIWORKSPACE_DIAG_VERBOSE === '1'
+
+if (!app.isPackaged && process.platform === 'win32') {
+  // electron-vite development launches can fail to create the renderer process
+  // under the Windows sandbox (exit code 49), leaving the Vite page half-loaded.
+  // Keep this limited to unpackaged Windows runs; production stays sandboxed.
+  app.commandLine.appendSwitch('no-sandbox')
+  console.log(
+    '[Diag] no-sandbox switch registered:',
+    app.commandLine.hasSwitch('no-sandbox'),
+    'value:',
+    JSON.stringify(app.commandLine.getSwitchValue('no-sandbox'))
+  )
+}
+
+// Renderer-failure diagnostics: environment context printed once at startup so
+// pasted logs from an affected machine carry version + memory info.
+console.log(
+  '[Diag] versions:',
+  JSON.stringify({
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+    node: process.versions.node
+  })
+)
+try {
+  console.log('[Diag] system memory (KB):', JSON.stringify(process.getSystemMemoryInfo()))
+} catch (err) {
+  console.error('[Diag] getSystemMemoryInfo failed:', err)
+}
+
 if (gpuDisabled) {
   app.commandLine.appendSwitch('disable-gpu')
   app.commandLine.appendSwitch('disable-gpu-compositing')
@@ -41,6 +79,122 @@ function perfLog(label: string): void {
   console.log(`[perf:start] ${label} ${Date.now() - startupStartedAt}ms`)
 }
 
+// --- Renderer self-healing (corrupted Chromium disk-cache recovery) ---------
+// Root cause: a repeated force-kill of the app during dev debugging left
+// %APPDATA%/ai-workspace/Cache in a state where Chromium kept serving a
+// stale/garbled 304-reused entry for index.html even though the real dev
+// server response was always clean. That's not a bug in this app's code, but
+// the same failure mode (crash, forced shutdown, power loss, disk error, AV
+// interference mid-write) could hit a packaged build too, so the app checks
+// its own renderer health after every load and self-heals instead of leaving
+// a real user stuck on a permanently broken window.
+const EXPECTED_TITLE = 'AI Workspace'
+const HEALTH_CHECK_SETTLE_MS = 500
+
+// Test hook only: forces the health check to report unhealthy so the
+// cache-clear-and-reload / fallback-screen paths can be exercised without
+// hand-corrupting the real Chromium cache. 'once' fails a single check (to
+// verify the auto-recovery reload path); 'always' fails every check (to
+// verify the fallback error screen).
+let forceHealthCheckFailOnce = process.env.AIWORKSPACE_FORCE_HEALTH_CHECK_FAIL === 'once'
+
+async function verifyRendererHealth(win: BrowserWindow): Promise<boolean> {
+  if (win.isDestroyed()) return false
+  if (process.env.AIWORKSPACE_FORCE_HEALTH_CHECK_FAIL === 'always') {
+    console.log('[Recovery] health check forced unhealthy via AIWORKSPACE_FORCE_HEALTH_CHECK_FAIL=always')
+    return false
+  }
+  if (forceHealthCheckFailOnce) {
+    forceHealthCheckFailOnce = false
+    console.log('[Recovery] health check forced unhealthy via AIWORKSPACE_FORCE_HEALTH_CHECK_FAIL=once')
+    return false
+  }
+  try {
+    const probe = await win.webContents.executeJavaScript(`(() => {
+      const root = document.getElementById('root')
+      // Defensive signature check for the exact garbled-cache symptom seen in
+      // the incident: raw response bytes dumped as text directly under <body>,
+      // outside the mounted #root app.
+      let strayText = false
+      if (document.body) {
+        for (const node of Array.from(document.body.childNodes)) {
+          if (node.nodeType === Node.TEXT_NODE && node.textContent && /[\\x00-\\x08\\x0E-\\x1F]/.test(node.textContent)) {
+            strayText = true
+            break
+          }
+        }
+      }
+      return { title: document.title || '', rootChildren: root ? root.childElementCount : 0, strayText: strayText }
+    })()`)
+    const healthy =
+      typeof probe?.title === 'string' &&
+      probe.title === EXPECTED_TITLE &&
+      typeof probe?.rootChildren === 'number' &&
+      probe.rootChildren > 0 &&
+      !probe.strayText
+    console.log('[Recovery] health check probe:', JSON.stringify(probe), 'healthy:', healthy)
+    return healthy
+  } catch (err) {
+    console.error('[Recovery] health check probe threw:', err)
+    return false
+  }
+}
+
+function fallbackErrorScreenHtml(): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI Workspace</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #141519;
+    color: #e8e8ea;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .box { max-width: 420px; text-align: center; padding: 32px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  p { font-size: 14px; line-height: 1.5; color: #a8a8ae; margin: 0 0 24px; }
+  button {
+    background: #7c5cff;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 22px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #8f72ff; }
+  button:disabled { opacity: 0.6; cursor: default; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>AI Workspace failed to load correctly.</h1>
+    <p>This is usually fixed by resetting the local cache.</p>
+    <button id="reset-btn">Reset and Restart</button>
+  </div>
+  <script>
+    document.getElementById('reset-btn').addEventListener('click', (e) => {
+      e.target.disabled = true
+      e.target.textContent = 'Resetting...'
+      window.api.app.resetAndRestart()
+    })
+  </script>
+</body>
+</html>`
+}
+
+function showFallbackErrorScreen(win: BrowserWindow): void {
+  if (win.isDestroyed()) return
+  console.error('[Recovery] Showing fallback error screen (health check still failing after cache-clear retry)')
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(fallbackErrorScreenHtml()))
+}
+
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -53,8 +207,114 @@ function createWindow(): BrowserWindow {
       preload: join(__dirname, '../preload/index.js')
     }
   })
-  if (process.env.ELECTRON_RENDERER_URL) win.loadURL(process.env.ELECTRON_RENDERER_URL)
-  else win.loadFile(join(__dirname, '../renderer/index.html'))
+  // --- Renderer-failure diagnostics (attached before any load starts) ---
+  // Captures the real reason when the renderer process dies or a load fails,
+  // instead of guessing from the symptom. Verbose on purpose; trim after the
+  // garbled-renderer bug is root-caused.
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[RENDERER GONE]', JSON.stringify(details))
+  })
+  win.webContents.on('unresponsive', () => {
+    console.error('[RENDERER UNRESPONSIVE]')
+  })
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    console.error('[LOAD FAILED]', errorCode, errorDescription, 'url:', validatedURL, 'mainFrame:', isMainFrame)
+  })
+  win.webContents.on('preload-error', (_event, preloadPath, error) => {
+    console.error('[PRELOAD ERROR]', preloadPath, error)
+  })
+  // Surface renderer-side warnings/errors in the terminal (levels: 0=verbose,
+  // 1=info, 2=warning, 3=error).
+  win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) console.error(`[RENDERER CONSOLE] ${message} (${sourceId}:${line})`)
+  })
+  // Discriminator for the "raw page source shown as text" symptom: if the
+  // document parsed as text/plain instead of text/html, scripts render as
+  // literal text — a MIME/parsing failure, not a renderer crash.
+  win.webContents.once('did-finish-load', () => {
+    win.webContents
+      .executeJavaScript(
+        '({ contentType: document.contentType, title: document.title, bodyChildren: document.body ? document.body.childElementCount : -1 })'
+      )
+      .then((info) => console.log('[Diag] document after load:', JSON.stringify(info)))
+      .catch((err) => console.error('[Diag] document probe failed:', err))
+    // Full markup of whatever actually parsed, so an empty-body probe result can
+    // be told apart from a blank page vs. source-rendered-as-text.
+    if (diagVerbose) {
+      win.webContents
+        .executeJavaScript('document.documentElement.outerHTML')
+        .then((html: string) => console.log('[Diag] outerHTML (first 2000 chars):', html.slice(0, 2000)))
+        .catch((err) => console.error('[Diag] outerHTML probe failed:', err))
+    }
+  })
+
+  const rendererUrl = process.env.ELECTRON_RENDERER_URL
+  const loadRenderer = (): void => {
+    console.log('[Diag] loading renderer from:', rendererUrl ?? join(__dirname, '../renderer/index.html'))
+    if (rendererUrl) win.loadURL(rendererUrl)
+    else win.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+  loadRenderer()
+
+  // Self-healing health check: after each load finishes, verify the page
+  // actually rendered the app (not a corrupted/garbled cache hit). Runs in
+  // both dev and packaged builds — this protects real users, not just dev
+  // debugging. Waits a beat past did-finish-load so React's async mount has
+  // time to paint before the #root-children check runs (did-finish-load only
+  // means the page's own load event fired, not that React has mounted yet).
+  let recoveryAttempted = false
+  // Guards against the fallback error page's own did-finish-load re-entering
+  // this handler and reloading itself forever — once the fallback is shown,
+  // the health check never runs again for this window.
+  let fallbackShown = false
+  win.webContents.on('did-finish-load', () => {
+    if (fallbackShown) return
+    void (async () => {
+      await new Promise((resolve) => setTimeout(resolve, HEALTH_CHECK_SETTLE_MS))
+      if (win.isDestroyed() || fallbackShown) return
+      const healthy = await verifyRendererHealth(win)
+      if (healthy) {
+        if (recoveryAttempted) console.log('[Recovery] Renderer healthy after cache-clear retry')
+        return
+      }
+      if (recoveryAttempted) {
+        fallbackShown = true
+        showFallbackErrorScreen(win)
+        return
+      }
+      recoveryAttempted = true
+      console.error('[Recovery] Renderer health check failed — clearing cache and reloading (one automatic retry)')
+      try {
+        await session.defaultSession.clearCache()
+        await session.defaultSession.clearStorageData({ storages: ['cachestorage'] })
+        console.log('[Recovery] Cache cleared, reloading renderer')
+      } catch (err) {
+        console.error('[Recovery] Cache clear failed, reloading anyway:', err)
+      }
+      if (win.isDestroyed()) return
+      loadRenderer()
+    })()
+  })
+
+  // Same URL fetched outside Electron: shows the bytes and Content-Type Vite is
+  // really serving, independent of any renderer-side weirdness.
+  if (!app.isPackaged && rendererUrl?.startsWith('http://')) {
+    http
+      .get(rendererUrl, (res) => {
+        console.log('[Diag] raw HTTP status:', res.statusCode, 'content-type:', res.headers['content-type'])
+        if (!diagVerbose) {
+          res.resume() // Drain; nothing is reading the body.
+          return
+        }
+        console.log('[Diag] raw HTTP headers:', JSON.stringify(res.headers))
+        let body = ''
+        res.on('data', (chunk) => {
+          if (body.length < 500) body += chunk
+        })
+        res.on('end', () => console.log('[Diag] raw HTTP body (first 500 chars):', body.slice(0, 500)))
+      })
+      .on('error', (err) => console.error('[Diag] raw HTTP probe failed:', err))
+  }
   win.webContents.once('did-finish-load', () => perfLog('renderer-loaded'))
   // Clear whatever background-completion attention cue window:notifyActivity set.
   win.on('focus', () => {
@@ -125,6 +385,24 @@ async function ensureBrowserMcp(): Promise<void> {
     console.warn('[MCP] Failed to register browser MCP server:', err)
   }
 }
+
+// Belt-and-suspenders reset triggered from the fallback error screen: clear
+// the cache again (in case the automatic retry's clear didn't take, e.g. the
+// corruption was in a different storage area) and do a full process relaunch
+// rather than another in-place reload, since a fresh process is the more
+// reliable recovery once the automatic single-retry path has already failed.
+ipcMain.handle('app:resetAndRestart', async () => {
+  console.log('[Recovery] Reset and Restart requested from fallback error screen')
+  try {
+    await session.defaultSession.clearCache()
+    await session.defaultSession.clearStorageData({ storages: ['cachestorage'] })
+    console.log('[Recovery] Cache cleared before relaunch')
+  } catch (err) {
+    console.error('[Recovery] Cache clear before relaunch failed:', err)
+  }
+  app.relaunch()
+  app.exit(0)
+})
 
 app.whenReady().then(async () => {
   try {
