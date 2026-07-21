@@ -15,6 +15,15 @@
   --focus-ring:#7a5f23;   /* visible keyboard focus on warm light surfaces */
   --active-bg: #fbf9f5;   /* active session/item background — brightest, floats like a panel card */
   --hover-bg:  #f4f1eb;   /* hover background — subtle lift, clearly dimmer than active */
+  /* Session rows run a hotter scale than the generic hover/active pair: hovering
+     a row lands about where a generic active item sits, and the open session
+     goes brighter still so it stays the brightest thing in the list. */
+  --session-hover-bg:  #faf8f3;
+  --session-active-bg: #ffffff;
+  /* Chip behind the ⋮ glyph on hover. Translucent so it lifts off whatever the
+     row is painted; on this near-white light surface "lighter" isn't available,
+     so the equivalent affordance is a faint dark tint. */
+  --session-more-hover-bg: rgba(0, 0, 0, 0.08);
   --pill-bg:   #e3ddd3;   /* active tab pill background */
 
   /* Aliases — keep old names working in legacy rules */
@@ -319,6 +328,17 @@ input:focus, textarea:focus, select:focus {
 }
 .topbar-tab:hover { background: var(--hover-bg); color: var(--text); }
 .topbar-tab.active { background: var(--pill-bg); color: var(--text); }
+/* A detached panel holds no dock slot, so its rack entry is the main window's
+   only trace of it: a small dot marking "this one lives in another window".
+   Clicking the entry brings that window home (WINDOW_DETACH_DESIGN.md §4.6). */
+.topbar-tab.is-detached,
+.topbar-dropdown-item.is-detached,
+.topbar-group-btn.has-detached { color: var(--text); }
+.topbar-tab-detached-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); flex: none;
+  box-shadow: 0 0 0 2px var(--bg-3);
+}
 .topbar-tab-close {
   font-size: 14px; line-height: 1; color: var(--text-3);
   margin-left: 2px; padding: 0 2px; border-radius: 2px;
@@ -590,6 +610,17 @@ input:focus, textarea:focus, select:focus {
   width: 7px; height: 7px; border-radius: 50%; flex: none;
   background: var(--panel-accent, var(--accent));
 }
+.shell.workspace-detach-ready,
+.shell.workspace-detach-ready * {
+  cursor: alias !important;
+}
+.drag-ghost.detach-ready {
+  max-width: 238px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-4) 90%, var(--text) 10%);
+  border-color: color-mix(in srgb, var(--text-2) 58%, var(--border));
+  box-shadow: var(--shadow-2), 0 0 0 1px color-mix(in srgb, var(--text-2) 12%, transparent);
+}
 
 /* ── Empty launcher ──────────────────────────────────────────────────────── */
 .workspace-empty-launcher {
@@ -658,8 +689,8 @@ input:focus, textarea:focus, select:focus {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 11px; color: var(--text-3); line-height: 1.3;
 }
-.session-item:hover { background: var(--hover-bg); color: var(--text); }
-.session-item.active { background: var(--active-bg); color: var(--text); }
+.session-item:hover { background: var(--session-hover-bg); color: var(--text); }
+.session-item.active { background: var(--session-active-bg); color: var(--text); }
 
 /* Timestamp/"..." overlay — sits over the row's top-right corner (see
    .session-item-row1's reserved padding-right above). At rest the relative
@@ -673,7 +704,12 @@ input:focus, textarea:focus, select:focus {
 .session-row-meta .session-activity-time {
   opacity: 1; transition: opacity 100ms ease;
 }
-.session-row:hover .session-row-meta .session-activity-time { opacity: 0; }
+/* Hover fades the timestamp out; so does an open options menu or a keyboard
+   focus ring, since the button is visible in those states too and the two
+   would otherwise overlap in the shared grid cell once the pointer leaves. */
+.session-row:hover .session-row-meta .session-activity-time,
+.session-row-meta:has(.session-row-more-btn.menu-open) .session-activity-time,
+.session-row-meta:has(.session-row-more-btn:focus-visible) .session-activity-time { opacity: 0; }
 /* The button itself is the ≥28×28 hit/focus target (WCAG 2.5.8); the visible
    20×20 square is its inner icon box, so the on-screen chip stays small while
    the click/tap area doesn't. */
@@ -687,14 +723,23 @@ input:focus, textarea:focus, select:focus {
 .session-row:hover .session-row-more-btn,
 .session-row-more-btn.menu-open,
 .session-row-more-btn:focus-visible { opacity: 1; }
+/* At rest the glyph sits bare on the row — no chip, so it reads as part of the
+   session button. The 20×20 square only picks up a fill when the button itself
+   is hovered (or its menu is open), lifting it above whatever the row is
+   currently painted, hovered or active. */
 .session-row-more-icon {
   width: 20px; height: 20px;
   display: flex; align-items: center; justify-content: center;
   color: var(--text-2); font-size: 13px; line-height: 1;
-  background: var(--bg-4); border-radius: 5px;
+  background: transparent; border-radius: 5px;
   transition: color var(--t), background var(--t);
 }
-.session-row-more-btn:hover .session-row-more-icon { color: var(--text); background: var(--bg-3); }
+.session-row-more-btn:hover .session-row-more-icon,
+.session-row-more-btn.menu-open .session-row-more-icon,
+.session-row-more-btn:focus-visible .session-row-more-icon {
+  color: var(--text);
+  background: var(--session-more-hover-bg);
+}
 
 /* Inline rename input */
 .session-rename-input {
@@ -1194,6 +1239,17 @@ button.session-menu-delete.pending-confirm:focus-visible,
 .context-items { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; flex-wrap: nowrap; overflow: hidden; }
 .context-item { min-width: 0; max-width: 190px; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .context-item + .context-item::before { content: "·"; color: var(--border); padding: 0 6px; }
+/* Trailing action on the context bar (Hermes "Compact"). Sits outside
+   .context-items so the ellipsizing detail list can never squeeze it out. */
+.context-bar-action { flex: none; display: flex; align-items: center; }
+.context-bar-btn {
+  min-height: 20px; padding: 1px 7px; border-radius: 5px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-3); font: inherit; cursor: pointer;
+  transition: color var(--t), background var(--t), border-color var(--t);
+}
+.context-bar-btn:hover:not(:disabled) { color: var(--text); background: var(--hover-bg); border-color: var(--text-3); }
+.context-bar-btn:disabled { opacity: 0.45; cursor: default; }
 .context-item.context-item-badge { max-width: none; overflow: visible; flex: none; }
 .context-item.context-item-badge .workspace-status-badge { font-family: var(--font-mono); }
 
@@ -4724,6 +4780,9 @@ html[data-motion="off"] *::after {
 
   --active-bg: #38342e;
   --hover-bg: #292623;
+  --session-hover-bg: #35312b;
+  --session-active-bg: #454039;
+  --session-more-hover-bg: rgba(255, 255, 255, 0.15);
   --pill-bg: #34312d;
   --panel: var(--bg-2);
   --panel-2: var(--bg-3);
@@ -4959,7 +5018,11 @@ button.primary:hover {
   filter: brightness(1.08);
 }
 
-button.danger {
+/* Solid-fill danger buttons. The session context menu's Delete is a menu row,
+   not a filled button — it stays transparent with red text until hovered, so it
+   opts out here (nesting under [data-theme='dark'] would otherwise let this rule
+   outrank .session-context-item.danger). */
+button.danger:not(.session-context-item) {
   background: var(--danger);
   box-shadow: none;
 }
@@ -5015,15 +5078,20 @@ select:focus {
   transform: none;
 }
 
-/* Tied to --hover-bg (not --surface-hover) so the row's hover/active
+/* Tied to --session-hover-bg (not --surface-hover) so the row's hover/active
    brightness ladder stays controlled by the same two tokens as the light
    theme, instead of drifting from a translucent-overlay composite. */
 .session-item:hover {
-  background: var(--hover-bg);
+  background: var(--session-hover-bg);
   transform: none;
 }
 
-.session-item.active,
+.session-item.active {
+  background: var(--session-active-bg);
+  border-color: transparent;
+  box-shadow: none;
+}
+
 .memory-item.selected,
 .project-row.current,
 .scope-seg-btn.active,
@@ -6209,9 +6277,9 @@ html[data-motion="off"] .ext-registry-skeleton::after {
   border-radius: 8px;
   min-height: 0;
 }
-.session-item:hover { background: var(--hover-bg); }
+.session-item:hover { background: var(--session-hover-bg); }
 .session-item.active {
-  background: var(--active-bg);
+  background: var(--session-active-bg);
   box-shadow: none; /* no border, no left accent bar */
   border-color: transparent;
 }
@@ -6856,6 +6924,18 @@ button.tiny,
   position: absolute; inset: 0; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 10px; text-align: center;
 }
+
+/* Detached Browser/Preview windows load the same renderer bundle in
+   "single panel" mode (no topbar/docking) — fill the window edge to edge. */
+.detached-panel-window { display: flex; flex-direction: column; }
+.detached-panel-window .browser-panel,
+.detached-panel-window .preview-panel { flex: 1; }
+.detached-react-panel {
+  flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text);
+}
+.detached-react-panel-head { cursor: default; }
+.detached-react-panel-body { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; }
 @media (prefers-reduced-motion: reduce) {
   .browser-tab-spinner, .browser-progress.loading { animation: none; }
 }
