@@ -37,15 +37,21 @@ export default function ProjectPicker(props: {
     if (!name.trim()) return
     const parent = await window.api.projects.pickFolder()
     if (!parent) return
-    await window.api.projects.create(name.trim(), parent)
+    const created = await window.api.projects.create(name.trim(), parent)
     setName('')
     setCreating(false)
     props.onRefresh()
+    // A just-created project is where the user wants to be — don't make them
+    // find it in the list.
+    props.onOpen(created)
   }
 
   async function importFolder() {
     const p = await window.api.projects.import()
-    if (p) props.onRefresh()
+    if (p) {
+      props.onRefresh()
+      props.onOpen(p)
+    }
   }
 
   const rootClass = isPanel ? 'navigator-panel' : isNavigator ? 'navigator-overlay' : 'picker'

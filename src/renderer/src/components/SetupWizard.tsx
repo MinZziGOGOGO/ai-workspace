@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import anime, { cleanupMotion, type MotionHandle } from '../motion'
 import type { Project, ToolDetection } from '../types'
+import CloudSpeedNudge, { useSlowLocalNudge } from './CloudSpeedNudge'
 
 // First-run setup wizard (full-screen modal). Detects the installed AI tools,
 // explains what each one does, optionally creates a first project, and records
@@ -47,13 +48,22 @@ const TOOLS: ToolMeta[] = [
     label: 'Hermes',
     foundDetail: 'Your autonomous agent framework.',
     missingDetail: 'Your autonomous agent framework. Install from:',
-    installUrl: 'https://github.com/nouresearch/hermes'
+    installUrl: 'https://github.com/NousResearch/hermes-agent'
+  },
+  {
+    key: 'kimi',
+    label: 'Kimi',
+    foundDetail: "Moonshot AI's coding agent (Kimi Code CLI).",
+    missingDetail: 'Install with npm, or the official script (PowerShell: irm https://code.kimi.com/kimi-code/install.ps1 | iex), then see:',
+    installCommand: 'npm install -g @moonshot-ai/kimi-code',
+    installUrl: 'https://moonshotai.github.io/kimi-code/en/guides/getting-started.html'
   }
 ]
 
 const EMPTY_DETECTION: ToolDetection = {
   claudeCode: { installed: false },
   codex: { installed: false },
+  kimi: { installed: false },
   ollama: { installed: false },
   hermes: { installed: false }
 }
@@ -195,6 +205,11 @@ export default function SetupWizard(props: { onComplete: () => void }) {
 
   const detectionDone = detection !== null && revealed >= TOOLS.length
 
+  // Ollama being installed is only half the story: on a CPU-only box it works
+  // but takes minutes per reply. Probe for that once detection has actually
+  // found Ollama, and only on the results step where we have room to explain.
+  const speedNudge = useSlowLocalNudge(step === 3 && detection?.ollama.installed === true)
+
   function toolStatus(key: ToolKey): 'pending' | 'found' | 'notfound' {
     const index = TOOLS.findIndex((t) => t.key === key)
     if (!detection || revealed <= index) return 'pending'
@@ -221,7 +236,7 @@ export default function SetupWizard(props: { onComplete: () => void }) {
               <h1 className="setup-wizard-heading">Welcome to AI Workspace</h1>
               <p className="setup-wizard-description">
                 Let&apos;s set up your AI toolkit. The following steps will detect what you have
-                installed and get you ready to work with Claude Code, Hermes, Codex, and local models.
+                installed and get you ready to work with Claude Code, Hermes, Codex, Kimi, and local models.
               </p>
             </>
           )}
@@ -249,6 +264,14 @@ export default function SetupWizard(props: { onComplete: () => void }) {
             <>
               <div className="setup-wizard-icon" aria-hidden>☰</div>
               <h1 className="setup-wizard-heading">Here&apos;s what we found</h1>
+              {speedNudge.show && (
+                <CloudSpeedNudge
+                  probe={speedNudge.probe}
+                  testId="setup-cloud-nudge"
+                  onDismiss={speedNudge.dismiss}
+                  onConfigured={speedNudge.markConfigured}
+                />
+              )}
               {TOOLS.map((meta) => {
                 const status = detection?.[meta.key] ?? { installed: false }
                 return (
@@ -336,7 +359,7 @@ export default function SetupWizard(props: { onComplete: () => void }) {
               <h1 className="setup-wizard-heading">All set!</h1>
               <p className="setup-wizard-description">
                 You&apos;re ready to start. Go to Settings anytime to configure Claude Code, Hermes,
-                or Codex further.
+                Codex, or Kimi further.
               </p>
               <label className="setup-wizard-option">
                 <input

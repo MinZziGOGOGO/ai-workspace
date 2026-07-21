@@ -196,12 +196,27 @@ export default function CommandPalette(props: {
     setSelectedIndex(0)
   }, [query])
 
+  // Keyboard navigation must keep the selection on screen — beyond ~10 items
+  // the highlight otherwise moves below the fold and arrows appear dead.
+  // Gated to keyboard moves so hover-selection can't yank the scroll position.
+  const resultsRef = useRef<HTMLDivElement>(null)
+  const keyboardNavRef = useRef(false)
+  useEffect(() => {
+    if (!keyboardNavRef.current) return
+    keyboardNavRef.current = false
+    resultsRef.current
+      ?.querySelector('.cmdk-item.selected')
+      ?.scrollIntoView({ block: 'nearest' })
+  }, [selectedIndex])
+
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'ArrowDown') {
       e.preventDefault()
+      keyboardNavRef.current = true
       setSelectedIndex((i) => (flatItems.length ? (i + 1) % flatItems.length : 0))
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
+      keyboardNavRef.current = true
       setSelectedIndex((i) => (flatItems.length ? (i - 1 + flatItems.length) % flatItems.length : 0))
     } else if (e.key === 'Enter') {
       e.preventDefault()
@@ -223,7 +238,7 @@ export default function CommandPalette(props: {
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
         />
-        <div className="cmdk-results">
+        <div className="cmdk-results" ref={resultsRef}>
           {flatItems.length === 0 && <div className="cmdk-empty muted small">No matches</div>}
           {groups.map((group) => (
             <div key={group.label}>

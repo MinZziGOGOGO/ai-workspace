@@ -163,13 +163,28 @@ export default function ProjectHomePanel(props: {
 
   useEffect(() => {
     let cancelled = false
-    const modes = ['chat', 'codex', 'claudecode', 'hermes']
-    Promise.all(modes.map((mode) => window.api.sessions.list(props.project.id, mode).catch(() => [] as Session[])))
-      .then((groups) => {
-        if (cancelled) return
-        setSessions(groups.flat().sort((a, b) => b.created_at - a.created_at).slice(0, 6))
-      })
-    return () => { cancelled = true }
+    const loadSessions = () => {
+      const modes = ['chat', 'codex', 'claudecode', 'hermes']
+      Promise.all(modes.map((mode) => window.api.sessions.list(props.project.id, mode).catch(() => [] as Session[])))
+        .then((groups) => {
+          if (cancelled) return
+          setSessions(groups.flat().sort((a, b) => b.created_at - a.created_at).slice(0, 6))
+        })
+    }
+    loadSessions()
+    // "Recent Activity" must not stay frozen at mount time: agent/chat runs
+    // emit activity:log entries, so use them as a cheap changed-signal and
+    // re-list sessions (debounced — bursts of tool events collapse to one).
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const offActivity = window.api.activity.onLog(() => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(loadSessions, 1000)
+    })
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      offActivity()
+    }
   }, [props.project.id])
 
   useEffect(() => {
@@ -203,7 +218,7 @@ export default function ProjectHomePanel(props: {
       ]
     }
     return [
-      { label: 'Ask Chat about this project', detail: 'Use local context and shared memory.', panel: 'chat' as const, prompt: `Help me understand the ${props.project.name} project.` },
+      { label: 'Ask Chat about this project', detail: 'Use local context and shared memory.', panel: 'chat' as const, prompt: `Help me understand this project (${props.project.name}).` },
       { label: 'Run Codex task', detail: 'Hand off a coding task to Codex.', panel: 'codex' as const, prompt: 'Inspect this project and suggest a small, safe next improvement.' },
       { label: 'Run Claude Code task', detail: 'Use Claude Code inside this folder.', panel: 'claudecode' as const, prompt: 'Review this project and identify the highest-impact next engineering task.' },
       { label: 'Run Hermes task', detail: 'Start an autonomous Hermes task.', panel: 'hermes' as const, prompt: 'Explore this project and propose a short action plan.' },
