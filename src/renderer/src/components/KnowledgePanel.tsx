@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import type { Project, MemoryItem, KnowledgeDiagnostics } from '../types'
 import { GLOBAL_PROJECT_ID, isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { StatusBadge, WorkspaceEmptyState } from './WorkspacePrimitives'
 import { useToast } from './ToastContext'
+import { useConfirmDestructive } from './AgentPanelPrimitives'
 import { collapseElement } from '../motion'
 
 // Memory you can't inspect is memory you can't trust. This panel ships with
@@ -50,7 +50,7 @@ export default function KnowledgePanel(props: {
   const [items, setItems] = useState<MemoryItem[]>([])
   const [selectedItem, setSelectedItem] = useState<MemoryItem | null>(null)
   const [diagnostics, setDiagnostics] = useState<KnowledgeDiagnostics | null>(null)
-  const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
+  const [editing, setEditing] = useState<{ id: string; value: string; titleValue: string } | null>(null)
   const [editSaving, setEditSaving] = useState(false)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [query, setQuery] = useState('')
@@ -58,6 +58,14 @@ export default function KnowledgePanel(props: {
   const [searching, setSearching] = useState(false)
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  // Two-step delete (same pattern as the session context menu): first click
+  // arms, second click within 3s deletes. Native confirm()/prompt() dialogs
+  // are out — prompt() isn't even supported in Electron.
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const pendingDeleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
+  const [bulkDeletePhrase, setBulkDeletePhrase] = useState('')
+  const confirmDestructive = useConfirmDestructive()
   const [staleUpdatingId, setStaleUpdatingId] = useState<string | null>(null)
   const [linkedProjects, setLinkedProjects] = useState<Project[]>([])
   const [showLinkModal, setShowLinkModal] = useState(false)
@@ -65,6 +73,7 @@ export default function KnowledgePanel(props: {
   const [linkTarget, setLinkTarget] = useState('')
   const { addToast } = useToast()
   const itemRefs = useRef<Record<string, HTMLLIElement | null>>({})
+  const listScrollRef = useRef<HTMLDivElement | null>(null)
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   // Use the sentinel for global-panel "project" scope. The backend's project
   // scope returns sentinel-scoped items plus project_id NULL shared memories,
@@ -100,8 +109,13 @@ export default function KnowledgePanel(props: {
   useEffect(() => {
     setScope('project')
     setSelectedItem(null)
+    setPendingDeleteId(null)
     void refresh('project')
   }, [props.project.id, scopedProjectId])
+
+  useEffect(() => () => {
+    if (pendingDeleteTimer.current) clearTimeout(pendingDeleteTimer.current)
+  }, [])
 
   // Linked projects only exist for folder-backed projects, not the sentinel.
   useEffect(() => {
@@ -170,12 +184,13 @@ export default function KnowledgePanel(props: {
   // the corrected copy first (re-embedding it), then remove the stale one.
   async function commitEdit(item: MemoryItem) {
     const content = editing?.value.trim() ?? ''
+    const title = editing?.titleValue.trim() ?? item.title
     if (editing?.id !== item.id) return
     if (!content) {
       addToast('Memory content cannot be empty')
       return
     }
-    if (content === item.content) {
+    if (content === item.content && title === item.title) {
       setEditing(null)
       return
     }
@@ -184,7 +199,7 @@ export default function KnowledgePanel(props: {
       const saved = await window.api.memory.save({
         projectId: item.project_id,
         type: item.type,
-        title: item.title,
+        title: title || item.title,
         content,
         source: item.source,
         tags: item.tags
@@ -195,7 +210,7 @@ export default function KnowledgePanel(props: {
       await refresh()
       addToast('Memory updated')
     } catch (err) {
-      setEditing({ id: item.id, value: content })
+      setEditing({ id: item.id, value: content, titleValue: title })
       addToast(`Failed to update memory: ${err instanceof Error ? err.message : 'unknown error'}`)
     } finally {
       setEditSaving(false)
@@ -205,6 +220,9 @@ export default function KnowledgePanel(props: {
   async function inspectItem(item: MemoryItem) {
     const alreadyOpen = selectedItem?.id === item.id
     setSelectedItem(item)
+    window.requestAnimationFrame(() => {
+      listScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' })
+    })
     if (alreadyOpen) return
     try {
       await window.api.memory.touch(item.id)
@@ -225,8 +243,14 @@ export default function KnowledgePanel(props: {
   }
 
   async function deleteItem(item: MemoryItem) {
-    const ok = window.confirm(`Delete "${item.title}" from Knowledge? This cannot be undone.`)
-    if (!ok) return
+    if (confirmDestructive && pendingDeleteId !== item.id) {
+      setPendingDeleteId(item.id)
+      if (pendingDeleteTimer.current) clearTimeout(pendingDeleteTimer.current)
+      pendingDeleteTimer.current = setTimeout(() => setPendingDeleteId(null), 3000)
+      return
+    }
+    if (pendingDeleteTimer.current) clearTimeout(pendingDeleteTimer.current)
+    setPendingDeleteId(null)
     setDeletingId(item.id)
     try {
       await window.api.memory.delete(item.id)
@@ -274,14 +298,14 @@ export default function KnowledgePanel(props: {
     }
   }
 
-  async function deleteLowQualityCandidates() {
-    const count = diagnostics?.lowQualityCount ?? 0
-    if (count === 0) return
-    const phrase = 'DELETE LOW QUALITY'
-    const typed = window.prompt(
-      `Type "${phrase}" to bulk-delete low-quality Knowledge candidates. Decisions and user-created notes are skipped. This cannot be undone.`
-    )
-    if (typed !== phrase) return
+  // window.prompt() is unsupported in Electron (it throws), so the typed
+  // confirmation lives in an in-app modal instead.
+  const BULK_DELETE_PHRASE = 'DELETE LOW QUALITY'
+
+  async function confirmBulkDelete() {
+    if (bulkDeletePhrase.trim() !== BULK_DELETE_PHRASE) return
+    setBulkDeleteOpen(false)
+    setBulkDeletePhrase('')
     setDiagnosticsLoading(true)
     try {
       const removed = await window.api.memory.deleteLowQualityCandidates(scope === 'global' ? null : scopedProjectId)
@@ -399,7 +423,7 @@ export default function KnowledgePanel(props: {
           <button className="ghost tiny" onClick={reviewLowQualityCandidates} disabled={!diagnostics?.lowQualityCount || diagnosticsLoading} data-testid="knowledge-review-low-quality">
             Review candidates
           </button>
-          <button className="ghost tiny settings-danger-link" onClick={deleteLowQualityCandidates} disabled={!diagnostics?.lowQualityCount || diagnosticsLoading} data-testid="knowledge-delete-low-quality">
+          <button className="ghost tiny settings-danger-link" onClick={() => setBulkDeleteOpen(true)} disabled={!diagnostics?.lowQualityCount || diagnosticsLoading} data-testid="knowledge-delete-low-quality">
             Delete candidates
           </button>
         </div>
@@ -410,6 +434,7 @@ export default function KnowledgePanel(props: {
           </p>
         )}
       </section>
+      <div className="knowledge-list-scroll" data-testid="knowledge-list-scroll" ref={listScrollRef}>
       {items.length === 0 && (
         <WorkspaceEmptyState
           compact
@@ -441,27 +466,24 @@ export default function KnowledgePanel(props: {
               <div className="memory-content muted small">{snippetAt(m.content, 200)}</div>
             </button>
             <button
-              className="ghost tiny memory-delete"
-              title="Delete memory"
-              aria-label={`Delete memory: ${m.title}`}
+              className={`ghost tiny memory-delete${pendingDeleteId === m.id ? ' pending-confirm' : ''}`}
+              title={pendingDeleteId === m.id ? 'Click again to confirm delete' : 'Delete memory'}
+              aria-label={pendingDeleteId === m.id ? `Confirm delete memory: ${m.title}` : `Delete memory: ${m.title}`}
               disabled={deletingId === m.id}
               onClick={() => void deleteItem(m)}
             >
-              {deletingId === m.id ? '...' : '×'}
+              {deletingId === m.id ? '...' : pendingDeleteId === m.id ? 'Confirm?' : '×'}
             </button>
           </li>
         ))}
       </ul>
-      {selectedItem && createPortal(
-        <div className="knowledge-detail-backdrop" onClick={() => setSelectedItem(null)}>
+      {selectedItem && (
           <section
             key={selectedItem.id}
             className="knowledge-detail motion-detail"
             data-testid="knowledge-detail"
-            role="dialog"
-            aria-modal="true"
+            role="region"
             aria-label="Knowledge item details"
-            onClick={(event) => event.stopPropagation()}
           >
             <div className="knowledge-detail-head">
               <div className="knowledge-detail-title-wrap">
@@ -471,7 +493,7 @@ export default function KnowledgePanel(props: {
               </div>
               <button
                 type="button"
-                className="ghost tiny"
+                className="ghost tiny knowledge-detail-close"
                 data-testid="knowledge-detail-close"
                 onClick={() => setSelectedItem(null)}
                 aria-label="Close knowledge details"
@@ -495,18 +517,32 @@ export default function KnowledgePanel(props: {
               </div>
             )}
             {editing?.id === selectedItem.id ? (
-              <textarea
-                className="knowledge-detail-editor"
-                data-testid="knowledge-detail-editor"
-                value={editing.value}
-                autoFocus
-                disabled={editSaving}
-                aria-label={`Edit knowledge item: ${selectedItem.title}`}
-                onChange={(e) => setEditing({ id: selectedItem.id, value: e.target.value })}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
-                }}
-              />
+              <>
+                <input
+                  className="knowledge-detail-title-editor"
+                  data-testid="knowledge-detail-title-editor"
+                  value={editing.titleValue}
+                  disabled={editSaving}
+                  aria-label="Edit knowledge item title"
+                  placeholder="Title"
+                  autoFocus
+                  onChange={(e) => setEditing({ id: selectedItem.id, value: editing.value, titleValue: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
+                  }}
+                />
+                <textarea
+                  className="knowledge-detail-editor"
+                  data-testid="knowledge-detail-editor"
+                  value={editing.value}
+                  disabled={editSaving}
+                  aria-label={`Edit knowledge item content: ${selectedItem.title}`}
+                  onChange={(e) => setEditing({ id: selectedItem.id, value: e.target.value, titleValue: editing.titleValue })}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null) }
+                  }}
+                />
+              </>
             ) : (
               <div className="knowledge-detail-content" data-testid="knowledge-detail-content">
                 {selectedItem.content?.trim() ? selectedItem.content : 'No content is stored for this knowledge item.'}
@@ -540,7 +576,7 @@ export default function KnowledgePanel(props: {
                     type="button"
                     className="ghost tiny"
                     data-testid="knowledge-detail-edit"
-                    onClick={() => setEditing({ id: selectedItem.id, value: selectedItem.content })}
+                    onClick={() => setEditing({ id: selectedItem.id, value: selectedItem.content, titleValue: selectedItem.title })}
                   >
                     Edit
                   </button>
@@ -564,19 +600,17 @@ export default function KnowledgePanel(props: {
                   </button>
                   <button
                     type="button"
-                    className="ghost tiny settings-danger-link"
+                    className={`ghost tiny settings-danger-link${pendingDeleteId === selectedItem.id ? ' pending-confirm' : ''}`}
                     data-testid="knowledge-detail-delete"
                     disabled={deletingId === selectedItem.id}
                     onClick={() => void deleteItem(selectedItem)}
                   >
-                    {deletingId === selectedItem.id ? 'Deleting...' : 'Delete'}
+                    {deletingId === selectedItem.id ? 'Deleting...' : pendingDeleteId === selectedItem.id ? 'Click again to confirm' : 'Delete'}
                   </button>
                 </>
               )}
             </div>
           </section>
-        </div>,
-        document.body
       )}
       {!isGlobalWorkspace && (
         <div className="knowledge-related-projects" data-testid="related-projects">
@@ -622,6 +656,51 @@ export default function KnowledgePanel(props: {
               ))}
             </div>
           )}
+        </div>
+      )}
+      </div>
+      {bulkDeleteOpen && (
+        <div className="link-project-modal" onClick={() => { setBulkDeleteOpen(false); setBulkDeletePhrase('') }}>
+          <div
+            className="link-project-card"
+            role="dialog"
+            aria-label="Confirm bulk delete of low-quality knowledge"
+            data-testid="knowledge-bulk-delete-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="link-project-title">Delete low-quality candidates</div>
+            <p className="muted small">
+              Bulk-deletes {diagnostics?.lowQualityCount ?? 0} flagged item{(diagnostics?.lowQualityCount ?? 0) === 1 ? '' : 's'}.
+              Decisions and user-created notes are skipped. This cannot be undone.
+              Type <strong>{BULK_DELETE_PHRASE}</strong> to confirm.
+            </p>
+            <input
+              autoFocus
+              value={bulkDeletePhrase}
+              placeholder={BULK_DELETE_PHRASE}
+              aria-label={`Type ${BULK_DELETE_PHRASE} to confirm`}
+              data-testid="knowledge-bulk-delete-input"
+              onChange={(e) => setBulkDeletePhrase(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void confirmBulkDelete()
+                if (e.key === 'Escape') { setBulkDeleteOpen(false); setBulkDeletePhrase('') }
+              }}
+            />
+            <div className="link-project-actions">
+              <button type="button" onClick={() => { setBulkDeleteOpen(false); setBulkDeletePhrase('') }}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                data-testid="knowledge-bulk-delete-confirm"
+                disabled={bulkDeletePhrase.trim() !== BULK_DELETE_PHRASE}
+                onClick={() => void confirmBulkDelete()}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
         </div>
       )}
       {showLinkModal && (
