@@ -10,6 +10,7 @@ import anime, {
 import type { Project, Session, Message, MemoryItem } from '../types'
 import { AttachmentChips, resolveAttachments } from './ComposerAttachments'
 import { useComposerAttachments } from '../hooks/useComposerAttachments'
+import { useComposerDraft } from '../hooks/useComposerDraft'
 import Markdown from './Markdown'
 import ClarificationCard, {
   formatChoiceAnswer,
@@ -28,7 +29,8 @@ import TipBanner from './TipBanner'
 import AiContextBar, { estimateTokensFromText } from './AiContextBar'
 import VoiceInputButton from './VoiceInputButton'
 import { useToast } from './ToastContext'
-import { useAgentActivity } from '../AgentActivityContext'
+import CloudSpeedNudge, { useCloudNudgeGate } from './CloudSpeedNudge'
+import { useAgentTaskReporter } from '../AgentActivityContext'
 import { isGlobalProjectId } from '../../../shared/globalWorkspace'
 import { cleanupGeneratedTitle, fallbackTitleFromText, firstExchange, isGenericSessionTitle } from '../../../shared/sessionTitles'
 import { AgentSessionRail, AgentStatusStrip, ChatJumpToBottomButton, EditableUserMessage, OutputActions, SessionContextMenu, useAutoSessionSummary, useChatScrollFollow, useConfirmDestructive, useStatusPhrase } from './AgentPanelPrimitives'
@@ -43,9 +45,29 @@ import {
 } from '../handoff'
 
 const PINNED_KEY = 'aiworkspace.chat.pinned'
+// Which session this tab was last looking at, per project — shared across the
+// app's windows so a detached ChatTab remounts on the same conversation.
+const SELECTED_SESSION_KEY_PREFIX = 'aiworkspace.chat.selected-session.'
+// Remembers a *deliberate* model pick. Its presence — not its value — is what
+// stops the cloud-preferring default below from overriding the user on launch.
+const MODEL_CHOICE_KEY = 'aiworkspace.chat.model'
 const RENDER_LIMIT = 50
 
 type ChatMode = 'plan' | 'execute'
+
+// Live slow-inference thresholds. These mirror src/main/inferenceSpeed.ts's
+// SLOW_TOKENS_PER_SECOND so the wizard and the in-chat hint agree on what
+// "slow" means; the difference is only that this one measures the real turn the
+// user is waiting on instead of a synthetic probe.
+const SLOW_TOKENS_PER_SECOND = 10
+/** Don't judge the rate until the 5s rolling window has had time to fill. */
+const RATE_SETTLE_MS = 20_000
+/** No token at all by here means something is wrong even for a slow CPU model. */
+const SLOW_FIRST_TOKEN_MS = 30_000
+/** Start showing "…45s" on the waiting note once the wait is clearly unusual. */
+const ELAPSED_VISIBLE_MS = 15_000
+/** Surface the inline "switch model / keep waiting" affordance at this point. */
+const STILL_WAITING_MS = 30_000
 
 const PLAN_SYSTEM_PROMPT =
   'You are in planning mode. Focus on brainstorming, asking clarifying ' +
@@ -245,14 +267,13 @@ function ThinkingBlock(props: { text: string; tokenCount: number; done: boolean 
 
 export default function ChatTab(props: { project: Project; active?: boolean }) {
   const { addToast } = useToast()
-  const { setActive: setAgentActive } = useAgentActivity()
   const [sessions, setSessions] = useState<Session[]>([])
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState('')
-  const [input, setInput] = useState('')
+  const [model, setModel] = useState(() => localStorage.getItem(MODEL_CHOICE_KEY) ?? '')
+  const [input, setInput] = useComposerDraft('aiworkspace.chat.draft', session?.id)
   const [streaming, setStreaming] = useState('')
   const [thinking, setThinking] = useState('')
   const [busy, setBusy] = useState(false)
@@ -272,6 +293,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => loadPinned())
   const [tokPerSec, setTokPerSec] = useState(0)
+  // Wall-clock age of the in-flight turn, and whether any turn this session has
+  // proven the local model too slow to chat with. Both reset per turn / session
+  // respectively — see the effects below.
+  const [elapsedMs, setElapsedMs] = useState(0)
+  const [slowTurnSeen, setSlowTurnSeen] = useState(false)
+  const [chatNudgeDismissed, setChatNudgeDismissed] = useState(false)
+  const [waitHintDismissed, setWaitHintDismissed] = useState(false)
   const [answeredClarifications, setAnsweredClarifications] = useState<Set<string>>(() => new Set())
   const { attachments, setAttachments, isDragOver, setIsDragOver, handlePaste, pickFile, handleDrop } = useComposerAttachments()
   const [renderOffset, setRenderOffset] = useState(0)
@@ -297,7 +325,19 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const sendButtonMotion = usePressMotion<HTMLButtonElement>()
   const modelRef = useRef(model)
   modelRef.current = model
+  // Highest replay sequence already applied, so a detach handover can overlap
+  // the replayed token log with the live stream without duplicating text.
+  const lastLiveSequenceRef = useRef(0)
+  // Mirror of `busy` for imperative code (the switch-and-retry poll) that must
+  // read the *current* value across setTimeouts rather than a render closure.
+  const busyRef = useRef(false)
+  // Has the user ever picked a model on purpose? If so, nothing below may
+  // change it out from under them — the cloud preference is an *initial*
+  // default only, not a per-launch override.
+  const modelChosenRef = useRef(Boolean(localStorage.getItem(MODEL_CHOICE_KEY)))
+  const cloudDefaultAppliedRef = useRef(false)
   const suggestToken = useRef(0)
+  const turnStartedAtRef = useRef(0)
   const tokenTimestamps = useRef<number[]>([])
   const streamingBufferRef = useRef('')
   const thinkingBufferRef = useRef('')
@@ -306,6 +346,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   const isGlobalWorkspace = isGlobalProjectId(props.project.id)
   const memoryProjectId = isGlobalWorkspace ? null : props.project.id
   const active = props.active ?? true
+  const isCloudModel = model.startsWith('cloud:')
+  busyRef.current = busy
   const notifyCompletion = useCompletionNotifier(active)
   const statusPhrase = useStatusPhrase({ active: busy, hasStarted: streaming.length > 0 || thinking.length > 0, toolName: null, progressKey: `${streaming.length}:${thinking.length}` })
   const { showJumpToBottom, jumpToBottom } = useChatScrollFollow(
@@ -316,11 +358,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   sessionRef.current = session
 
   // Publish start/stop only (not per streamed token) so the topbar activity
-  // badge doesn't re-render on every chunk.
-  useEffect(() => {
-    setAgentActive('chat', busy)
-    return () => setAgentActive('chat', false)
-  }, [busy, setAgentActive])
+  // badge and the activity popover don't re-render on every chunk.
+  useAgentTaskReporter('chat', {
+    running: busy,
+    session,
+    title: session?.summary || session?.title,
+    failed: Boolean(error)
+  })
 
   useEffect(() => () => {
     stopMotion(sessionSwitchAnimRef.current)
@@ -328,9 +372,28 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   }, [])
 
   useEffect(() => {
-    window.api.sessions.list(props.project.id, 'chat').then(setSessions)
-    window.api.sessions.listArchived(props.project.id, 'chat').then(setArchivedSessions)
+    let disposed = false
+    void Promise.all([
+      window.api.sessions.list(props.project.id, 'chat'),
+      window.api.sessions.listArchived(props.project.id, 'chat'),
+      window.api.chat.liveState(props.project.id),
+    ]).then(([nextSessions, nextArchived, live]) => {
+      if (disposed) return
+      setSessions(nextSessions)
+      setArchivedSessions(nextArchived)
+      let storedId: string | null = null
+      try { storedId = localStorage.getItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`) } catch { /* storage unavailable */ }
+      const desiredId = live?.sessionId ?? storedId
+      const next = desiredId ? [...nextSessions, ...nextArchived].find((candidate) => candidate.id === desiredId) ?? null : null
+      if (next?.id !== sessionRef.current?.id) setSession(next)
+    })
+    return () => { disposed = true }
   }, [props.project.id])
+
+  useEffect(() => {
+    if (!session?.id) return
+    try { localStorage.setItem(`${SELECTED_SESSION_KEY_PREFIX}${props.project.id}`, session.id) } catch { /* storage unavailable */ }
+  }, [props.project.id, session?.id])
 
   useEffect(() => {
     function onFocusComposer(event: Event) {
@@ -413,6 +476,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     setSession((prev) => (prev && prev.id === sessionId ? { ...prev, summary } : prev))
   })
 
+  // Record a deliberate pick so it survives relaunch and outranks the default.
+  function chooseModel(next: string) {
+    modelChosenRef.current = true
+    localStorage.setItem(MODEL_CHOICE_KEY, next)
+    setModel(next)
+  }
+
   async function loadCloudModels(showFailureToast = false) {
     const result = await window.api.models.listCloud()
     if (!result.success) {
@@ -423,6 +493,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     }
     setCloudModels(result.models)
     setCloudModelsError('')
+    // Cloud is configured and reachable → it's the better first-run default than
+    // "whatever local model happens to sort first". Applied once, and only when
+    // the user has never made a choice of their own.
+    if (!modelChosenRef.current && !cloudDefaultAppliedRef.current && result.models.length > 0) {
+      cloudDefaultAppliedRef.current = true
+      setModel(`cloud:${result.models[0].id}`)
+    }
   }
 
   useEffect(() => {
@@ -464,6 +541,8 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
     suggestToken.current++
     tokenTimestamps.current = []
     setTokPerSec(0)
+    setSlowTurnSeen(false)
+    setWaitHintDismissed(false)
   }, [session])
 
   useEffect(() => {
@@ -475,6 +554,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         streaming?: string
         thinking?: string
         busy?: boolean
+        error?: string
       }
       if (!Array.isArray(detail?.messages)) return
       const nextSession = detail.session ?? sessionRef.current ?? { id: 'test-chat-session', project_id: props.project.id, mode: 'chat', title: 'Test chat', created_at: Date.now() }
@@ -485,7 +565,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
       setBusy(Boolean(detail.busy))
       setStreaming(typeof detail.streaming === 'string' ? detail.streaming : '')
       setThinking(typeof detail.thinking === 'string' ? detail.thinking : '')
-      setError('')
+      setError(typeof detail.error === 'string' ? detail.error : '')
       if (typeof detail.model === 'string') setModel(detail.model)
     }
     function handleTestLiveState(event: Event) {
@@ -493,10 +573,20 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         streaming?: string
         thinking?: string
         busy?: boolean
+        // Test-only: drive the elapsed-based UI (elapsed suffix, wait-hint,
+        // slow-turn nudge) without waiting real wall-clock seconds. Rewinds the
+        // turn's start so the live 1s ticker computes this elapsed value.
+        elapsedMs?: number
+        slowTurnSeen?: boolean
       }
       setBusy(Boolean(detail?.busy))
       setStreaming(typeof detail?.streaming === 'string' ? detail.streaming : '')
       setThinking(typeof detail?.thinking === 'string' ? detail.thinking : '')
+      if (typeof detail?.elapsedMs === 'number') {
+        turnStartedAtRef.current = Date.now() - detail.elapsedMs
+        setElapsedMs(detail.elapsedMs)
+      }
+      if (typeof detail?.slowTurnSeen === 'boolean') setSlowTurnSeen(detail.slowTurnSeen)
     }
     window.addEventListener('aiworkspace:test:set-chat-state', handleTestState)
     window.addEventListener('aiworkspace:test:set-chat-live-state', handleTestLiveState)
@@ -507,7 +597,23 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   }, [props.project.id])
 
   useEffect(() => {
-    const offToken = window.api.chat.onToken((d) => {
+    // Chat is a direct model conversation: no tools, no MCP client, no approval
+    // card — so unlike the agent tabs there is nothing to route on detach beyond
+    // the partially-streamed answer itself, replayed from chat:liveState.
+    let disposed = false
+    let hydrated = false
+    let finished = false
+    const queuedTokens: Array<{ sessionId: string; token: string; kind?: 'answer' | 'thinking'; sequence?: number }> = []
+    lastLiveSequenceRef.current = 0
+    const applyToken = (d: { sessionId: string; token: string; kind?: 'answer' | 'thinking'; sequence?: number }) => {
+      if (d.sequence !== undefined) {
+        // Main restarts the counter at 1 for every turn, so a fresh run resets the
+        // watermark — otherwise the second turn of a session would be discarded as
+        // 'already seen'.
+        if (d.sequence === 1) lastLiveSequenceRef.current = 0
+        if (d.sequence <= lastLiveSequenceRef.current) return
+        lastLiveSequenceRef.current = d.sequence
+      }
       if (d.sessionId === session?.id) {
         if (d.kind === 'thinking') thinkingBufferRef.current += d.token
         else streamingBufferRef.current += d.token
@@ -524,8 +630,13 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         }
         tokenTimestamps.current.push(Date.now())
       }
+    }
+    const offToken = window.api.chat.onToken((d) => {
+      if (!hydrated) { queuedTokens.push(d); return }
+      applyToken(d)
     })
     const offDone = window.api.chat.onDone(async (d) => {
+      finished = true
       if (!session || d.sessionId !== session.id) return
       if (streamingFrameRef.current !== null) {
         cancelAnimationFrame(streamingFrameRef.current)
@@ -551,8 +662,53 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
         setBusy(false); setStreaming(''); setThinking(''); setError(d.error); setTokPerSec(0)
       }
     })
-    return () => { offToken(); offDone(); offError() }
+    const flushQueue = () => {
+      hydrated = true
+      for (const item of queuedTokens) applyToken(item)
+      queuedTokens.length = 0
+    }
+    if (session) {
+      void window.api.chat.liveState(props.project.id).then((live) => {
+        if (disposed) return
+        if (live?.sessionId === session.id) {
+          if (!finished) setBusy(true)
+          for (const item of live.events) {
+            applyToken({ sessionId: live.sessionId, token: item.token, kind: item.kind, sequence: item.sequence })
+          }
+        }
+        flushQueue()
+      }).catch(() => { if (!disposed) flushQueue() })
+    } else {
+      hydrated = true
+    }
+    return () => { disposed = true; offToken(); offDone(); offError() }
   }, [session])
+
+  // How long the current turn has been running. Drives the elapsed-time note and
+  // the "still waiting" affordance, and gives the slow-model detector below a
+  // clock. Ticks once a second and only while busy.
+  useEffect(() => {
+    if (!busy) { setElapsedMs(0); return }
+    turnStartedAtRef.current = Date.now()
+    setElapsedMs(0)
+    setWaitHintDismissed(false) // fresh turn → the "still waiting" hint may show again
+    const iv = setInterval(() => setElapsedMs(Date.now() - turnStartedAtRef.current), 1000)
+    return () => clearInterval(iv)
+  }, [busy])
+
+  // Live evidence that *this* local model is too slow to chat with — measured,
+  // not assumed: either it produced no token at all for 30s, or it has been
+  // streaming long enough to trust the rate and that rate is a crawl. Cloud
+  // turns are exempt (they're the thing we'd be recommending), and once a
+  // session has seen one slow turn we stop re-evaluating so the hint can't
+  // reappear per message.
+  useEffect(() => {
+    if (slowTurnSeen || !busy || isCloudModel) return
+    const noTokensYet = !streaming && !thinking
+    const stalled = noTokensYet && elapsedMs >= SLOW_FIRST_TOKEN_MS
+    const crawling = !noTokensYet && elapsedMs >= RATE_SETTLE_MS && tokPerSec > 0 && tokPerSec < SLOW_TOKENS_PER_SECOND
+    if (stalled || crawling) setSlowTurnSeen(true)
+  }, [slowTurnSeen, busy, isCloudModel, elapsedMs, tokPerSec, streaming, thinking])
 
   // Compute tok/s every 500ms while streaming
   useEffect(() => {
@@ -907,6 +1063,69 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
 
   const fetchChatMessages = useCallback((sid: string) => window.api.chat.messages(sid), [])
 
+  // Retry the failed turn from the error banner: the user message is already
+  // persisted (main inserts it before streaming), so resend it through the
+  // regenerate path rather than appending a duplicate user turn.
+  const lastUserMessage = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return messages[i]
+    }
+    return null
+  }, [messages])
+
+  function retryLastTurn() {
+    if (!lastUserMessage || busy) return
+    setError('')
+    chatResend(lastUserMessage.content, lastUserMessage.id)
+  }
+
+  // Best alternative to the current model when the user gives up on a slow turn:
+  // prefer a configured cloud model (the whole point of the nudge), else any
+  // other local model. Returns null if there's genuinely nothing else to try.
+  function alternativeModel(): string | null {
+    if (!isCloudModel && cloudModels.length > 0) return `cloud:${cloudModels[0].id}`
+    const otherLocal = models.find((m) => m !== model && !m.includes('embed'))
+    if (otherLocal) return otherLocal
+    if (isCloudModel) {
+      const firstLocal = models.find((m) => !m.includes('embed'))
+      if (firstLocal) return firstLocal
+    }
+    return null
+  }
+
+  // "Switch model & retry" from the still-waiting hint. Aborts the in-flight
+  // turn *for real* (window.api.chat.abort → main aborts the fetch controller),
+  // switches to an alternative model, and resends the same user message through
+  // the regenerate path once the abort has settled the busy state.
+  function switchModelAndRetry() {
+    const next = alternativeModel()
+    if (!next) { addToast('No other model available to switch to.'); return }
+    const toResend = lastUserMessage
+    const s = session
+    if (s) window.api.chat.abort(s.id)
+    chooseModel(next)
+    setWaitHintDismissed(true)
+    setSlowTurnSeen(false)
+    if (!toResend || !s) return
+    // Wait for the abort to flip busy→false (chat:done/error clears the in-flight
+    // controller in main) before resending, so the new turn doesn't collide with
+    // the one we just cancelled and leave main's abort map inconsistent.
+    const started = Date.now()
+    const tryResend = () => {
+      if (!busyRef.current) {
+        setError(''); setBusy(true); setStreaming(''); setThinking('')
+        streamingBufferRef.current = ''; thinkingBufferRef.current = ''
+        const systemPrefix = mode === 'execute' ? EXECUTE_SYSTEM_PROMPT : PLAN_SYSTEM_PROMPT
+        // Send with `next` explicitly — the model state update may not have
+        // flushed into a fresh closure yet.
+        window.api.chat.send({ sessionId: s.id, projectId: props.project.id, model: next, content: toResend.content, systemPrefix, regenerateMessageId: toResend.id })
+        return
+      }
+      if (Date.now() - started < 4000) window.setTimeout(tryResend, 80)
+    }
+    window.setTimeout(tryResend, 80)
+  }
+
   const { regenerate, editAndResend, setReaction } = useMessageActions({
     sessionId: session?.id,
     messages,
@@ -934,12 +1153,43 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
   )
   const contextStatus = busy ? 'Streaming' : session ? 'Ready' : 'No active chat'
 
+  // In-chat cloud hint. Gated on a *measured* slow turn (slowTurnSeen), so a
+  // fast local setup never sees it; on cloud still being unconfigured; and on
+  // the shared dismissal. `chatNudgeDismissed` keeps it to once per app session
+  // even if the user closes it without persisting a permanent "no".
+  const chatNudgeGate = useCloudNudgeGate(slowTurnSeen)
+  const showChatCloudNudge = chatNudgeGate.eligible && !chatNudgeDismissed
+  const liveSpeedProbe = useMemo(
+    () => slowTurnSeen
+      ? {
+          verdict: 'slow' as const,
+          tokensPerSecond: tokPerSec > 0 ? Math.round(tokPerSec * 10) / 10 : null,
+          signal: 'generate' as const,
+          detail: tokPerSec > 0
+            ? `This reply is arriving at about ${Math.round(tokPerSec)} tokens/sec on ${model}.`
+            : `${model} produced no output for over ${SLOW_FIRST_TOKEN_MS / 1000}s.`,
+          probedAt: Date.now()
+        }
+      : null,
+    // tokPerSec is deliberately not a dependency: the text should freeze at the
+    // moment the hint appears rather than flicker with every rate sample.
+    [slowTurnSeen, model] // eslint-disable-line react-hooks/exhaustive-deps
+  )
+
   const visibleMessages = messages.slice(Math.max(0, messages.length - RENDER_LIMIT - renderOffset))
 
   // Context line + unified composer shell, shared between the empty state and
   // an active session — the empty state IS the composer, ready to type into.
   const composerBlock = (
     <>
+      {showChatCloudNudge && (
+        <CloudSpeedNudge
+          probe={liveSpeedProbe}
+          testId="chat-cloud-nudge"
+          onDismiss={() => { setChatNudgeDismissed(true); chatNudgeGate.dismiss() }}
+          onConfigured={() => { chatNudgeGate.markConfigured(); void loadCloudModels(true) }}
+        />
+      )}
       <AiContextBar
         testId="context-bar-chat"
         usedTokens={session ? (chatUsage?.used ?? estimatedTokens) : undefined}
@@ -1001,7 +1251,7 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
             )}
             <div className="model-picker-wrap">
               <div className="model-select model-picker-plain">
-                <select value={model} onChange={(e) => setModel(e.target.value)} title="Model">
+                <select value={model} data-testid="chat-model-select" onChange={(e) => chooseModel(e.target.value)} title="Model">
                   <optgroup label="LOCAL MODELS">
                     {models.length === 0 && <option value="">No local models found</option>}
                     {models.map((m) => <option key={m} value={m} disabled={m.includes('embed')}>{m}</option>)}
@@ -1124,6 +1374,48 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
                   onReaction={setReaction}
                 />
               ))}
+              {/* Same waiting note the agent tabs show: without it the
+                  transcript is silent until the first token, which on a slow
+                  local model can be minutes of apparent deadness. Once the wait
+                  runs long, append elapsed seconds so there's a sense of
+                  progress instead of a frozen phrase. */}
+              {busy && !streaming && !thinking && (
+                <div className="cc-note muted small" data-testid="chat-waiting-note">
+                  {statusPhrase ?? 'Working…'}
+                  {elapsedMs >= ELAPSED_VISIBLE_MS && (
+                    <span className="chat-waiting-elapsed" data-testid="chat-waiting-elapsed"> {Math.round(elapsedMs / 1000)}s</span>
+                  )}
+                  <span className="cursor">▋</span>
+                </div>
+              )}
+              {/* "Still waiting" affordance: an inline, dismissible nudge to
+                  switch models or cancel — never a modal. Appears only after the
+                  wait crosses the threshold, and only while nothing has streamed. */}
+              {busy && !streaming && !thinking && elapsedMs >= STILL_WAITING_MS && !waitHintDismissed && (
+                <div className="chat-wait-hint" data-testid="chat-wait-hint">
+                  <span className="chat-wait-hint-text">
+                    Still waiting on {isCloudModel ? model.slice(6) : model}. You can switch models and retry, or keep waiting.
+                  </span>
+                  <div className="chat-wait-hint-actions">
+                    <button
+                      className="ghost tiny"
+                      data-testid="chat-wait-hint-switch"
+                      onClick={switchModelAndRetry}
+                    >
+                      Switch model &amp; retry
+                    </button>
+                    <button
+                      className="ghost tiny"
+                      aria-label="Dismiss waiting hint"
+                      title="Keep waiting"
+                      data-testid="chat-wait-hint-dismiss"
+                      onClick={() => setWaitHintDismissed(true)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              )}
               {thinking && <ThinkingBlock text={thinking} tokenCount={thinking.split(/\s+/).filter(Boolean).length} done={streaming.length > 0} />}
               {streaming && (
                 <div className="msg assistant">
@@ -1221,7 +1513,20 @@ export default function ChatTab(props: { project: Project; active?: boolean }) {
               </div>
             )}
 
-            {error && <div className="error-bar">{error}</div>}
+            {error && (
+              <div className="error-bar" data-testid="chat-error-bar">
+                <span className="error-bar-text">{error}</span>
+                {lastUserMessage && !busy && (
+                  <button
+                    className="ghost tiny error-bar-retry"
+                    data-testid="chat-error-retry"
+                    onClick={retryLastTurn}
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
 
             {composerBlock}
           </>
