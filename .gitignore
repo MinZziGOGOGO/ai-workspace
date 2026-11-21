@@ -44,3 +44,6 @@ __pycache__/
 
 # Local-only Claude settings (keep shared config, ignore personal overrides)
 .claude/settings.local.json
+
+# Third-party Claude Code skill packs (installed locally, not part of the app)
+.claude/skills/

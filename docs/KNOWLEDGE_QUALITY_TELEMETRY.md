@@ -11,7 +11,7 @@ The Electron main process passes `app.getPath('userData')` from `src/main/index.
   directory follows the installed app identity on Windows.
 - Sandboxed or packaged-container environments: Windows can redirect roaming app data
   into the package container. That is why a live diagnostic can find:
-  `C:\Users\marti\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\ai-workspace\workspace.db`.
+  `%LOCALAPPDATA%\Packages\<package-id>\LocalCache\Roaming\ai-workspace\workspace.db`.
 - MCP server: the app registers it with `AIWORKSPACE_DB_DIR` set to the same
   `userData` directory. If run manually without that variable, it falls back to
   `%APPDATA%\ai-workspace`.

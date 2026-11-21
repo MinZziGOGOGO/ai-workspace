@@ -1,7 +1,8 @@
 import { spawn, ChildProcess } from 'child_process'
 import { randomUUID } from 'crypto'
 import { existsSync, readFileSync } from 'fs'
-import { resolve, relative, isAbsolute } from 'path'
+import { homedir, userInfo } from 'os'
+import { join, resolve, relative, isAbsolute } from 'path'
 import { getDb } from './db'
 import { isE2EFakeEnabled } from './e2e'
 
@@ -317,6 +318,20 @@ export interface AcpRunResult {
 
 // ---- Config helpers ---------------------------------------------------------
 
+// Defaults for a fresh install; every value can be changed in the Hermes settings.
+// The Hermes path is resolved by the remote shell, so `~` points to the remote home.
+function defaultHermesConfig(): RemoteHermesConfig {
+  let user = ''
+  try { user = userInfo().username } catch { /* no user info available */ }
+  return {
+    mode: 'local',
+    sshHost: '',
+    sshUser: user,
+    sshKeyPath: join(homedir(), '.ssh', 'id_ed25519'),
+    hermesPath: '~/.local/bin/hermes',
+  }
+}
+
 export function getHermesConfig(): RemoteHermesConfig {
   try {
     const db = getDb()
@@ -324,15 +339,16 @@ export function getHermesConfig(): RemoteHermesConfig {
       const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get(key) as { value: string } | undefined
       return row?.value ?? ''
     }
+    const defaults = defaultHermesConfig()
     return {
-      mode: (get('hermes_mode') || 'local') as 'local' | 'remote',
+      mode: (get('hermes_mode') || defaults.mode) as 'local' | 'remote',
       sshHost: get('hermes_ssh_host'),
-      sshUser: get('hermes_ssh_user') || 'martin',
-      sshKeyPath: get('hermes_ssh_key') || 'C:\\Users\\marti\\.ssh\\id_ed25519',
-      hermesPath: get('hermes_hermes_path') || '/home/martin/.local/bin/hermes',
+      sshUser: get('hermes_ssh_user') || defaults.sshUser,
+      sshKeyPath: get('hermes_ssh_key') || defaults.sshKeyPath,
+      hermesPath: get('hermes_hermes_path') || defaults.hermesPath,
     }
   } catch {
-    return { mode: 'local', sshHost: '', sshUser: 'martin', sshKeyPath: 'C:\\Users\\marti\\.ssh\\id_ed25519', hermesPath: '/home/martin/.local/bin/hermes' }
+    return defaultHermesConfig()
   }
 }
 
@@ -461,10 +477,12 @@ export async function checkHermes(): Promise<HermesCheck> {
 
   // Check binary + config + marker via three separate exit-code-only calls.
   // No stdout read → no encoding issues. Each `test -f` exits 0 if the file exists.
+  // `sh -c` expands $HOME inside WSL, so this works for any Linux user name.
+  const inHome = (path: string) => runWsl(['-d', distro, '--', 'sh', '-c', `test -f "$HOME/${path}"`])
   const [binR, markerR, cfgR] = await Promise.all([
-    runWsl(['-d', distro, '--', 'test', '-f', '/home/marti/.local/bin/hermes']),
-    runWsl(['-d', distro, '--', 'test', '-f', '/home/marti/.ai-workspace-hermes/installed']),
-    runWsl(['-d', distro, '--', 'test', '-f', '/home/marti/.hermes/config.yaml']),
+    inHome('.local/bin/hermes'),
+    inHome('.ai-workspace-hermes/installed'),
+    inHome('.hermes/config.yaml'),
   ])
   console.error('[checkHermes] bin=%s marker=%s cfg=%s', binR.code, markerR.code, cfgR.code)
   const hasBin = binR.code === 0

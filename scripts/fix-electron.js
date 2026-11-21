@@ -12,6 +12,10 @@
 // because index.js joins its raw contents into the binary path. A BOM here
 // produces a "﻿electron.exe" ENOENT on spawn.
 
+// The workaround is Windows-specific (electron.exe, %LOCALAPPDATA% cache);
+// on other platforms Electron's own install script works, so do nothing.
+if (process.platform !== 'win32') process.exit(0)
+
 const { execSync } = require('child_process')
 const { existsSync, readdirSync, writeFileSync, readFileSync } = require('fs')
 const { join } = require('path')

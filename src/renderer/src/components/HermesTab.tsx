@@ -295,9 +295,9 @@ function HermesSettings(props: {
       {mode === 'remote' && (
         <>
           <div className="hermes-settings-row"><label className="hermes-settings-label">SSH Host</label><input className="hermes-settings-input" value={sshHost} onChange={(e) => setSshHost(e.target.value)} placeholder="10.0.0.246" /></div>
-          <div className="hermes-settings-row"><label className="hermes-settings-label">SSH User</label><input className="hermes-settings-input" value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="martin" /></div>
-          <div className="hermes-settings-row"><label className="hermes-settings-label">SSH Key</label><input className="hermes-settings-input" value={sshKey} onChange={(e) => setSshKey(e.target.value)} placeholder="C:\Users\marti\.ssh\id_ed25519" /></div>
-          <div className="hermes-settings-row"><label className="hermes-settings-label">Hermes Path</label><input className="hermes-settings-input" value={hermesPath} onChange={(e) => setHermesPath(e.target.value)} placeholder="/home/martin/.local/bin/hermes" /></div>
+          <div className="hermes-settings-row"><label className="hermes-settings-label">SSH User</label><input className="hermes-settings-input" value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="username" /></div>
+          <div className="hermes-settings-row"><label className="hermes-settings-label">SSH Key</label><input className="hermes-settings-input" value={sshKey} onChange={(e) => setSshKey(e.target.value)} placeholder="C:\Users\you\.ssh\id_ed25519" /></div>
+          <div className="hermes-settings-row"><label className="hermes-settings-label">Hermes Path</label><input className="hermes-settings-input" value={hermesPath} onChange={(e) => setHermesPath(e.target.value)} placeholder="~/.local/bin/hermes" /></div>
           <div className="hermes-settings-action-row">
             <button className="ghost" onClick={runTest} disabled={testStatus === 'testing' || !sshHost}>{testStatus === 'testing' ? 'Testing…' : 'Test Connection'}</button>
             {testStatus === 'ok' && <span className="hermes-test-ok">✓ Connected</span>}

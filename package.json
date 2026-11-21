@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Local-first AI workspace: Chat | Hermes | Claude Code with shared project-aware knowledge",
   "main": "out/main/index.js",
-  "author": "you",
+  "author": "MinZziGOGOGO",
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",

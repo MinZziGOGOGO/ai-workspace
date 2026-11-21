@@ -48,8 +48,8 @@ async function main() {
 
   const db = getDb()
   const fileItems = () =>
-    db.prepare(`SELECT title, type, source, content FROM memory_items WHERE project_id = ? AND type = 'file' AND title = 'greeter.ts'`)
-      .all(project.id) as { title: string; type: string; source: string; content: string }[]
+    db.prepare(`SELECT title, type, source, content, updated_at FROM memory_items WHERE project_id = ? AND type = 'file' AND title = 'greeter.ts'`)
+      .all(project.id) as { title: string; type: string; source: string; content: string; updated_at: number }[]
   const fileNodes = () =>
     db.prepare(`SELECT name FROM nodes WHERE project_id = ? AND type = 'file' AND name = 'greeter.ts'`)
       .all(project.id) as { name: string }[]
@@ -71,8 +71,14 @@ async function main() {
   // ---- 2) change (upsert in place, no duplicate node/edge) ----
   writeFileSync(filePath, `// changed\nexport const PI = 3.14159\n`)
   console.error('[test] modified greeter.ts...')
-  const before = items[0]?.content
-  if (!(await waitFor('change → re-indexed', () => fileItems()[0]?.content !== before))) fail('change not re-indexed')
+  // Without a local model the placeholder summary text stays the same, so detect the
+  // re-index by its timestamp (and accept a changed summary when a model is available)
+  const before = items[0]
+  const reindexed = () => {
+    const now = fileItems()[0]
+    return !!now && (now.updated_at > before.updated_at || now.content !== before.content)
+  }
+  if (!(await waitFor('change → re-indexed', reindexed))) fail('change not re-indexed')
   items = fileItems()
   if (items.length !== 1) fail(`change created a duplicate item (${items.length})`)
   if (fileNodes().length !== 1) fail(`change created a duplicate node (${fileNodes().length})`)
